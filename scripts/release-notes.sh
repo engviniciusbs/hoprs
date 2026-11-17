@@ -65,7 +65,7 @@ After each update, Keychain asks again before hoprs can read its saved passwords
 
 **Windows** (x64): run \`hoprs_${v}_windows_x64.msi\`. It is not signed, so SmartScreen says "Windows protected your PC": click More info, then Run anyway. Or use the portable \`hoprs_${v}_windows_x64.zip\`: unzip it and run \`hoprs.exe\`.
 
-The Windows and macOS builds are new and not yet tried on real machines; please open an issue if something is off.
+If something is off on your system, please open an issue.
 EOF
 }
 
@@ -184,8 +184,8 @@ EOF
     expect_contains "Installing block: a prerelease's asset names" 1.0.0-rc1 \
         "$dir/CHANGELOG.md" "sudo apt install ./hoprs_1.0.0~rc1-1_amd64.deb" \
         "hoprs_1.0.0-rc1_macos_universal.dmg" "hoprs_1.0.0-rc1_windows_x64.msi"
-    expect_contains "Installing block: the new-builds line" 1.0.0 "$dir/CHANGELOG.md" \
-        "The Windows and macOS builds are new and not yet tried on real machines; please open an issue if something is off."
+    expect_contains "Installing block: the issue line" 1.0.0 "$dir/CHANGELOG.md" \
+        "If something is off on your system, please open an issue."
     if got=$(release_notes 3.0.0 "$dir/CHANGELOG.md" 2>/dev/null) || [ -n "$got" ]; then
         echo "FAIL  full notes: a missing section must fail and print nothing, got [$got]"
         fails=$((fails + 1))
