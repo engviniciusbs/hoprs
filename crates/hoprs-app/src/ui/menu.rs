@@ -63,6 +63,8 @@ pub fn label(action: MenuAction) -> &'static str {
         MenuAction::EditSite | MenuAction::EditWorkspace => strings::edit(),
         MenuAction::OpenAll => strings::menu_open_all(),
         MenuAction::CloseAll => strings::menu_close_all(),
+        MenuAction::Export => strings::export_ellipsis(),
+        MenuAction::ExportAll => strings::export_everything(),
         MenuAction::CloseTab => strings::close_tab(),
         MenuAction::CloseOtherTabs => strings::menu_close_other_tabs(),
     }
@@ -94,6 +96,7 @@ pub fn icon(action: MenuAction) -> Icon {
         MenuAction::OpenAll => Icon::Stack,
         MenuAction::CloseAll => Icon::X,
         MenuAction::CloseTab | MenuAction::CloseOtherTabs => Icon::X,
+        MenuAction::Export | MenuAction::ExportAll => Icon::ShieldCheck,
     }
 }
 
@@ -121,6 +124,8 @@ pub fn shortcut(action: MenuAction) -> Option<&'static str> {
         | MenuAction::OpenAll
         | MenuAction::CloseAll
         | MenuAction::EditWorkspace
+        | MenuAction::Export
+        | MenuAction::ExportAll
         | MenuAction::CloseTab
         | MenuAction::CloseOtherTabs => None,
     }

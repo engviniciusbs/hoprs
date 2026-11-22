@@ -1,5 +1,5 @@
 import { facts } from "../facts";
-import { formatDate, pagePath, useLang, useT } from "../i18n";
+import { formatDate, pagePaths, useLang, useT } from "../i18n";
 
 export default function Footer() {
   const lang = useLang();
@@ -8,7 +8,7 @@ export default function Footer() {
   return (
     <footer className="footer">
       <div className="container footer-row">
-        <a className="wordmark" href={pagePath[lang]} aria-label={dict.nav.home}>
+        <a className="wordmark" href={pagePaths.home[lang]} aria-label={dict.nav.home}>
           <img src="/icon.svg" alt="" width="24" height="24" />
           <span>hoprs</span>
         </a>
@@ -18,6 +18,7 @@ export default function Footer() {
           <a href={facts.changelogUrl}>{t.changelog}</a>
           <a href={facts.securityUrl}>{t.security}</a>
           <a href={facts.licenseUrl}>{t.license}</a>
+          <a href={pagePaths.privacy[lang]}>{t.privacy}</a>
         </nav>
         <p className="muted small">
           {t.licensed} {t.madeBy} <a href={facts.maintainerUrl}>{facts.maintainer}</a>. {t.updated}{" "}

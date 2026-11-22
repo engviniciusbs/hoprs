@@ -103,5 +103,57 @@ export const ptBr: Dict = {
     licensed: "Licenciado sob MIT OR Apache-2.0.",
     madeBy: "Feito por",
     updated: "Atualizado em",
+    privacy: "Privacidade",
+  },
+  privacy: {
+    title: "Política de privacidade",
+    metaTitle: "Política de privacidade | hoprs",
+    metaDescription:
+      "O que o hoprs faz com os seus dados: o app não coleta nada, a checagem de atualização faz um pedido ao GitHub e o Google Drive só é usado se você escolher.",
+    updated: "Última alteração: 22 de novembro de 2026.",
+    back: "Voltar ao hoprs",
+    sections: [
+      {
+        heading: "Quem é o responsável",
+        paragraphs: [
+          "O hoprs é um app de desktop de código aberto, publicado por {responsible}. Ele responde pelo que esta página descreve.",
+          "Dúvidas sobre privacidade: {email}.",
+        ],
+      },
+      {
+        heading: "O app não coleta nada",
+        paragraphs: [
+          "O hoprs não tem conta, não envia telemetria e não tem servidor próprio. Seus sites, workspaces e configurações ficam em arquivos no seu computador, e as senhas ficam no chaveiro do sistema.",
+          "Fora o que está descrito abaixo (a checagem de atualização e, nas versões que o oferecem, o Google Drive), o app só se conecta aos servidores que você adiciona.",
+        ],
+      },
+      {
+        heading: "Checagem de atualização",
+        paragraphs: [
+          "Poucos segundos depois de abrir, e depois uma vez por dia, o hoprs faz um pedido à API do GitHub para saber qual é a versão mais recente. O pedido não leva nenhum identificador: só a versão do app no cabeçalho User-Agent (hoprs/<versão>) e um cabeçalho Accept padrão.",
+          "Em Configurações → Geral dá para desligar a checagem. Ao clicar em Atualizar, o instalador é baixado do GitHub.",
+        ],
+      },
+      {
+        heading: "Google Drive (nas versões que o oferecem)",
+        paragraphs: [
+          "O hoprs só fala com o Google quando você clica em Conectar ou Desconectar, ou exporta para o Google Drive. O que vai para o Google é a troca de autorização OAuth, o arquivo de exportação criptografado (enviado para uma pasta chamada hoprs) e, ao desconectar, o pedido para revogar a autorização.",
+          "A única permissão que o hoprs pede é drive.file: acesso aos arquivos que o próprio app criou. O hoprs não consegue ver, listar nem alterar mais nada no seu Drive.",
+          "O arquivo é criptografado no seu computador, com uma senha que nunca sai dele. A autorização fica guardada no chaveiro do sistema, e o e-mail da conta é lido só para mostrar qual conta está conectada.",
+          "Desconectar no hoprs apaga a autorização do chaveiro deste computador e pede ao Google que a revogue; se esse pedido falhar (sem internet, por exemplo), a autorização some deste computador, mas pode continuar valendo do lado do Google. Para removê-la do lado do Google com certeza, use https://myaccount.google.com/permissions.",
+          "O uso que o hoprs faz das informações recebidas das APIs do Google segue a Google API Services User Data Policy, incluindo os requisitos de Uso Limitado (Limited Use). Em inglês: “hoprs's use of information received from Google APIs adheres to the Google API Services User Data Policy, including the Limited Use requirements.”",
+        ],
+      },
+      {
+        heading: "Este site",
+        paragraphs: [
+          "As visitas a hoprs.online são contadas com o Cloudflare Web Analytics, que não define cookies e não guarda dados pessoais. O site fica atrás da Cloudflare.",
+        ],
+      },
+      {
+        heading: "Alterações",
+        paragraphs: ["Se esta política mudar, o novo texto é publicado nesta página, e a data acima muda junto."],
+      },
+    ],
   },
 };

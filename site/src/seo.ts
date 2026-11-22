@@ -2,10 +2,10 @@
 // facts.ts, so they never drift from the page. Pure functions: scripts/prerender.tsx writes them.
 import { downloads, systems } from "./downloads";
 import { facts } from "./facts";
-import { dicts, formatDate, formatNumber, langs, otherLang, pagePath } from "./i18n";
-import type { Lang } from "./i18n";
+import { dicts, formatDate, formatNumber, langs, otherLang, pagePaths } from "./i18n";
+import type { Lang, Page } from "./i18n";
 
-export const pageUrl = (lang: Lang) => `${facts.siteUrl}${pagePath[lang]}`;
+export const pageUrl = (lang: Lang, page: Page = "home") => `${facts.siteUrl}${pagePaths[page][lang]}`;
 // One WebSite and one SoftwareApplication, whichever page describes them: both pages share these @ids.
 export const siteId = `${facts.siteUrl}/#website`;
 export const appId = `${facts.siteUrl}/#app`;
@@ -19,9 +19,33 @@ const escapeHtml = (s: string) =>
 /** The four downloadable assets of the current release. */
 export const downloadUrls = [facts.debUrl, facts.dmgUrl, facts.msiUrl, facts.zipUrl];
 
-export function jsonLd(lang: Lang): object {
+export function jsonLd(lang: Lang, page: Page = "home"): object {
   const t = dicts[lang];
-  const url = pageUrl(lang);
+  const url = pageUrl(lang, page);
+  if (page === "privacy") {
+    return {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": "WebSite",
+          "@id": siteId,
+          name: "hoprs",
+          url: pageUrl("en"),
+          inLanguage: [...langs],
+          description: t.meta.description,
+        },
+        {
+          "@type": "WebPage",
+          "@id": `${url}#webpage`,
+          url,
+          name: t.privacy.title,
+          description: t.privacy.metaDescription,
+          inLanguage: lang,
+          isPartOf: { "@id": siteId },
+        },
+      ],
+    };
+  }
   const author = { "@type": "Person", name: facts.maintainer, url: facts.maintainerUrl, sameAs: [facts.maintainerUrl] };
   return {
     "@context": "https://schema.org",
@@ -79,19 +103,21 @@ export function jsonLd(lang: Lang): object {
 }
 
 /** Everything that goes in <head> after the static tags of index.html. */
-export function headHtml(lang: Lang): string {
+export function headHtml(lang: Lang, page: Page = "home"): string {
   const t = dicts[lang];
   const other = otherLang(lang);
-  const url = pageUrl(lang);
+  const url = pageUrl(lang, page);
+  const title = page === "privacy" ? t.privacy.metaTitle : t.meta.title;
+  const description = page === "privacy" ? t.privacy.metaDescription : t.meta.description;
   const e = escapeHtml;
   // "<" inside a <script> data block could end it early; < is the same character to a JSON parser.
-  const ld = JSON.stringify(jsonLd(lang)).replaceAll("<", "\\u003c");
+  const ld = JSON.stringify(jsonLd(lang, page)).replaceAll("<", "\\u003c");
   return [
-    `<title>${e(t.meta.title)}</title>`,
-    `<meta name="description" content="${e(t.meta.description)}" />`,
+    `<title>${e(title)}</title>`,
+    `<meta name="description" content="${e(description)}" />`,
     `<link rel="canonical" href="${url}" />`,
-    ...langs.map((l) => `<link rel="alternate" hreflang="${l}" href="${pageUrl(l)}" />`),
-    `<link rel="alternate" hreflang="x-default" href="${pageUrl("en")}" />`,
+    ...langs.map((l) => `<link rel="alternate" hreflang="${l}" href="${pageUrl(l, page)}" />`),
+    `<link rel="alternate" hreflang="x-default" href="${pageUrl("en", page)}" />`,
     `<link rel="icon" href="/favicon.ico" sizes="32x32" />`,
     `<link rel="icon" type="image/svg+xml" href="/icon.svg" />`,
     `<link rel="apple-touch-icon" href="/apple-touch-icon.png" />`,
@@ -99,30 +125,35 @@ export function headHtml(lang: Lang): string {
     `<meta property="og:site_name" content="hoprs" />`,
     `<meta property="og:locale" content="${t.meta.ogLocale}" />`,
     `<meta property="og:locale:alternate" content="${dicts[other].meta.ogLocale}" />`,
-    `<meta property="og:title" content="${e(t.meta.title)}" />`,
-    `<meta property="og:description" content="${e(t.meta.description)}" />`,
+    `<meta property="og:title" content="${e(title)}" />`,
+    `<meta property="og:description" content="${e(description)}" />`,
     `<meta property="og:url" content="${url}" />`,
     `<meta property="og:image" content="${ogImage.url}" />`,
     `<meta property="og:image:width" content="${ogImage.width}" />`,
     `<meta property="og:image:height" content="${ogImage.height}" />`,
     `<meta property="og:image:alt" content="${e(t.meta.ogImageAlt)}" />`,
     `<meta name="twitter:card" content="summary_large_image" />`,
-    `<meta name="twitter:title" content="${e(t.meta.title)}" />`,
-    `<meta name="twitter:description" content="${e(t.meta.description)}" />`,
+    `<meta name="twitter:title" content="${e(title)}" />`,
+    `<meta name="twitter:description" content="${e(description)}" />`,
     `<meta name="twitter:image" content="${ogImage.url}" />`,
     `<meta name="twitter:image:alt" content="${e(t.meta.ogImageAlt)}" />`,
     `<script type="application/ld+json">${ld}</script>`,
   ].join("\n    ");
 }
 
-/** dist/sitemap.xml: both pages, each with its hreflang alternates. */
+/** dist/sitemap.xml: every page (home, then privacy), each with its own hreflang alternates. */
 export function sitemapXml(lastmod: string): string {
-  const alternates = [
-    ...langs.map((l) => `    <xhtml:link rel="alternate" hreflang="${l}" href="${pageUrl(l)}"/>`),
-    `    <xhtml:link rel="alternate" hreflang="x-default" href="${pageUrl("en")}"/>`,
-  ].join("\n");
-  const urls = langs
-    .map((l) => `  <url>\n    <loc>${pageUrl(l)}</loc>\n    <lastmod>${lastmod}</lastmod>\n${alternates}\n  </url>`)
+  const pages: Page[] = ["home", "privacy"];
+  const urls = pages
+    .flatMap((page) => {
+      const alternates = [
+        ...langs.map((l) => `    <xhtml:link rel="alternate" hreflang="${l}" href="${pageUrl(l, page)}"/>`),
+        `    <xhtml:link rel="alternate" hreflang="x-default" href="${pageUrl("en", page)}"/>`,
+      ].join("\n");
+      return langs.map(
+        (l) => `  <url>\n    <loc>${pageUrl(l, page)}</loc>\n    <lastmod>${lastmod}</lastmod>\n${alternates}\n  </url>`,
+      );
+    })
     .join("\n");
   return `<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">
@@ -177,6 +208,7 @@ MIT OR Apache-2.0: ${facts.licenseUrl} and ${facts.apacheLicenseUrl}
 - [Releases](${facts.releasesUrl})
 - [Changelog](${facts.changelogUrl})
 - [Security](${facts.securityUrl})
+- [Privacy policy](${pageUrl("en", "privacy")})
 - [Página em português](${pageUrl("pt-BR")})
 `;
 }

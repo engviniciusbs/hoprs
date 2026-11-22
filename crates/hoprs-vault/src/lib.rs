@@ -19,9 +19,12 @@ use hoprs_core::{Error, ErrorKind, Result, Site, SiteId, Workspace, WorkspaceId}
 use secrecy::SecretString;
 
 pub use atomic::write_atomic;
-pub use export::{BackupImportReport, ExportParams, ExportReport, ImportMode};
+pub use export::{BackupImportReport, ExportParams, ExportReport, ExportScope, ImportMode};
 pub use profiles::UnreadableEntry;
-pub use secrets::{KeyringStore, MemoryStore, SecretKind, SecretStore, is_keyring_unavailable};
+pub use secrets::{
+    AppSecret, AppSecretStore, KeyringStore, MemoryStore, SecretKind, SecretStore,
+    is_keyring_unavailable,
+};
 
 use profiles::Profiles;
 
@@ -66,6 +69,15 @@ impl fmt::Debug for Vault {
 fn unknown_site(id: &SiteId) -> Error {
     Error::coded(ErrorKind::NotFound, "vault-unknown-site", "Unknown site")
         .with_detail(id.0.clone())
+}
+
+fn unknown_workspace(id: &WorkspaceId) -> Error {
+    Error::coded(
+        ErrorKind::NotFound,
+        "vault-unknown-workspace",
+        "Unknown workspace",
+    )
+    .with_detail(id.0.clone())
 }
 
 impl Vault {
@@ -158,12 +170,7 @@ impl Vault {
 
     pub fn remove_workspace(&mut self, id: &WorkspaceId) -> Result<()> {
         let Some(pos) = self.profiles.workspaces.iter().position(|w| &w.id == id) else {
-            return Err(Error::coded(
-                ErrorKind::NotFound,
-                "vault-unknown-workspace",
-                "Unknown workspace",
-            )
-            .with_detail(id.0.clone()));
+            return Err(unknown_workspace(id));
         };
         let mut next = self.profiles.clone();
         next.workspaces.remove(pos);

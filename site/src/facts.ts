@@ -1,5 +1,8 @@
 // Filled by hand per release. facts.test.ts checks the version against the workspace Cargo.toml.
 const maintainer = "engviniciusbs";
+// The person responsible for the app and the contact of the privacy page.
+const responsible = "Vinícius Sarmento";
+const privacyEmail = "privacy@hoprs.online";
 const maintainerUrl = `https://github.com/${maintainer}`;
 const repoUrl = `${maintainerUrl}/hoprs`;
 const version = "1.5.0";
@@ -16,6 +19,8 @@ export const facts = {
   version,
   releaseDate,
   maintainer,
+  responsible,
+  privacyEmail,
   maintainerUrl,
   debName,
   debUrl: `${releaseBase}/${debName}`,

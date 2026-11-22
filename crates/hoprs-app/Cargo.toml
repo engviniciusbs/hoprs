@@ -70,6 +70,11 @@ rustls-native-certs = { workspace = true }
 # The update download's private fallback directory (never the shared temp directory
 # itself). Already in the tree. MIT OR Apache-2.0.
 tempfile = { workspace = true }
+# PKCE and `state` as base64url (Google Drive sign-in). Already in the tree. MIT OR Apache-2.0.
+base64 = { workspace = true }
+# Percent-encodes the authorisation URL and decodes the browser's callback (Google Drive
+# sign-in). Already in the tree. MIT OR Apache-2.0.
+percent-encoding = "2"
 
 # Unix: the update download reuses an existing file only when this user (geteuid) owns
 # it. Already in the tree. MIT OR Apache-2.0.

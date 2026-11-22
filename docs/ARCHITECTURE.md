@@ -13,7 +13,7 @@ plain async Rust, tested without a window.
 | Crate | What it owns |
 |---|---|
 | `hoprs-core` | Shared types: `Site`, `Protocol`, `Workspace`, `RemotePath`, `RemoteEntry`, `ConnectionState` and the one `Error` type (a kind, an English message, an optional detail, and a stable `code` + `args` for translation) |
-| `hoprs-vault` | The profile file (`sites.toml`), secrets in the OS keyring, encrypted backup export and import (Argon2id + XChaCha20-Poly1305) |
+| `hoprs-vault` | The profile file (`sites.toml`), secrets in the OS keyring, encrypted backup export (of everything, one workspace or one site) and import (Argon2id + XChaCha20-Poly1305) |
 | `hoprs-ssh` | SSH sessions on russh: authentication (agent, keys, password, keyboard-interactive), `known_hosts`, keepalive, the PTY shells of the terminal |
 | `hoprs-remote` | The `RemoteFs` trait and its implementations: SFTP (over a `hoprs-ssh` session), FTP / FTPS (suppaftp), the local disk, and an in-memory one for tests |
 | `hoprs-transfer` | The transfer engine: a persistent queue (SQLite), workers per site, resume, conflict policies, one writer per destination, recovery after a crash |
@@ -55,6 +55,7 @@ The app follows iced's model: state, messages, a pure update, and views.
 | Where | What |
 |---|---|
 | `src/app.rs`, `src/app/*.rs` | `App` (all UI state), `Message`, and the **pure** `update`: no I/O, it only changes state and returns `Effect`s. One file per area (`files`, `transfers`, `terminal`, `edit`, `dialogs`, `palette`, `settings`, …) |
+| `src/app/export.rs`, `src/ui/export.rs` | The export flow, a centre form (`Form::Export`) with its state in `App::export`: scope, File field, password, overwrite question, running and result; the view draws it |
 | `src/effects.rs` | Turns each `Effect` into an `iced::Task`: the only place that calls the backend |
 | `src/backend/` | `BackendApi` and its real implementation: the vault, the transfer engine, the session manager (`sessions.rs`), the terminal shells, remote edits (`edit.rs`), and the prompt broker (`broker.rs`) that turns "trust this host key?" or "password?" requests from the connection crates into dialogs and the answers back |
 | `src/backend/fake.rs` | `FakeBackend`, an in-memory `BackendApi` for UI tests (test builds only) |

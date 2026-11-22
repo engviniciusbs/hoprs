@@ -25,11 +25,12 @@
 
 use hoprs_core::{SiteId, WorkspaceId};
 use hoprs_transfer::TransferId;
+use hoprs_vault::ExportScope;
 use iced::Point;
 
 use super::files::Row;
 use super::{
-    App, CompareMsg, Effect, FileKey, Message, PaneMsg, QueueMsg, RowAction, SidebarMsg,
+    App, CompareMsg, Effect, ExportMsg, FileKey, Message, PaneMsg, QueueMsg, RowAction, SidebarMsg,
     SidebarSection, TabId,
 };
 use crate::backend::Side;
@@ -121,6 +122,10 @@ pub enum MenuAction {
     CloseAll,
     /// The workspace's form (its pencil).
     EditWorkspace,
+    /// Opens the export screen for the site or the workspace the menu is about.
+    Export,
+    /// Opens the export screen for everything (the sidebar's ⋯ menu).
+    ExportAll,
     /// The tab's ×.
     CloseTab,
     /// Every other tab of the strip closes (each as its × would).
@@ -186,6 +191,10 @@ impl App {
                 checked: Some(!self.section(section).hidden),
                 ..MenuItem::new(action)
             })
+            .chain(std::iter::once(MenuItem {
+                rule_before: true,
+                ..MenuItem::new(MenuAction::ExportAll)
+            }))
             .collect(),
             MenuTarget::Pane { tab, side, row } => self.pane_menu(*tab, *side, *row),
             MenuTarget::CompareRow { tab, index } => self.compare_menu(*tab, *index),
@@ -201,6 +210,7 @@ impl App {
                 Some(_) => vec![
                     MenuItem::new(MenuAction::OpenSite),
                     MenuItem::new(MenuAction::EditSite),
+                    MenuItem::new(MenuAction::Export),
                 ],
                 None => Vec::new(),
             },
@@ -211,6 +221,7 @@ impl App {
                         items.push(MenuItem::new(MenuAction::CloseAll));
                     }
                     items.push(MenuItem::new(MenuAction::EditWorkspace));
+                    items.push(MenuItem::new(MenuAction::Export));
                     items
                 }
                 false => Vec::new(),
@@ -333,6 +344,9 @@ impl App {
             (MenuTarget::SidebarOptions, MenuAction::ShowSites) => {
                 self.set_hidden(SidebarSection::Sites)
             }
+            (MenuTarget::SidebarOptions, MenuAction::ExportAll) => {
+                Message::Export(ExportMsg::Open(ExportScope::All))
+            }
             (&MenuTarget::Pane { tab, .. }, MenuAction::Compare) => {
                 Message::Compare(CompareMsg::Start { tab })
             }
@@ -362,6 +376,12 @@ impl App {
             }
             (MenuTarget::Site(id), MenuAction::OpenSite) => Message::ConnectSite(id.clone()),
             (MenuTarget::Site(id), MenuAction::EditSite) => Message::EditSite(id.clone()),
+            (MenuTarget::Site(id), MenuAction::Export) => {
+                Message::Export(ExportMsg::Open(ExportScope::Site(id.clone())))
+            }
+            (MenuTarget::Workspace(id), MenuAction::Export) => {
+                Message::Export(ExportMsg::Open(ExportScope::Workspace(id.clone())))
+            }
             (MenuTarget::Workspace(id), MenuAction::OpenAll) => Message::OpenWorkspace(id.clone()),
             (MenuTarget::Workspace(id), MenuAction::CloseAll) => {
                 Message::CloseWorkspace(id.clone())
