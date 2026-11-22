@@ -59,8 +59,6 @@ pub trait AgentHost: Send + Sync + 'static {
     /// The remote filesystem of a connected session.
     fn remote(&self, session: SessionId) -> Result<Arc<dyn RemoteFs>>;
     /// Runs one command on an SSH session.
-    // TODO(Task 10): remove
-    #[allow(dead_code)]
     async fn exec(
         &self,
         session: SessionId,

@@ -3,7 +3,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use hoprs_core::{AgentAccess, Error, ErrorKind, Protocol, RemotePath, Site, SiteId};
-use hoprs_remote::MemFs;
+use hoprs_remote::{MemFs, RemoteFs};
+use hoprs_ssh::{ExecEnd, ExecOutput};
 use hoprs_transfer::{Direction, Origin, TransferId, TransferItem, TransferSpec, TransferState};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -28,6 +29,7 @@ struct Fx {
     ro: Site,
     closed: Site,
     ssh_fs: MemFs,
+    ftp_fs: MemFs,
 }
 
 fn site(name: &str, host: &str, protocol: Protocol, level: AgentAccess) -> Site {
@@ -53,7 +55,7 @@ fn fixture() -> Fx {
         AgentAccess::None,
     );
     let ssh_fs = host.add_site(ssh.clone());
-    host.add_site(ftp.clone());
+    let ftp_fs = host.add_site(ftp.clone());
     let ro_fs = host.add_site(ro.clone());
     let closed_fs = host.add_site(closed.clone());
     for fs in [&ssh_fs, &ro_fs, &closed_fs] {
@@ -70,6 +72,7 @@ fn fixture() -> Fx {
         ro,
         closed,
         ssh_fs,
+        ftp_fs,
     }
 }
 
@@ -1442,4 +1445,644 @@ async fn the_limit_is_the_attempts() {
     assert_eq!(err(spawn(&fx).await.unwrap()), WAITING_FOR_USER);
     assert_eq!(started.elapsed(), Duration::from_secs(120));
     assert_eq!(fx.host.connects(&fx.ssh.id), 2, "a fresh attempt");
+}
+
+// ---- Task 10: writing, deleting, commands ----
+
+/// `more` with the site's id as `site`.
+fn on(site: &Site, more: Value) -> Value {
+    let mut args = more;
+    args["site"] = json!(site.id.0);
+    args
+}
+
+/// The names in a folder of `fs`, sorted.
+async fn children(fs: &MemFs, path: &str) -> Vec<String> {
+    let mut names: Vec<String> = fs
+        .list(&RemotePath::new(path).unwrap())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    names.sort();
+    names
+}
+
+/// Waits (yielding, no timer) until `done` holds.
+async fn until(mut done: impl FnMut() -> bool) {
+    for _ in 0..10_000 {
+        if done() {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("never happened");
+}
+
+fn exec_output(stdout: &[u8], stderr: &[u8], end: ExecEnd) -> ExecOutput {
+    ExecOutput {
+        stdout: stdout.to_vec(),
+        stderr: stderr.to_vec(),
+        stdout_truncated: false,
+        stderr_truncated: false,
+        end,
+    }
+}
+
+#[tokio::test]
+async fn write_file_rules() {
+    let fx = fixture();
+    let write = |site: &Site, path: &str, content: &str, overwrite: Option<bool>| {
+        let mut args = on(site, json!({"path": path, "content": content}));
+        if let Some(overwrite) = overwrite {
+            args["overwrite"] = json!(overwrite);
+        }
+        let service = fx.service.clone();
+        async move { service.call("write_file", args).await }
+    };
+
+    // A new file.
+    let reply = write(&fx.ssh, "/var/www/new.txt", "hello world!", None).await;
+    assert_eq!(
+        head(reply),
+        json!({"ok": true, "path": "/var/www/new.txt", "bytes": 12})
+    );
+    assert_eq!(
+        fx.ssh_fs.read_file("/var/www/new.txt").as_deref(),
+        Some(&b"hello world!"[..])
+    );
+    // Over SFTP by a temporary file and a rename, and none is left behind.
+    assert!(fx.host.calls(&fx.ssh.id, FsOp::Rename) >= 1);
+    assert_eq!(children(&fx.ssh_fs, "/var/www").await, ["a.txt", "new.txt"]);
+
+    // An existing file without `overwrite`: an error naming it, the old bytes stay.
+    let writes = fx.host.calls(&fx.ssh.id, FsOp::Write);
+    for overwrite in [None, Some(false)] {
+        let text = err(write(&fx.ssh, "/var/www/a.txt", "other", overwrite).await);
+        assert!(text.contains("overwrite"), "{text}");
+        assert!(text.contains("/var/www/a.txt"), "{text}");
+    }
+    assert_eq!(
+        fx.ssh_fs.read_file("/var/www/a.txt").as_deref(),
+        Some(&b"hello"[..])
+    );
+    assert_eq!(fx.host.calls(&fx.ssh.id, FsOp::Write), writes);
+    // With it: replaced.
+    ok(write(&fx.ssh, "/var/www/a.txt", "other", Some(true)).await);
+    assert_eq!(
+        fx.ssh_fs.read_file("/var/www/a.txt").as_deref(),
+        Some(&b"other"[..])
+    );
+    assert_eq!(children(&fx.ssh_fs, "/var/www").await, ["a.txt", "new.txt"]);
+
+    // One byte over the cap: an error, nothing written, no connection needed.
+    let writes = fx.host.calls(&fx.ssh.id, FsOp::Write);
+    let big = "x".repeat(1_048_577);
+    let text = err(write(&fx.ssh, "/var/www/big.txt", &big, Some(true)).await);
+    assert!(text.contains("1048576"), "{text}");
+    assert!(fx.ssh_fs.read_file("/var/www/big.txt").is_none());
+    assert_eq!(fx.host.calls(&fx.ssh.id, FsOp::Write), writes);
+    // The cap itself fits.
+    let full = "x".repeat(1_048_576);
+    assert_eq!(
+        head(write(&fx.ssh, "/var/www/big.txt", &full, None).await)["bytes"],
+        1_048_576
+    );
+
+    // A folder or a link at the path: an error, with or without `overwrite`.
+    fx.ssh_fs.add_dir("/var/www/dir");
+    fx.ssh_fs.add_symlink("/var/www/link", "/etc/passwd");
+    let writes = fx.host.calls(&fx.ssh.id, FsOp::Write);
+    for overwrite in [None, Some(true)] {
+        let text = err(write(&fx.ssh, "/var/www/dir", "x", overwrite).await);
+        assert!(text.contains("folder"), "{text}");
+        let text = err(write(&fx.ssh, "/var/www/link", "x", overwrite).await);
+        assert!(text.contains("symbolic link"), "{text}");
+    }
+    assert_eq!(fx.host.calls(&fx.ssh.id, FsOp::Write), writes);
+    assert!(
+        fx.ssh_fs
+            .stat(&RemotePath::new("/var/www/dir").unwrap())
+            .await
+            .is_ok()
+    );
+
+    // Over FTP in place: one write, no rename.
+    ok(write(&fx.ftp, "/new.txt", "ftp text", None).await);
+    assert_eq!(
+        fx.ftp_fs.read_file("/new.txt").as_deref(),
+        Some(&b"ftp text"[..])
+    );
+    assert_eq!(fx.host.calls(&fx.ftp.id, FsOp::Write), 1);
+    assert_eq!(fx.host.calls(&fx.ftp.id, FsOp::Rename), 0);
+
+    // An in-place write cut by the network: the file may now be incomplete.
+    fx.host.fail(
+        &fx.ftp.id,
+        FsOp::Write,
+        Error::new(ErrorKind::Network, "Connection lost"),
+    );
+    let text = err(write(&fx.ftp, "/new.txt", "again", Some(true)).await);
+    assert!(text.contains("Connection lost"), "{text}");
+    assert!(text.contains("may now be incomplete"), "{text}");
+    // Over SFTP the cut write is the temporary file's: the file itself is untouched.
+    fx.host.fail(
+        &fx.ssh.id,
+        FsOp::Write,
+        Error::new(ErrorKind::Network, "Connection lost"),
+    );
+    let text = err(write(&fx.ssh, "/var/www/a.txt", "again", Some(true)).await);
+    assert!(text.contains("Connection lost"), "{text}");
+    assert!(!text.contains("incomplete"), "{text}");
+    assert_eq!(
+        fx.ssh_fs.read_file("/var/www/a.txt").as_deref(),
+        Some(&b"other"[..])
+    );
+}
+
+#[tokio::test]
+async fn make_rename_chmod() {
+    let fx = fixture();
+    let call = |tool: &'static str, args: Value| {
+        let service = fx.service.clone();
+        async move { service.call(tool, args).await }
+    };
+
+    // A folder; again (it exists: not an error); a missing parent is the error.
+    let mkdir = on(&fx.ssh, json!({"path": "/var/www/new"}));
+    assert_eq!(
+        head(call("make_directory", mkdir.clone()).await),
+        json!({"ok": true, "path": "/var/www/new"})
+    );
+    let made = fx
+        .ssh_fs
+        .stat(&RemotePath::new("/var/www/new").unwrap())
+        .await;
+    assert_eq!(made.unwrap().kind, hoprs_core::EntryKind::Dir);
+    ok(call("make_directory", mkdir).await);
+    let text = err(call(
+        "make_directory",
+        on(&fx.ssh, json!({"path": "/no/such/dir"})),
+    )
+    .await);
+    assert!(text.contains("/no/such/dir"), "{text}");
+    assert!(text.contains("parent"), "{text}");
+    assert!(
+        fx.ssh_fs
+            .stat(&RemotePath::new("/no").unwrap())
+            .await
+            .is_err()
+    );
+    // A file at the path is not a folder.
+    err(call(
+        "make_directory",
+        on(&fx.ssh, json!({"path": "/var/www/a.txt"})),
+    )
+    .await);
+
+    // Rename onto an existing name: refused, both files intact.
+    fx.ssh_fs.add_file("/var/www/b.txt", b"bee", EPOCH);
+    let text = err(call(
+        "rename",
+        on(
+            &fx.ssh,
+            json!({"from": "/var/www/a.txt", "to": "/var/www/b.txt"}),
+        ),
+    )
+    .await);
+    assert!(text.contains("/var/www/b.txt"), "{text}");
+    assert!(text.contains("already"), "{text}");
+    assert_eq!(fx.host.calls(&fx.ssh.id, FsOp::Rename), 0);
+    assert_eq!(
+        fx.ssh_fs.read_file("/var/www/a.txt").as_deref(),
+        Some(&b"hello"[..])
+    );
+    assert_eq!(
+        fx.ssh_fs.read_file("/var/www/b.txt").as_deref(),
+        Some(&b"bee"[..])
+    );
+    // Onto a free name: moved.
+    assert_eq!(
+        head(
+            call(
+                "rename",
+                on(
+                    &fx.ssh,
+                    json!({"from": "/var/www/a.txt", "to": "/var/www/new/c.txt"})
+                ),
+            )
+            .await
+        ),
+        json!({"ok": true, "from": "/var/www/a.txt", "to": "/var/www/new/c.txt"})
+    );
+    assert!(fx.ssh_fs.read_file("/var/www/a.txt").is_none());
+    assert_eq!(
+        fx.ssh_fs.read_file("/var/www/new/c.txt").as_deref(),
+        Some(&b"hello"[..])
+    );
+    // The root is neither renamed nor replaced; both paths are checked.
+    let renames = fx.host.calls(&fx.ssh.id, FsOp::Rename);
+    for (from, to) in [
+        ("/", "/x"),
+        ("/var/www/b.txt", "/"),
+        ("/var/www/b.txt", "rel"),
+    ] {
+        err(call("rename", on(&fx.ssh, json!({"from": from, "to": to}))).await);
+    }
+    let text = err(call(
+        "rename",
+        on(&fx.ssh, json!({"from": "/a/../..", "to": "/x"})),
+    )
+    .await);
+    assert!(text.contains("`from`"), "{text}");
+    assert_eq!(fx.host.calls(&fx.ssh.id, FsOp::Rename), renames);
+
+    // Permissions: three or four octal digits.
+    let chmod = |mode: Value| on(&fx.ssh, json!({"path": "/var/www/b.txt", "mode": mode}));
+    let mode = || async {
+        fx.ssh_fs
+            .stat(&RemotePath::new("/var/www/b.txt").unwrap())
+            .await
+            .unwrap()
+            .mode
+    };
+    assert_eq!(
+        head(call("set_permissions", chmod(json!("644"))).await),
+        json!({"ok": true, "path": "/var/www/b.txt", "mode": "0644"})
+    );
+    assert_eq!(mode().await, Some(0o644));
+    ok(call("set_permissions", chmod(json!("0755"))).await);
+    assert_eq!(mode().await, Some(0o755));
+    let chmods = fx.host.calls(&fx.ssh.id, FsOp::Chmod);
+    for bad in ["9z", "77777", "", "64", "0x1f", "+755", "７５５"] {
+        let text = err(call("set_permissions", chmod(json!(bad))).await);
+        assert!(text.contains("octal"), "{bad}: {text}");
+    }
+    let text = err(call("set_permissions", chmod(json!(644))).await);
+    assert!(text.contains("`mode`"), "{text}");
+    assert_eq!(fx.host.calls(&fx.ssh.id, FsOp::Chmod), chmods);
+    assert_eq!(mode().await, Some(0o755));
+
+    // An FTP server without SITE CHMOD answers 502, which the FTP backend reports as an
+    // unexpected reply (`map_reply`): a clear error.
+    fx.ftp_fs.add_file("/f.txt", b"f", EPOCH);
+    fx.host.fail(
+        &fx.ftp.id,
+        FsOp::Chmod,
+        Error::new(ErrorKind::Protocol, "Unexpected FTP reply: /f.txt")
+            .with_detail("502 SITE CHMOD not understood"),
+    );
+    let text = err(call(
+        "set_permissions",
+        on(&fx.ftp, json!({"path": "/f.txt", "mode": "600"})),
+    )
+    .await);
+    assert!(text.contains("does not support"), "{text}");
+    assert!(!text.contains("502"), "{text}");
+}
+
+#[tokio::test]
+async fn delete_needs_recursive_for_a_full_folder() {
+    let fx = fixture();
+    let fs = &fx.ssh_fs;
+    let delete = |path: &str, recursive: Option<bool>| {
+        let mut args = on(&fx.ssh, json!({"path": path}));
+        if let Some(recursive) = recursive {
+            args["recursive"] = json!(recursive);
+        }
+        let service = fx.service.clone();
+        async move { service.call("delete", args).await }
+    };
+
+    // A file.
+    assert_eq!(
+        head(delete("/var/www/a.txt", None).await),
+        json!({"ok": true, "path": "/var/www/a.txt", "deleted": 1})
+    );
+    assert!(fs.read_file("/var/www/a.txt").is_none());
+    // An empty folder.
+    fs.add_dir("/var/www/empty");
+    assert_eq!(head(delete("/var/www/empty", None).await)["deleted"], 1);
+    assert!(children(fs, "/var/www").await.is_empty());
+
+    // A folder with content: without `recursive`, an error and nothing removed.
+    fs.add_file("/srv/tree/a.txt", b"a", EPOCH);
+    fs.add_file("/srv/tree/sub/b.txt", b"b", EPOCH);
+    fs.add_file("/keep/k.txt", b"k", EPOCH);
+    fs.add_symlink("/srv/tree/link", "/keep");
+    let removes = fx.host.calls(&fx.ssh.id, FsOp::Remove);
+    for recursive in [None, Some(false)] {
+        let text = err(delete("/srv/tree", recursive).await);
+        assert!(text.contains("recursive"), "{text}");
+        assert!(text.contains("/srv/tree"), "{text}");
+    }
+    assert_eq!(fx.host.calls(&fx.ssh.id, FsOp::Remove), removes);
+    assert_eq!(children(fs, "/srv/tree").await, ["a.txt", "link", "sub"]);
+    // With it: gone, every item counted (a.txt, link, b.txt, sub, tree), and the link
+    // is removed, never followed.
+    assert_eq!(head(delete("/srv/tree", Some(true)).await)["deleted"], 5);
+    assert!(children(fs, "/srv").await.is_empty());
+    assert_eq!(fs.read_file("/keep/k.txt").as_deref(), Some(&b"k"[..]));
+    // A link at the path itself: the link goes, its target stays.
+    fs.add_symlink("/srv/l", "/keep");
+    assert_eq!(head(delete("/srv/l", Some(true)).await)["deleted"], 1);
+    assert_eq!(fs.read_file("/keep/k.txt").as_deref(), Some(&b"k"[..]));
+
+    // The root, and paths that are not absolute: refused before anything is touched.
+    let (lists, removes) = (
+        fx.host.calls(&fx.ssh.id, FsOp::List),
+        fx.host.calls(&fx.ssh.id, FsOp::Remove),
+    );
+    for recursive in [None, Some(true)] {
+        let text = err(delete("/", recursive).await);
+        assert!(text.contains("root"), "{text}");
+        err(delete("", recursive).await);
+        err(delete("keep", recursive).await);
+        err(delete("/keep/..", recursive).await);
+    }
+    assert_eq!(fx.host.calls(&fx.ssh.id, FsOp::List), lists);
+    assert_eq!(fx.host.calls(&fx.ssh.id, FsOp::Remove), removes);
+    assert_eq!(fs.read_file("/keep/k.txt").as_deref(), Some(&b"k"[..]));
+
+    // A failure half way says how much went and that the rest is still there.
+    for i in 0..3 {
+        fs.add_file(&format!("/part/a{i}"), b"", EPOCH);
+    }
+    fs.add_file("/part/z/locked", b"", EPOCH);
+    fs.deny_writes_under("/part/z");
+    let text = err(delete("/part", Some(true)).await);
+    assert!(text.contains("3 items were deleted"), "{text}");
+    assert!(text.contains("still there"), "{text}");
+    assert_eq!(children(fs, "/part").await, ["z"]);
+    // Missing: an error.
+    err(delete("/nothing/here", Some(true)).await);
+}
+
+#[tokio::test]
+async fn run_command_reply_and_limits() {
+    let fx = fixture();
+    let run = |site: &Site, more: Value| {
+        let service = fx.service.clone();
+        let args = on(site, more);
+        async move { service.call("run_command", args).await }
+    };
+    let last = || fx.host.execs().last().cloned().unwrap();
+
+    let mut out = exec_output(b"ok\n", b"warn", ExecEnd::Exit(3));
+    out.stdout_truncated = true;
+    fx.host.set_exec(Ok(out));
+    let blocks = ok(run(&fx.ssh, json!({"command": "make test"})).await);
+    let header: Value = serde_json::from_str(&blocks[0]).unwrap();
+    assert_eq!(
+        header,
+        json!({"exit_code": 3, "signal": null, "timed_out": false, "lost": false,
+            "stdout_truncated": true, "stderr_truncated": false})
+    );
+    assert_eq!(blocks[1..], ["stdout:\nok\n", "stderr:\nwarn"]);
+    let (site, command, limits) = last();
+    assert_eq!((site, command.as_str()), (fx.ssh.id.clone(), "make test"));
+    assert_eq!(limits.timeout, Duration::from_secs(60), "the default");
+    assert_eq!(limits.stream_bytes, 262_144);
+
+    // The time limit: clamped to 600 s, at least 1 s.
+    ok(run(&fx.ssh, json!({"command": "x", "timeout_seconds": 5000})).await);
+    assert_eq!(last().2.timeout, Duration::from_secs(600));
+    ok(run(&fx.ssh, json!({"command": "x", "timeout_seconds": 5})).await);
+    assert_eq!(last().2.timeout, Duration::from_secs(5));
+    let runs = fx.host.execs().len();
+    err(run(&fx.ssh, json!({"command": "x", "timeout_seconds": 0})).await);
+    err(run(&fx.ssh, json!({"command": "x", "timeout_seconds": "5"})).await);
+    assert_eq!(fx.host.execs().len(), runs);
+
+    // Timed out: no exit code, and the process may still be running.
+    fx.host
+        .set_exec(Ok(exec_output(b"", b"", ExecEnd::TimedOut)));
+    let blocks = ok(run(&fx.ssh, json!({"command": "sleep 900"})).await);
+    assert_eq!(blocks.len(), 1, "no empty stream blocks: {blocks:?}");
+    let header: Value = serde_json::from_str(&blocks[0]).unwrap();
+    assert_eq!(header["timed_out"], true);
+    assert_eq!(header["exit_code"], Value::Null);
+    assert_eq!(header["lost"], false);
+    assert!(
+        header["note"]
+            .as_str()
+            .unwrap()
+            .contains("may still be running"),
+        "{header}"
+    );
+    // A signal; a lost connection.
+    fx.host.set_exec(Ok(exec_output(
+        b"",
+        b"",
+        ExecEnd::Signal("KILL".to_owned()),
+    )));
+    let header = head(run(&fx.ssh, json!({"command": "x"})).await);
+    assert_eq!(
+        (header["signal"].clone(), header["exit_code"].clone()),
+        (json!("KILL"), Value::Null)
+    );
+    fx.host
+        .set_exec(Ok(exec_output(b"part", b"", ExecEnd::Lost)));
+    let blocks = ok(run(&fx.ssh, json!({"command": "x"})).await);
+    let header: Value = serde_json::from_str(&blocks[0]).unwrap();
+    assert_eq!(header["lost"], true);
+    assert_eq!(header["timed_out"], false);
+    assert!(
+        header["note"].as_str().unwrap().contains("lost"),
+        "{header}"
+    );
+    assert_eq!(blocks[1], "stdout:\npart");
+    // Output that is not UTF-8 is decoded lossily.
+    fx.host
+        .set_exec(Ok(exec_output(&[0xff, b'a'], b"", ExecEnd::Exit(0))));
+    assert_eq!(
+        ok(run(&fx.ssh, json!({"command": "x"})).await)[1],
+        "stdout:\n\u{fffd}a"
+    );
+    // A command that could not start: a clear error.
+    fx.host.set_exec(Err(Error::new(
+        ErrorKind::Protocol,
+        "Server refused the command",
+    )));
+    let text = err(run(&fx.ssh, json!({"command": "x"})).await);
+    assert!(text.contains("Server refused the command"), "{text}");
+    assert!(text.contains("\"Acme\""), "{text}");
+
+    // On the FTP site the host is never called.
+    let runs = fx.host.execs().len();
+    assert_eq!(
+        err(run(&fx.ftp, json!({"command": "ls"})).await),
+        ssh_only(&fx.ftp.name)
+    );
+    assert_eq!(fx.host.execs().len(), runs);
+    assert_eq!(fx.host.connects(&fx.ftp.id), 0);
+}
+
+#[tokio::test]
+async fn commands_run_one_at_a_time_per_site() {
+    let fx = fixture();
+    fx.set_level(&fx.ro, AgentAccess::All);
+    let spawn = |site: &Site, command: &str| {
+        let service = fx.service.clone();
+        let args = on(site, json!({"command": command}));
+        tokio::spawn(async move { service.call("run_command", args).await })
+    };
+    let running = |site: &Site| {
+        fx.service
+            .activity()
+            .running
+            .get(&site.id)
+            .copied()
+            .unwrap_or(0)
+    };
+
+    let hold = fx.host.hold_exec();
+    let first = spawn(&fx.ssh, "one");
+    hold.entered().await;
+    let second = spawn(&fx.ssh, "two");
+    // The second is in flight (the reaper leaves the site alone) but waits its turn.
+    until(|| running(&fx.ssh) == 2).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(fx.host.execs().len(), 1, "the second waits for the first");
+    // Another site does not wait.
+    let other = spawn(&fx.ro, "three");
+    until(|| fx.host.execs().len() == 2).await;
+    let commands: Vec<String> = fx.host.execs().into_iter().map(|e| e.1).collect();
+    assert_eq!(commands, ["one", "three"]);
+    assert!(!first.is_finished() && !second.is_finished() && !other.is_finished());
+
+    hold.release();
+    ok(first.await.unwrap());
+    ok(second.await.unwrap());
+    ok(other.await.unwrap());
+    let commands: Vec<String> = fx.host.execs().into_iter().map(|e| e.1).collect();
+    assert_eq!(commands, ["one", "three", "two"]);
+    assert!(fx.service.activity().running.is_empty());
+    assert!(fx.service.commands().is_empty(), "turns are not kept");
+}
+
+#[tokio::test]
+async fn write_tools_log_what_they_did() {
+    let (logs, _guard) = capture_logs();
+    let fx = fixture();
+    let call = |tool: &'static str, more: Value| {
+        let service = fx.service.clone();
+        let args = on(&fx.ssh, more);
+        async move { service.call(tool, args).await }
+    };
+    let last = || logs.agent_lines().last().cloned().unwrap();
+
+    ok(call(
+        "write_file",
+        json!({"path": "/a.txt", "content": "hello world!"}),
+    )
+    .await);
+    assert!(
+        last().ends_with("wrote /a.txt (12 bytes) on \"Acme\""),
+        "{}",
+        last()
+    );
+    fx.host.set_exec(Ok(exec_output(
+        b"SECRET-OUTPUT",
+        b"SECRET-ERR",
+        ExecEnd::Exit(0),
+    )));
+    ok(call("run_command", json!({"command": "uptime"})).await);
+    assert!(
+        last().ends_with("ran `uptime` on \"Acme\" (exit 0)"),
+        "{}",
+        last()
+    );
+    ok(call("make_directory", json!({"path": "/d"})).await);
+    assert!(
+        last().ends_with("created the folder /d on \"Acme\""),
+        "{}",
+        last()
+    );
+    ok(call("rename", json!({"from": "/a.txt", "to": "/d/b.txt"})).await);
+    assert!(
+        last().ends_with("renamed /a.txt to /d/b.txt on \"Acme\""),
+        "{}",
+        last()
+    );
+    ok(call(
+        "set_permissions",
+        json!({"path": "/d/b.txt", "mode": "600"}),
+    )
+    .await);
+    assert!(
+        last().ends_with("changed the permissions of /d/b.txt to 0600 on \"Acme\""),
+        "{}",
+        last()
+    );
+    ok(call("delete", json!({"path": "/d", "recursive": true})).await);
+    assert!(
+        last().ends_with("deleted /d on \"Acme\" (2 items)"),
+        "{}",
+        last()
+    );
+    err(call(
+        "write_file",
+        json!({"path": "/var/www/a.txt", "content": "x"}),
+    )
+    .await);
+    assert!(
+        last().contains("wrote /var/www/a.txt (1 byte) on \"Acme\" (failed: "),
+        "{}",
+        last()
+    );
+
+    for (end, says) in [
+        (ExecEnd::TimedOut, "(timed out)"),
+        (ExecEnd::Signal("TERM".to_owned()), "(signal TERM)"),
+        (ExecEnd::Lost, "(connection lost)"),
+    ] {
+        fx.host.set_exec(Ok(exec_output(b"", b"", end)));
+        ok(call("run_command", json!({"command": "x"})).await);
+        assert!(
+            last().ends_with(&format!("ran `x` on \"Acme\" {says}")),
+            "{}",
+            last()
+        );
+    }
+
+    // A command cannot forge a line.
+    let before = logs.text().lines().count();
+    ok(call(
+        "run_command",
+        json!({"command": "uptime\nINFO agent: forged\r"}),
+    )
+    .await);
+    assert_eq!(logs.text().lines().count(), before + 1);
+    assert!(
+        last().contains("ran `uptime INFO agent: forged ` on"),
+        "{}",
+        last()
+    );
+
+    // A cancelled command is on record.
+    let hold = fx.host.hold_exec();
+    let running = tokio::spawn({
+        let service = fx.service.clone();
+        let args = on(&fx.ssh, json!({"command": "sleep 100"}));
+        async move { service.call("run_command", args).await }
+    });
+    hold.entered().await;
+    running.abort();
+    assert!(running.await.unwrap_err().is_cancelled());
+    assert!(hold.dropped());
+    assert!(
+        last().ends_with("ran `sleep 100` on \"Acme\" (cancelled)"),
+        "{}",
+        last()
+    );
+    assert!(fx.service.activity().running.is_empty());
+
+    let log = logs.text();
+    for secret in ["hello world!", "SECRET-OUTPUT", "SECRET-ERR"] {
+        assert!(!log.contains(secret), "{log}");
+    }
 }

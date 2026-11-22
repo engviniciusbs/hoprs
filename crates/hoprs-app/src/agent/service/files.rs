@@ -1,17 +1,28 @@
-//! The reading tools on a site's files: `list_directory`, `stat` and `read_file`.
+//! The tools on a site's files: reading (`list_directory`, `stat`, `read_file`) and
+//! changing (`write_file`, `make_directory`, `rename`, `set_permissions`, `delete`).
 //!
-//! Every function here runs after the call's access check, on a site the call may read.
-//! A failed remote operation answers `<what failed>: <the error's English message>`;
-//! nothing here logs (the service writes the call's one line).
+//! Every function here runs after the call's access check, on a site the call may read
+//! (or, for the changing tools, change), with its arguments' values checked. A failed
+//! remote operation answers `<what failed>: <the error's English message>`; nothing here
+//! logs (the service writes the call's one line).
+//!
+//! **Nothing is replaced by default.** `write_file` refuses an existing path unless the
+//! call says `overwrite`, and always refuses a folder or a link at the path; `rename`
+//! never replaces what is at its target; `delete` removes a folder that is not empty only
+//! with `recursive`, and the walk removes a link as a link, never what it points to (see
+//! `backend::ops` for FTP servers that list a link to a folder as a folder).
 
 use std::time::SystemTime;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use hoprs_core::{EntryKind, Error, RemoteEntry, RemotePath, Site};
+use hoprs_core::{EntryKind, Error, ErrorKind, Protocol, RemoteEntry, RemotePath, Site};
 use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
+use tokio::sync::mpsc;
 
-use super::{Failure, Service};
+use super::{Done, Failure, Service, count};
+use crate::backend::edit::{self, UploadMode};
+use crate::backend::ops::{self, DeleteTarget};
 
 impl Service {
     /// The folder's entries sorted by name, the page `offset .. offset + limit` of them.
@@ -172,6 +183,209 @@ impl Service {
             "eof": eof,
         });
         Ok(vec![header.to_string(), text.to_owned()])
+    }
+}
+
+impl Service {
+    /// Writes `content` as the whole file (ruling 10): `stat` first, so an existing path
+    /// without `overwrite`, a folder and a link are refused before anything is written;
+    /// then like a remote edit, by a temporary file renamed over it on SFTP and in place
+    /// on FTP.
+    pub(super) async fn write_file(
+        &self,
+        site: &Site,
+        path: &RemotePath,
+        content: &str,
+        overwrite: bool,
+    ) -> Result<Done, Failure> {
+        let remote = self.remote(site).await?;
+        let what = format!("Could not write {path}");
+        match remote.stat(path).await {
+            Ok(found) => match found.kind {
+                EntryKind::Dir => {
+                    return Err(Failure::new(
+                        format!(
+                            "{path} is a folder: write_file writes files only, and never replaces a folder. Nothing was written."
+                        ),
+                        "a folder",
+                    ));
+                }
+                EntryKind::Symlink => {
+                    return Err(Failure::new(
+                        format!(
+                            "{path} is a symbolic link: write_file neither writes through a link nor replaces one. Write the file it points to by that file's own path. Nothing was written."
+                        ),
+                        "a symbolic link",
+                    ));
+                }
+                EntryKind::File if !overwrite => {
+                    return Err(Failure::new(
+                        format!(
+                            "{path} already exists, and nothing was written. To replace it, call write_file again with overwrite set to true."
+                        ),
+                        "already exists",
+                    ));
+                }
+                EntryKind::File => {}
+            },
+            Err(e) if e.kind == ErrorKind::NotFound => {}
+            Err(e) => return Err(failed(&what, &e)),
+        }
+        let mode = match site.protocol {
+            Protocol::Ssh => UploadMode::TempRename,
+            Protocol::Ftp | Protocol::FtpsExplicit | Protocol::FtpsImplicit => UploadMode::InPlace,
+        };
+        if let Err(cut) = edit::put(remote.as_ref(), path, mode, content.as_bytes()).await {
+            let mut failure = failed(&what, &cut.error);
+            if cut.may_be_incomplete {
+                failure.text.push_str(&format!(
+                    ". It was being written in place, so {path} on the server may now be incomplete: write it again, or check it with read_file."
+                ));
+            }
+            return Err(failure);
+        }
+        let result = json!({"ok": true, "path": path.as_str(), "bytes": content.len()});
+        Ok(vec![result.to_string()].into())
+    }
+
+    /// Creates the folder: its parent must exist, and a folder already there is fine
+    /// (every backend's `mkdir` answers so).
+    pub(super) async fn make_directory(
+        &self,
+        site: &Site,
+        path: &RemotePath,
+    ) -> Result<Done, Failure> {
+        let remote = self.remote(site).await?;
+        if let Err(e) = remote.mkdir(path).await {
+            let mut failure = failed(&format!("Could not create the folder {path}"), &e);
+            if e.kind == ErrorKind::NotFound {
+                failure
+                    .text
+                    .push_str(". Its parent folder must exist: create the folders above it first.");
+            }
+            return Err(failure);
+        }
+        Ok(vec![json!({"ok": true, "path": path.as_str()}).to_string()].into())
+    }
+
+    /// Renames or moves, never over something that is at `to`.
+    pub(super) async fn rename(
+        &self,
+        site: &Site,
+        from: &RemotePath,
+        to: &RemotePath,
+    ) -> Result<Done, Failure> {
+        let remote = self.remote(site).await?;
+        match ops::rename_no_replace(remote.as_ref(), from, to).await {
+            Ok(()) => {
+                let result = json!({"ok": true, "from": from.as_str(), "to": to.as_str()});
+                Ok(vec![result.to_string()].into())
+            }
+            Err(e) if e.kind == ErrorKind::Conflict => Err(Failure::new(
+                format!(
+                    "Could not rename {from} to {to}: something is already at {to}, and rename never replaces it. Nothing changed. Delete it first, or choose another name."
+                ),
+                "the target already exists",
+            )),
+            Err(e) => Err(failed(&format!("Could not rename {from} to {to}"), &e)),
+        }
+    }
+
+    /// Sets the permission bits. Over FTP it is `SITE CHMOD`, which many servers lack.
+    pub(super) async fn set_permissions(
+        &self,
+        site: &Site,
+        path: &RemotePath,
+        mode: u32,
+    ) -> Result<Done, Failure> {
+        let remote = self.remote(site).await?;
+        let what = format!("Could not change the permissions of {path}");
+        match remote.chmod(path, mode).await {
+            Ok(()) => {
+                let result =
+                    json!({"ok": true, "path": path.as_str(), "mode": format!("{mode:04o}")});
+                Ok(vec![result.to_string()].into())
+            }
+            // The FTP backend reports a command the server does not know (500, 502, 504)
+            // as an unexpected reply.
+            Err(e) if site.protocol != Protocol::Ssh && e.kind == ErrorKind::Protocol => {
+                Err(Failure::new(
+                    format!(
+                        "{what}: the FTP server of \"{}\" does not support changing permissions (it did not accept SITE CHMOD).",
+                        site.name
+                    ),
+                    "the server does not support it",
+                ))
+            }
+            Err(e) => Err(failed(&what, &e)),
+        }
+    }
+
+    /// Deletes a file or a link, an empty folder, or with `recursive` a folder and all in
+    /// it; answers how many items went. A failure half way says how many went before it.
+    pub(super) async fn delete(
+        &self,
+        site: &Site,
+        path: &RemotePath,
+        recursive: bool,
+    ) -> Result<Done, Failure> {
+        let remote = self.remote(site).await?;
+        let what = format!("Could not delete {path}");
+        let found = remote.stat(path).await.map_err(|e| failed(&what, &e))?;
+        if found.kind == EntryKind::Dir && !recursive {
+            let inside = remote.list(path).await.map_err(|e| failed(&what, &e))?;
+            let inside = inside
+                .iter()
+                .filter(|e| !matches!(e.name.as_str(), "" | "." | ".."))
+                .count();
+            if inside > 0 {
+                return Err(Failure::new(
+                    format!(
+                        "{path} is a folder that is not empty ({}). Nothing was deleted. To delete it with everything in it, call delete again with recursive set to true.",
+                        count(inside as u64, "item")
+                    ),
+                    "a folder that is not empty",
+                ));
+            }
+        }
+        let target = DeleteTarget {
+            path: path.clone(),
+            kind: found.kind,
+        };
+        let (progress, mut counts) = mpsc::unbounded_channel();
+        let result = ops::delete_all(remote.as_ref(), vec![target], &progress).await;
+        drop(progress);
+        match result {
+            Ok(deleted) => {
+                let result = json!({"ok": true, "path": path.as_str(), "deleted": deleted});
+                Ok(Done {
+                    blocks: vec![result.to_string()],
+                    note: Some(count(deleted, "item")),
+                })
+            }
+            Err(e) => {
+                // The last count sent is how far the walk got.
+                let mut deleted = 0;
+                while let Ok(n) = counts.try_recv() {
+                    deleted = n;
+                }
+                let mut failure = failed(&what, &e);
+                failure.text.push_str(&if deleted == 0 {
+                    ". Nothing was deleted.".to_owned()
+                } else {
+                    format!(
+                        ". {} deleted before the failure; the rest of {path} is still there.",
+                        if deleted == 1 {
+                            "1 item was".to_owned()
+                        } else {
+                            format!("{deleted} items were")
+                        }
+                    )
+                });
+                failure.reason = format!("{}; {} deleted", failure.reason, count(deleted, "item"));
+                Err(failure)
+            }
+        }
     }
 }
 

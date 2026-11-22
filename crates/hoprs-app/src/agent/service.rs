@@ -29,7 +29,13 @@
 //! it) writes its line then, ending in `(cancelled)`: whatever it already did is on
 //! record.
 //!
-//! All the work goes through [`AgentHost`], and no lock is held across an await.
+//! **Commands.** `run_command` runs one command at a time per site: a call waits for the
+//! site's turn (counted as running meanwhile, so the reaper leaves the session alone), and
+//! its time limit starts when its command does. The command line is logged (it is the
+//! record the user asked for, made one line like every other), its output never is.
+//!
+//! All the work goes through [`AgentHost`], and no std lock is held across an await (the
+//! command turn is a tokio lock, held for the command's run).
 
 mod files;
 
@@ -42,6 +48,7 @@ use futures_util::FutureExt;
 use futures_util::future::{BoxFuture, Shared};
 use hoprs_core::{AgentAccess, Error, ErrorKind, PathError, Protocol, RemotePath, Site, SiteId};
 use hoprs_remote::RemoteFs;
+use hoprs_ssh::{ExecEnd, ExecLimits};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -74,6 +81,8 @@ pub struct Service {
     next_attempt: AtomicU64,
     /// The last [`AgentEvent::Sites`] sent.
     sites_sent: Mutex<Option<Vec<SiteId>>>,
+    /// Each site's command turn: one `run_command` at a time per site.
+    commands: Mutex<HashMap<SiteId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// One connection attempt, awaited by every call that needs its site meanwhile.
@@ -188,6 +197,48 @@ impl Drop for Running<'_> {
     }
 }
 
+/// A site's command turn, held by one `run_command` call from before it waits until it
+/// ends or is dropped. The last holder removes the site's entry.
+struct CommandTurn<'a> {
+    service: &'a Service,
+    site: SiteId,
+    turn: Option<Arc<tokio::sync::Mutex<()>>>,
+}
+
+impl<'a> CommandTurn<'a> {
+    fn take(service: &'a Service, site: &SiteId) -> CommandTurn<'a> {
+        let turn = service.commands().entry(site.clone()).or_default().clone();
+        CommandTurn {
+            service,
+            site: site.clone(),
+            turn: Some(turn),
+        }
+    }
+
+    /// Waits for the site's turn.
+    async fn lock(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.turn
+            .as_ref()
+            .expect("taken until dropped")
+            .lock()
+            .await
+    }
+}
+
+impl Drop for CommandTurn<'_> {
+    fn drop(&mut self) {
+        drop(self.turn.take());
+        let mut commands = self.service.commands();
+        // Clones are made under this lock only: a count of one is the map's own.
+        if commands
+            .get(&self.site)
+            .is_some_and(|turn| Arc::strong_count(turn) == 1)
+        {
+            commands.remove(&self.site);
+        }
+    }
+}
+
 /// A call that failed after its access check: the agent's text, and the outcome the log
 /// line gives (never an error's detail, never content).
 struct Failure {
@@ -243,14 +294,69 @@ struct ReadArgs {
     length: Option<u64>,
 }
 
+/// `write_file`. `Debug` is not derived: `content` is the file's content.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WriteArgs {
+    site: String,
+    path: String,
+    content: String,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// `rename`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RenameArgs {
+    site: String,
+    from: String,
+    to: String,
+}
+
+/// `set_permissions`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChmodArgs {
+    site: String,
+    path: String,
+    mode: String,
+}
+
+/// `delete`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteArgs {
+    site: String,
+    path: String,
+    #[serde(default)]
+    recursive: bool,
+}
+
+/// `run_command`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RunArgs {
+    site: String,
+    command: String,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+}
+
 /// A call's arguments, checked against its tool's schema.
 enum Args {
     ListSites,
     List(ListArgs),
     Stat(PathArgs),
     Read(ReadArgs),
-    /// A tool this version does not run yet (writing, commands, transfers): its access
-    /// is checked all the same.
+    Write(WriteArgs),
+    Mkdir(PathArgs),
+    Rename(RenameArgs),
+    Chmod(ChmodArgs),
+    Delete(DeleteArgs),
+    Run(RunArgs),
+    /// A tool this version does not run yet (transfers): its access is checked all the
+    /// same.
     Later {
         site: Option<String>,
     },
@@ -264,6 +370,12 @@ impl Args {
             "list_directory" => Args::List(typed(spec, map)?),
             "stat" => Args::Stat(typed(spec, map)?),
             "read_file" => Args::Read(typed(spec, map)?),
+            "write_file" => Args::Write(typed(spec, map)?),
+            "make_directory" => Args::Mkdir(typed(spec, map)?),
+            "rename" => Args::Rename(typed(spec, map)?),
+            "set_permissions" => Args::Chmod(typed(spec, map)?),
+            "delete" => Args::Delete(typed(spec, map)?),
+            "run_command" => Args::Run(typed(spec, map)?),
             _ => Args::Later {
                 site: map.get("site").and_then(Value::as_str).map(str::to_owned),
             },
@@ -275,20 +387,198 @@ impl Args {
         match self {
             Args::ListSites => None,
             Args::List(a) => Some(&a.site),
-            Args::Stat(a) => Some(&a.site),
+            Args::Stat(a) | Args::Mkdir(a) => Some(&a.site),
             Args::Read(a) => Some(&a.site),
+            Args::Write(a) => Some(&a.site),
+            Args::Rename(a) => Some(&a.site),
+            Args::Chmod(a) => Some(&a.site),
+            Args::Delete(a) => Some(&a.site),
+            Args::Run(a) => Some(&a.site),
             Args::Later { site } => site.as_deref(),
         }
     }
+}
 
-    /// The `path` argument, for the tools that take one.
-    fn path(&self) -> Option<&str> {
+/// A call on a site with its arguments' values checked: remote paths valid, the content
+/// and the mode within their rules, the time limit clamped.
+enum Job {
+    List {
+        path: RemotePath,
+        offset: u64,
+        limit: Option<u64>,
+    },
+    Stat {
+        path: RemotePath,
+    },
+    Read {
+        path: RemotePath,
+        offset: u64,
+        length: Option<u64>,
+    },
+    Write {
+        path: RemotePath,
+        content: String,
+        overwrite: bool,
+    },
+    Mkdir {
+        path: RemotePath,
+    },
+    Rename {
+        from: RemotePath,
+        to: RemotePath,
+    },
+    Chmod {
+        path: RemotePath,
+        mode: u32,
+    },
+    Delete {
+        path: RemotePath,
+        recursive: bool,
+    },
+    Run {
+        command: String,
+        timeout: Duration,
+    },
+    Later,
+}
+
+impl Job {
+    /// The job of `args` on `site`, or the refusal of a value that breaks its rule.
+    fn new(site: &Site, args: Args, limits: &Limits) -> Result<Job, Refusal> {
+        let bad = |text: String| Refusal {
+            text,
+            reason: "bad arguments",
+        };
+        let path = |name: &str, raw: &str| remote_path(site, name, raw).map_err(bad);
+        Ok(match args {
+            Args::List(a) => Job::List {
+                path: path("path", &a.path)?,
+                offset: a.offset,
+                limit: a.limit,
+            },
+            Args::Stat(a) => Job::Stat {
+                path: path("path", &a.path)?,
+            },
+            Args::Read(a) => Job::Read {
+                path: path("path", &a.path)?,
+                offset: a.offset,
+                length: a.length,
+            },
+            Args::Write(a) => {
+                let path = path("path", &a.path)?;
+                if a.content.len() > limits.file_max {
+                    return Err(Refusal {
+                        text: format!(
+                            "The content is {} bytes: write_file takes at most {} bytes per call. Nothing was written. For a larger file, use upload.",
+                            a.content.len(),
+                            limits.file_max
+                        ),
+                        reason: "content over the limit",
+                    });
+                }
+                Job::Write {
+                    path,
+                    content: a.content,
+                    overwrite: a.overwrite,
+                }
+            }
+            Args::Mkdir(a) => Job::Mkdir {
+                path: path("path", &a.path)?,
+            },
+            Args::Rename(a) => {
+                let (from, to) = (path("from", &a.from)?, path("to", &a.to)?);
+                for (name, p) in [("from", &from), ("to", &to)] {
+                    if *p == RemotePath::root() {
+                        return Err(bad(format!(
+                            "Argument `{name}` is the root folder /, which rename cannot move or replace."
+                        )));
+                    }
+                }
+                Job::Rename { from, to }
+            }
+            Args::Chmod(a) => Job::Chmod {
+                path: path("path", &a.path)?,
+                mode: octal_mode(&a.mode).ok_or_else(|| {
+                    bad("Argument `mode` must be 3 or 4 octal digits (0 to 7), such as \"644\" or \"0755\".".to_owned())
+                })?,
+            },
+            Args::Delete(a) => {
+                let path = path("path", &a.path)?;
+                if path == RemotePath::root() {
+                    return Err(bad(
+                        "delete refuses the root folder /: name the files or folders under it instead."
+                            .to_owned(),
+                    ));
+                }
+                Job::Delete {
+                    path,
+                    recursive: a.recursive,
+                }
+            }
+            Args::Run(a) => {
+                // The schema's minimum is 1; a value over the maximum is the maximum.
+                let max = limits.exec_max.as_secs().max(1);
+                let timeout = a
+                    .timeout_seconds
+                    .map_or(limits.exec_default, |s| Duration::from_secs(s.clamp(1, max)));
+                Job::Run {
+                    command: a.command,
+                    timeout,
+                }
+            }
+            Args::ListSites | Args::Later { .. } => Job::Later,
+        })
+    }
+
+    /// What the call does, for its log line (never content).
+    fn action(&self, spec: &ToolSpec) -> String {
         match self {
-            Args::List(a) => Some(&a.path),
-            Args::Stat(a) => Some(&a.path),
-            Args::Read(a) => Some(&a.path),
-            Args::ListSites | Args::Later { .. } => None,
+            Job::List { path, .. } => format!("listed {path}"),
+            Job::Stat { path } => format!("described {path}"),
+            Job::Read { path, .. } => format!("read {path}"),
+            Job::Write { path, content, .. } => {
+                format!("wrote {path} ({})", count(content.len() as u64, "byte"))
+            }
+            Job::Mkdir { path } => format!("created the folder {path}"),
+            Job::Rename { from, to } => format!("renamed {from} to {to}"),
+            Job::Chmod { path, mode } => {
+                format!("changed the permissions of {path} to {mode:04o}")
+            }
+            Job::Delete { path, .. } => format!("deleted {path}"),
+            Job::Run { command, .. } => format!("ran `{command}`"),
+            Job::Later => spec.name.to_owned(),
         }
+    }
+}
+
+/// What a call that worked answers, and what its log line adds (in parentheses).
+struct Done {
+    blocks: Vec<String>,
+    note: Option<String>,
+}
+
+impl From<Vec<String>> for Done {
+    fn from(blocks: Vec<String>) -> Done {
+        Done { blocks, note: None }
+    }
+}
+
+/// `"1 item"`, `"3 items"`.
+fn count(n: u64, what: &str) -> String {
+    if n == 1 {
+        format!("1 {what}")
+    } else {
+        format!("{n} {what}s")
+    }
+}
+
+/// `"644"` or `"0755"` as mode bits: three or four ASCII octal digits, nothing else.
+fn octal_mode(text: &str) -> Option<u32> {
+    let digits = (3..=4).contains(&text.len()) && text.bytes().all(|b| (b'0'..=b'7').contains(&b));
+    if digits {
+        u32::from_str_radix(text, 8).ok()
+    } else {
+        None
     }
 }
 
@@ -308,6 +598,7 @@ impl Service {
             connecting: Mutex::default(),
             next_attempt: AtomicU64::new(0),
             sites_sent: Mutex::default(),
+            commands: Mutex::default(),
         })
     }
 
@@ -454,41 +745,54 @@ impl Service {
 
     /// A call on a site that passed its check: the tool, then the log line.
     async fn on_site(&self, spec: &ToolSpec, site: &Site, args: Args) -> (Reply, String) {
-        let path = match args.path().map(|raw| remote_path(site, "path", raw)) {
-            None => None,
-            Some(Ok(path)) => Some(path),
-            Some(Err(text)) => {
-                return refused(
-                    spec.name,
-                    Refusal {
-                        text,
-                        reason: "bad arguments",
-                    },
-                );
-            }
+        let job = match Job::new(site, args, &self.limits) {
+            Ok(job) => job,
+            Err(refusal) => return refused(spec.name, refusal),
         };
         let mut running = Running::start(self, &site.id);
-        let action = match (&args, &path) {
-            (Args::List(_), Some(path)) => format!("listed {path}"),
-            (Args::Stat(_), Some(path)) => format!("described {path}"),
-            (Args::Read(_), Some(path)) => format!("read {path}"),
-            _ => spec.name.to_owned(),
-        };
-        let done = format!("{action} on \"{}\"", site.name);
+        let done = format!("{} on \"{}\"", job.action(spec), site.name);
         running.pending = Some(done.clone());
-        let result = match (args, path) {
-            (Args::List(a), Some(path)) => {
-                self.list_directory(site, &path, a.offset, a.limit).await
-            }
-            (Args::Stat(_), Some(path)) => self.stat(site, &path).await,
-            (Args::Read(a), Some(path)) => self.read_file(site, &path, a.offset, a.length).await,
-            _ => Err(Failure::new(not_yet(spec), "not available in this version")),
+        let result = match job {
+            Job::List {
+                path,
+                offset,
+                limit,
+            } => self
+                .list_directory(site, &path, offset, limit)
+                .await
+                .map(Done::from),
+            Job::Stat { path } => self.stat(site, &path).await.map(Done::from),
+            Job::Read {
+                path,
+                offset,
+                length,
+            } => self
+                .read_file(site, &path, offset, length)
+                .await
+                .map(Done::from),
+            Job::Write {
+                path,
+                content,
+                overwrite,
+            } => self.write_file(site, &path, &content, overwrite).await,
+            Job::Mkdir { path } => self.make_directory(site, &path).await,
+            Job::Rename { from, to } => self.rename(site, &from, &to).await,
+            Job::Chmod { path, mode } => self.set_permissions(site, &path, mode).await,
+            Job::Delete { path, recursive } => self.delete(site, &path, recursive).await,
+            Job::Run { command, timeout } => self.run_command(site, &command, timeout).await,
+            Job::Later => Err(Failure::new(not_yet(spec), "not available in this version")),
         };
         // It ended: the caller writes its line.
         running.pending = None;
         drop(running);
         match result {
-            Ok(blocks) => (Reply::Ok(blocks), done),
+            Ok(Done { blocks, note }) => {
+                let line = match note {
+                    Some(note) => format!("{done} ({note})"),
+                    None => done,
+                };
+                (Reply::Ok(blocks), line)
+            }
             Err(failure) => (
                 Reply::Err(failure.text),
                 format!("{done} (failed: {})", failure.reason),
@@ -543,6 +847,76 @@ impl Service {
                 ),
                 "connection closed",
             )
+        })
+    }
+
+    /// Runs one command, after the site's command turn (one at a time per site): the
+    /// time limit starts when the command does. The answer is ruling 7's header (with
+    /// `lost`), then the non-empty streams, decoded lossily; the log adds how it ended.
+    async fn run_command(
+        &self,
+        site: &Site,
+        command: &str,
+        timeout: Duration,
+    ) -> Result<Done, Failure> {
+        let turn = CommandTurn::take(self, &site.id);
+        let _held = turn.lock().await;
+        let session = self.session(site).await?;
+        let limits = ExecLimits {
+            stream_bytes: self.limits.exec_stream,
+            timeout,
+        };
+        let out = self
+            .host
+            .exec(session, command.to_owned(), limits)
+            .await
+            .map_err(|e| {
+                let mut text = format!(
+                    "Could not run the command on \"{}\": {}.",
+                    site.name, e.message
+                );
+                if e.kind == ErrorKind::Network {
+                    text.push_str(" The connection may have been lost: call the tool again.");
+                }
+                Failure::new(text, e.message.clone())
+            })?;
+        let (exit_code, signal, note) = match &out.end {
+            ExecEnd::Exit(code) => (Some(*code), None, format!("exit {code}")),
+            ExecEnd::Signal(name) => (None, Some(name.clone()), format!("signal {name}")),
+            ExecEnd::TimedOut => (None, None, "timed out".to_owned()),
+            ExecEnd::Lost => (None, None, "connection lost".to_owned()),
+        };
+        let mut header = json!({
+            "exit_code": exit_code,
+            "signal": signal,
+            "timed_out": out.end == ExecEnd::TimedOut,
+            "lost": out.end == ExecEnd::Lost,
+            "stdout_truncated": out.stdout_truncated,
+            "stderr_truncated": out.stderr_truncated,
+        });
+        let explained = match out.end {
+            ExecEnd::TimedOut => Some(format!(
+                "The command ran past its time limit of {}: hoprs stopped waiting and sent it a KILL signal, but the process may still be running on the server.",
+                span(timeout)
+            )),
+            ExecEnd::Lost => Some(
+                "The connection was lost before the command ended: it may or may not have finished. Check its effects before running it again."
+                    .to_owned(),
+            ),
+            _ => None,
+        };
+        if let (Some(text), Value::Object(map)) = (explained, &mut header) {
+            map.insert("note".to_owned(), Value::from(text));
+        }
+        let mut blocks = vec![header.to_string()];
+        for (name, bytes) in [("stdout", &out.stdout), ("stderr", &out.stderr)] {
+            if !bytes.is_empty() {
+                blocks.push(format!("{name}:\n{}", String::from_utf8_lossy(bytes)));
+            }
+        }
+        Ok(Done {
+            blocks,
+            note: Some(note),
         })
     }
 
@@ -647,6 +1021,10 @@ impl Service {
 
     fn connecting(&self) -> MutexGuard<'_, HashMap<SiteId, Pending>> {
         lock(&self.connecting)
+    }
+
+    fn commands(&self) -> MutexGuard<'_, HashMap<SiteId, Arc<tokio::sync::Mutex<()>>>> {
+        lock(&self.commands)
     }
 
     fn send(&self, event: AgentEvent) {

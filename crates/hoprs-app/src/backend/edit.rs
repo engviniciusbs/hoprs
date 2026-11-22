@@ -1407,21 +1407,34 @@ async fn write_remote(fs: &dyn RemoteFs, remote: &RemotePath, data: &[u8]) -> Re
     Ok(())
 }
 
+/// Why [`put`] did not write the file.
+#[derive(Debug)]
+pub(crate) struct PutError {
+    pub error: Error,
+    /// The file itself was being written (in place) when it failed: what is on the
+    /// server may now be incomplete. False when only a temporary file was cut, or nothing
+    /// was written.
+    pub may_be_incomplete: bool,
+}
+
 /// Writes `data` to `remote` the way a remote edit uploads (see the module docs): by
 /// `mode`, keeping the mode bits of the file it replaces. An agent's `write_file`. A
 /// temporary file a cut upload leaves behind is removed (best effort).
-// TODO(Task 10): remove
-#[allow(dead_code)]
 pub(crate) async fn put(
     fs: &dyn RemoteFs,
     remote: &RemotePath,
     mode: UploadMode,
     data: &[u8],
-) -> Result<()> {
+) -> std::result::Result<(), PutError> {
     let mode_bits = match fs.stat(remote).await {
         Ok(entry) => entry.mode,
         Err(error) if error.kind == ErrorKind::NotFound => None,
-        Err(error) => return Err(error),
+        Err(error) => {
+            return Err(PutError {
+                error,
+                may_be_incomplete: false,
+            });
+        }
     };
     match upload(fs, remote, mode, data, mode_bits).await {
         Ok(()) => Ok(()),
@@ -1429,7 +1442,10 @@ pub(crate) async fn put(
             if let Some(orphan) = cut.orphan {
                 let _ = fs.remove_file(&orphan).await;
             }
-            Err(cut.error)
+            Err(PutError {
+                error: cut.error,
+                may_be_incomplete: cut.clobbered,
+            })
         }
     }
 }

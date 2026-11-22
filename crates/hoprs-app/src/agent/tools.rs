@@ -288,7 +288,7 @@ static TOOLS: [ToolSpec; 13] = [
     ToolSpec {
         name: "write_file",
         title: "Write a text file",
-        description: "Writes a text file on a site: the whole content replaces the file. At most 1 MiB (1048576 bytes) of content per call; for more, use upload. With overwrite false (the default) a path that already exists is an error and nothing is written; with true the old content is destroyed. Over SFTP the file is written to a temporary name and renamed over the old one; over FTP and FTPS it is written in place. Needs full access. The site is an id from list_sites.",
+        description: "Writes a text file on a site: the whole content replaces the file. At most 1 MiB (1048576 bytes) of content per call; for more, use upload. With overwrite false (the default) a path that already exists is an error and nothing is written; with true the old content is destroyed. A folder or a symbolic link at the path is always an error. Over SFTP the file is written to a temporary name and renamed over the old one; over FTP and FTPS it is written in place, so a write cut half way can leave the file incomplete (the error says so). Needs full access. The site is an id from list_sites.",
         schema: schema_write_file,
         need: Need::All,
         read_only: false,
@@ -310,7 +310,7 @@ static TOOLS: [ToolSpec; 13] = [
     ToolSpec {
         name: "rename",
         title: "Rename or move",
-        description: "Renames or moves a file or folder on a site (a different folder in `to` moves it). Whether an existing target is replaced depends on the server. Needs full access. The site is an id from list_sites.",
+        description: "Renames or moves a file or folder on a site (a different folder in `to` moves it). An existing target is never replaced: if something is already at `to`, the call is an error and nothing changes. Needs full access. The site is an id from list_sites.",
         schema: schema_rename,
         need: Need::All,
         read_only: false,
@@ -343,7 +343,7 @@ static TOOLS: [ToolSpec; 13] = [
     ToolSpec {
         name: "delete",
         title: "Delete",
-        description: "Deletes a file or folder on a site. This cannot be undone. A folder that is not empty is an error unless recursive is true, which deletes everything inside it. Needs full access. The site is an id from list_sites.",
+        description: "Deletes a file, a symbolic link or a folder on a site. This cannot be undone. A folder that is not empty is an error unless recursive is true, which deletes everything inside it; a link is removed as a link, never what it points to. The root folder / is refused. The answer says how many items were deleted. Needs full access. The site is an id from list_sites.",
         schema: schema_delete,
         need: Need::All,
         read_only: false,
@@ -354,7 +354,7 @@ static TOOLS: [ToolSpec; 13] = [
     ToolSpec {
         name: "run_command",
         title: "Run a command over SSH",
-        description: "Runs one command on an SSH site and returns its exit code (or the signal that ended it), whether it timed out, and its output (stdout, then stderr). There is no terminal and no input: the command cannot ask a question, and programs that need a terminal will not work. The command is stopped after timeout_seconds (60 by default, 600 at most). Each output stream is cut at 256 KiB and the answer says when it was. The command can change anything the site's user can. One command at a time runs per site; the next waits. Only for SSH sites: FTP sites cannot run commands. Needs full access. The site is an id from list_sites.",
+        description: "Runs one command on an SSH site and returns its exit code (or the signal that ended it), whether it timed out, and its output (stdout, then stderr). There is no terminal and no input: the command cannot ask a question, and programs that need a terminal will not work. After timeout_seconds (60 by default, 600 at most) hoprs stops waiting and sends the command a KILL signal; the answer then says timed_out, and the process may still be running on the server. If the connection is lost before the command ends, the answer says lost. Each output stream is cut at 256 KiB and the answer says when it was. The command can change anything the site's user can. One command at a time runs per site; the next waits. Only for SSH sites: FTP sites cannot run commands. Needs full access. The site is an id from list_sites.",
         schema: schema_run_command,
         need: Need::AllSsh,
         read_only: false,

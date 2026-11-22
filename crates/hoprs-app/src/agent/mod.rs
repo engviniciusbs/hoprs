@@ -77,14 +77,8 @@ pub struct Limits {
     pub list_default: usize,
     pub list_max: usize,
     pub file_max: usize,
-    // TODO(Task 10): remove
-    #[allow(dead_code)]
     pub exec_stream: usize,
-    // TODO(Task 10): remove
-    #[allow(dead_code)]
     pub exec_default: Duration,
-    // TODO(Task 10): remove
-    #[allow(dead_code)]
     pub exec_max: Duration,
     // TODO(Task 11): remove
     #[allow(dead_code)]

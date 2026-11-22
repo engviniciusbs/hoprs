@@ -17,6 +17,8 @@
 //! hold tells when a call reached it and whether a held call was dropped (its caller went
 //! away). [`calls`](FakeHost::calls) counts the calls per site and kind, and
 //! [`streamed`](FakeHost::streamed) the bytes read from a site's files.
+//! [`fail`](FakeHost::fail) makes one kind of call of a site fail as a real backend
+//! would (an FTP server without `SITE CHMOD`, a connection cut during a write).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -160,6 +162,8 @@ struct State {
     execs: Vec<(SiteId, String, ExecLimits)>,
     exec_hold: Option<Weak<HoldState>>,
     holds: HashMap<(SiteId, FsOp), Weak<HoldState>>,
+    /// Calls that fail, after they are counted and held (see [`FakeHost::fail`]).
+    failures: HashMap<(SiteId, FsOp), Error>,
     connect_holds: HashMap<SiteId, Weak<HoldState>>,
     /// Each site's connect lock (the real host's per-site turn).
     turns: HashMap<SiteId, Arc<tokio::sync::Mutex<()>>>,
@@ -194,8 +198,9 @@ impl Shared {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Counts a call and waits at its hold, if any.
-    async fn enter(&self, site: &SiteId, op: FsOp) {
+    /// Counts a call and waits at its hold, if any; then the call's failure, if one is
+    /// set.
+    async fn enter(&self, site: &SiteId, op: FsOp) -> Result<()> {
         let hold = {
             let mut state = self.state();
             *state.calls.entry((site.clone(), op)).or_default() += 1;
@@ -203,6 +208,10 @@ impl Shared {
         };
         if let Some(hold) = hold {
             pass(&hold).await;
+        }
+        match self.state().failures.get(&(site.clone(), op)) {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
         }
     }
 
@@ -244,6 +253,7 @@ impl FakeHost {
                     execs: Vec::new(),
                     exec_hold: None,
                     holds: HashMap::new(),
+                    failures: HashMap::new(),
                     connect_holds: HashMap::new(),
                     turns: HashMap::new(),
                     zero_size: HashSet::new(),
@@ -372,8 +382,6 @@ impl FakeHost {
     }
 
     /// What the next commands return.
-    // TODO(Task 10): remove
-    #[allow(dead_code)]
     pub fn set_exec(&self, output: Result<ExecOutput>) {
         self.state().exec_output = output;
     }
@@ -411,6 +419,12 @@ impl FakeHost {
         let hold = Hold::new();
         self.state().holds.insert((site.clone(), op), hold.weak());
         hold
+    }
+
+    /// Every later call of kind `op` on the site fails with `error` (counted and held
+    /// first), touching nothing: build `error` the way the real backend reports that case.
+    pub fn fail(&self, site: &SiteId, op: FsOp, error: Error) {
+        self.state().failures.insert((site.clone(), op), error);
     }
 
     /// How many filesystem calls of kind `op` the site's remote received.
@@ -637,20 +651,20 @@ struct HeldFs {
 }
 
 impl HeldFs {
-    async fn enter(&self, op: FsOp) {
-        self.shared.enter(&self.site, op).await;
+    async fn enter(&self, op: FsOp) -> Result<()> {
+        self.shared.enter(&self.site, op).await
     }
 }
 
 #[async_trait]
 impl RemoteFs for HeldFs {
     async fn list(&self, path: &RemotePath) -> Result<Vec<RemoteEntry>> {
-        self.enter(FsOp::List).await;
+        self.enter(FsOp::List).await?;
         self.inner.list(path).await
     }
 
     async fn stat(&self, path: &RemotePath) -> Result<RemoteEntry> {
-        self.enter(FsOp::Stat).await;
+        self.enter(FsOp::Stat).await?;
         let mut entry = self.inner.stat(path).await?;
         let key = (self.site.clone(), path.clone());
         if self.shared.state().zero_size.contains(&key) {
@@ -660,12 +674,12 @@ impl RemoteFs for HeldFs {
     }
 
     async fn size(&self, path: &RemotePath) -> Result<u64> {
-        self.enter(FsOp::Read).await;
+        self.enter(FsOp::Read).await?;
         self.inner.size(path).await
     }
 
     async fn open_read(&self, path: &RemotePath, offset: u64) -> Result<BoxAsyncRead> {
-        self.enter(FsOp::Read).await;
+        self.enter(FsOp::Read).await?;
         let inner = self.inner.open_read(path, offset).await?;
         Ok(Box::new(CountingReader {
             inner,
@@ -675,37 +689,37 @@ impl RemoteFs for HeldFs {
     }
 
     async fn open_write(&self, path: &RemotePath, offset: u64) -> Result<BoxAsyncWrite> {
-        self.enter(FsOp::Write).await;
+        self.enter(FsOp::Write).await?;
         self.inner.open_write(path, offset).await
     }
 
     async fn mkdir(&self, path: &RemotePath) -> Result<()> {
-        self.enter(FsOp::Mkdir).await;
+        self.enter(FsOp::Mkdir).await?;
         self.inner.mkdir(path).await
     }
 
     async fn rename(&self, from: &RemotePath, to: &RemotePath) -> Result<()> {
-        self.enter(FsOp::Rename).await;
+        self.enter(FsOp::Rename).await?;
         self.inner.rename(from, to).await
     }
 
     async fn remove_file(&self, path: &RemotePath) -> Result<()> {
-        self.enter(FsOp::Remove).await;
+        self.enter(FsOp::Remove).await?;
         self.inner.remove_file(path).await
     }
 
     async fn remove_dir(&self, path: &RemotePath) -> Result<()> {
-        self.enter(FsOp::Remove).await;
+        self.enter(FsOp::Remove).await?;
         self.inner.remove_dir(path).await
     }
 
     async fn chmod(&self, path: &RemotePath, mode: u32) -> Result<()> {
-        self.enter(FsOp::Chmod).await;
+        self.enter(FsOp::Chmod).await?;
         self.inner.chmod(path, mode).await
     }
 
     async fn set_modified(&self, path: &RemotePath, mtime: SystemTime) -> Result<()> {
-        self.enter(FsOp::Chmod).await;
+        self.enter(FsOp::Chmod).await?;
         self.inner.set_modified(path, mtime).await
     }
 }
