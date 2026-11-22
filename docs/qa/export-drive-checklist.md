@@ -25,7 +25,7 @@ Automated rows first, then the steps that need a person on a real display and a 
 | The ⋯ menu and Ctrl+K offer "Export everything…" | Pass: `sidebar_options_offer_export_everything`, `palette_lists_export_everything` |
 | The Export… buttons in the site and workspace forms open the screen for the saved entry | Pass: `site_form_export_opens_the_export_screen`, `workspace_form_export_opens_the_export_screen` |
 | The three menu items use the shield icon and the Export texts | Pass: `export_labels_and_icon` |
-| Every new text in English, pt-BR and Turkish | Pass: `every_en_key_is_used` and the catalog parity tests |
+| Every new text in English, pt-BR and Turkish | Pass: `every_en_key_is_used`, `strings_rs_keys_exist`, `catalogs_parse_without_errors`, `same_keys_and_variables_in_both_languages`, `pt_br_values_differ_from_english`, `tr_values_differ_from_english` |
 | The screen's look, the dialogs and the file round trips on real machines, in English, pt-BR and Turkish | NEEDS HUMAN: steps below |
 
 ### NEEDS HUMAN
@@ -43,15 +43,17 @@ sites and saved tabs. Run a debug or release build of this branch: `cargo run -p
    macOS and Windows.
 2. **Right-click.** Right-click a site in the sidebar: "Export…" is in the menu. Choose it:
    the title says `Export "<site name>" (site)`. Do the same on a workspace: the title says
-   `(workspace, N sites)`. Close the screen (Escape or the sidebar) and check nothing was
-   written.
+   `(workspace, N sites)`. Close the screen with Cancel and check nothing was written
+   (Escape does not close it, as for every form in the middle of the window).
 3. **Everything.** Sidebar ⋯ menu → "Export everything…", and Ctrl+K → "Export everything…"
    (Ctrl+Shift+K inside a terminal): both open the screen titled "Export everything". Settings
    → Backup → "Export backup…" opens the same screen; "Restore backup…" is still there.
 4. **Keyboard only.** Without the mouse: select a site in the sidebar, press Enter or the
    edit shortcut to open its form, Tab to "Export…" (it shows only when editing, not for a new
    site), press Enter. The screen opens for that site. Tab through File, Choose…, the two
-   password fields and Export; Escape leaves. Repeat from a workspace's form.
+   password fields and Export. Escape does not close the screen (no form in the middle of
+   the window closes with Escape): Cancel closes it, or Done after an export. Repeat from a
+   workspace's form.
 5. **Save dialog and default name.** On the screen click "Choose…": the save dialog proposes
    `hoprs-<site name in lowercase, with - between words>-<today's date>.hoprs` in Documents (or
    home). For everything: `hoprs-backup-<date>.hoprs`. A name with accents or spaces
