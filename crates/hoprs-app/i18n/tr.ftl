@@ -807,6 +807,10 @@ error-edit-unmatched-quote = Düzenleyici komutunda eşleşmeyen tırnak var
 error-edit-no-editor = Düzenleyici komutu ayarlanmamış
 error-edit-cannot-start-editor = Düzenleyici başlatılamıyor
 error-edit-path-refused = Bu uzak yol yerel olarak düzenlenemez
+error-drive-connect-cancelled = Google Drive bağlantısı iptal edildi
+error-drive-connect-timed-out = Tarayıcı 5 dakika içinde yanıt vermedi
+error-drive-connect-denied = Google Drive erişimi verilmedi
+error-drive-connect-failed = Google Drive'a bağlanılamadı
 
 # Klasör karşılaştırma paneli (paneller ile kuyruk arasında).
 compare-button = Karşılaştır

@@ -851,6 +851,10 @@ error-edit-unmatched-quote = O comando do editor tem aspas sem fechar
 error-edit-no-editor = Nenhum comando de editor definido
 error-edit-cannot-start-editor = Não foi possível iniciar o editor
 error-edit-path-refused = Este caminho remoto não pode ser editado localmente
+error-drive-connect-cancelled = Conexão com o Google Drive cancelada
+error-drive-connect-timed-out = O navegador não respondeu em 5 minutos
+error-drive-connect-denied = O acesso ao Google Drive não foi concedido
+error-drive-connect-failed = Não foi possível conectar ao Google Drive
 
 # The folder compare panel (between the panes and the queue).
 compare-button = Comparar

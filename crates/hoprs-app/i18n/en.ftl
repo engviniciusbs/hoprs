@@ -894,6 +894,10 @@ error-edit-unmatched-quote = The editor command has an unmatched quote
 error-edit-no-editor = No editor command is set
 error-edit-cannot-start-editor = Cannot start the editor
 error-edit-path-refused = This remote path cannot be edited locally
+error-drive-connect-cancelled = Connection to Google Drive cancelled
+error-drive-connect-timed-out = The browser did not answer in 5 minutes
+error-drive-connect-denied = Access to Google Drive was not granted
+error-drive-connect-failed = Could not connect to Google Drive
 
 # The folder compare panel (between the panes and the queue).
 compare-button = Compare

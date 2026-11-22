@@ -14,8 +14,6 @@ pub const CLIENT_SECRET_ENV: &str = "HOPRS_GOOGLE_CLIENT_SECRET";
 /// Debug builds only: one `https://` base under which the five endpoints live.
 pub const BASE_URL_ENV: &str = "HOPRS_DRIVE_URL";
 /// The only scope hoprs asks for: files this app created.
-// TODO(task 8): the OAuth flow sends the scope; remove this allow then.
-#[allow(dead_code)]
 pub const SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
 /// The folder the exports go to.
 // TODO(task 9): the upload looks the folder up; remove this allow then.
@@ -24,7 +22,7 @@ pub const FOLDER: &str = "hoprs";
 
 /// The OAuth client of this build.
 #[derive(Clone, PartialEq, Eq)]
-// TODO(task 8): the OAuth flow reads these fields; remove this allow then.
+// TODO(task 9 or 10): the connect flow reads these fields; remove this allow then.
 #[allow(dead_code)]
 pub struct OAuthClient {
     pub id: String,
@@ -39,7 +37,7 @@ impl fmt::Debug for OAuthClient {
 }
 
 /// The client of this build, or `None` when the build has none (Drive is then hidden).
-// TODO(task 8): the connect flow calls this; remove this allow then.
+// TODO(task 9 or 10): the connect flow calls this; remove this allow then.
 #[allow(dead_code)]
 pub fn client() -> Option<OAuthClient> {
     choose(
@@ -81,8 +79,6 @@ fn choose(
 
 /// Where each Google call goes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-// TODO(task 8): the OAuth and upload calls read these fields; remove this allow then.
-#[allow(dead_code)]
 pub struct Endpoints {
     pub auth: String,
     pub token: String,
@@ -118,7 +114,7 @@ pub fn under(base: &str) -> Option<Endpoints> {
 }
 
 /// The endpoints in use: Google's, or in a debug build those under `HOPRS_DRIVE_URL`.
-// TODO(task 8): the OAuth and upload calls use this; remove this allow then.
+// TODO(task 9 or 10): the OAuth and upload calls use this; remove this allow then.
 #[allow(dead_code)]
 pub fn current() -> Endpoints {
     if cfg!(debug_assertions)
