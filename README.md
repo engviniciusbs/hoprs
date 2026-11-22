@@ -76,8 +76,8 @@ transfer queue behind it, in one quiet window that opens in under 100 ms and idl
   file changed on the server you choose what happens instead of losing either side.
 - **Credentials in the system keyring** (Secret Service, macOS Keychain, Windows Credential Manager). Site files hold no secrets.
   `ssh-agent` is supported and preferred.
-- **Encrypted backup:** export and import all sites, workspaces and passwords in one file
-  (Argon2id and XChaCha20-Poly1305).
+- **Encrypted backup:** export everything, one workspace or one site, and restore it, in one
+  encrypted file with the passwords (Argon2id and XChaCha20-Poly1305).
 - **FileZilla import:** reads `sitemanager.xml` and reports what was imported and what was
   skipped.
 - **Security prompts inline:** host key and certificate changes are shown in place, never as
@@ -268,9 +268,11 @@ on macOS. On Windows, Credential Manager shows them as `password.hoprs/<site-id>
    tabs you had ("Close all" closes them again).
 4. **Back everything up.** "Export backup…" writes one encrypted file with your sites,
    workspaces and passwords, protected by a password you choose (without it the backup
-   cannot be opened). "Restore backup…" on another machine brings all three back. Restoring
-   replaces everything: sites, workspaces and passwords not in the backup are removed, and
-   hoprs asks before doing it.
+   cannot be opened). "Restore backup…" on another machine brings all three back. Restore
+   offers two modes: Merge (the default) adds what is new and keeps what you have; Replace
+   makes everything the backup's, removing sites, workspaces and passwords not in it, and
+   hoprs asks before doing it. To export only one site or one workspace, see
+   [Backup and export](#backup-and-export).
 
 The first time hoprs meets an SSH host it shows the host key fingerprint inline and asks
 before trusting it; a changed key is shown as a warning, never accepted silently.
@@ -342,8 +344,37 @@ Items that do not apply are dimmed, not hidden. Right-clicking below the rows gi
 folder, Refresh and Compare. Shift+F10 or the Menu key opens the menu of the selected row
 from the keyboard; arrows move, Enter runs, Escape closes. The compare list (Upload,
 Download, Show in panes), the queue rows (Pause, Resume, Cancel, Retry, Dismiss), the
-sidebar's sites and workspaces (Open, Edit) and the tabs (Close tab, Close other tabs) have
+sidebar's sites and workspaces (Open, Edit, Export…) and the tabs (Close tab, Close other tabs) have
 menus too.
+
+### Backup and export
+
+An export is one encrypted file, protected by a password you type twice (without it the
+file cannot be opened). It holds one of three things:
+
+- **Everything:** every site, every workspace and the saved passwords.
+- **One workspace:** the workspace, with its saved tabs, and the sites in it, with their
+  passwords.
+- **One site:** that site and its password.
+
+Where to start:
+
+- Right-click a site or a workspace in the sidebar and choose "Export…".
+- The sidebar's ⋯ menu and the Ctrl+K palette have "Export everything…".
+- When you edit a site or a workspace, its form has an "Export…" button: this is the way in
+  from the keyboard. It exports the site or workspace as saved, and leaves the form (edits
+  you have not saved are dropped).
+- Settings → Backup has "Export backup…" (everything); "Restore backup…" stays there.
+
+The export screen is a form in the middle of the window. Its title says what is exported,
+the File field starts as `hoprs-<name>-<date>.hoprs` in your Documents folder (or home), and
+"Choose…" opens the save dialog. Everything is `hoprs-backup-<date>.hoprs`. If you type the
+path of a file that exists, hoprs asks before overwriting it.
+
+A file of one site or one workspace is a partial file. Restore it with Merge: Replace is
+refused, because it would remove everything the file does not hold. Partial files need
+hoprs 1.6.0 or newer; hoprs 1.5.0 and older answer "Unsupported backup version" and change
+nothing. A file of everything restores on every version, as before.
 
 ### Settings
 
@@ -352,7 +383,7 @@ menus too.
 Settings open as a tab: Ctrl+, (⌘, on macOS), the gear at the bottom of the sidebar, or
 "Settings" in the Ctrl+K palette. There is only ever one; pressing the shortcut again
 focuses it. A list on the left switches between General, Transfers, Folder compare, Remote
-editing, Terminal and Backup. Closing the tab returns to the tab you came from.
+editing, Terminal and Backup (export and restore). Closing the tab returns to the tab you came from.
 
 ### Remote editing
 

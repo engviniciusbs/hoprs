@@ -81,6 +81,21 @@ impl Profiles {
         self.workspaces_rest.has_unreadable_id(id)
     }
 
+    /// The unreadable `[[site]]` entry whose raw `id` is `id`. The n-th raw
+    /// entry of `sites_rest` pairs with the n-th [`UnreadableEntry`] of
+    /// `sites.toml`: `load` pushes both together.
+    pub fn unreadable_site(&self, id: &str) -> Option<&UnreadableEntry> {
+        let n = self
+            .sites_rest
+            .unreadable
+            .iter()
+            .position(|e| e.id.as_deref() == Some(id))?;
+        self.unreadable
+            .iter()
+            .filter(|e| e.file == SITES_FILE)
+            .nth(n)
+    }
+
     /// Profiles holding exactly `sites` and `workspaces`: no unknown keys,
     /// no unreadable entries.
     pub fn from_items(sites: Vec<Site>, workspaces: Vec<Workspace>) -> Self {
@@ -448,5 +463,44 @@ fn merge_unknown(typed: &mut Table, extras: &Table) {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unreadable_site_finds_the_entry_by_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join(SITES_FILE),
+            "version = 1\n\n\
+             [[site]]\nid = \"s1\"\nname = \"One\"\nprotocol = \"ssh\"\nhost = \"h\"\nport = 22\nuser = \"u\"\n\n\
+             [[site]]\nid = \"odd1\"\nname = \"Odd One\"\nprotocol = \"s3\"\n\n\
+             [[site]]\nid = \"odd2\"\nname = \"Odd Two\"\nprotocol = \"gopher\"\n",
+        )
+        .unwrap();
+        fs::write(
+            tmp.path().join(WORKSPACES_FILE),
+            "version = 1\n\n[[workspace]]\nid = \"w1\"\nname = \"Odd Workspace\"\nsites = 7\n",
+        )
+        .unwrap();
+        let profiles = load(tmp.path()).unwrap();
+        assert_eq!(profiles.sites.len(), 1);
+        assert_eq!(profiles.unreadable().len(), 3);
+
+        let one = profiles.unreadable_site("odd1").unwrap();
+        assert_eq!(
+            (one.file, one.name.as_deref()),
+            (SITES_FILE, Some("Odd One"))
+        );
+        let two = profiles.unreadable_site("odd2").unwrap();
+        assert_eq!(
+            (two.file, two.name.as_deref()),
+            (SITES_FILE, Some("Odd Two"))
+        );
+        assert!(profiles.unreadable_site("s1").is_none());
+        assert!(profiles.unreadable_site("w1").is_none());
     }
 }

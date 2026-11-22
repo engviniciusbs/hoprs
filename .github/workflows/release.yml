@@ -10,6 +10,10 @@
 # dry run: the version comes from Cargo.toml, there is no tag check and no notes, the
 # three build jobs build, check and upload their files as workflow artifacts, and
 # `publish` is skipped.
+#
+# The build steps get the Google Drive OAuth client from the repository secrets
+# HOPRS_GOOGLE_CLIENT_ID and HOPRS_GOOGLE_CLIENT_SECRET (read by the compiler with
+# option_env!). Without them the build is still valid and hides the Drive destination.
 name: Release
 
 on:
@@ -55,6 +59,20 @@ jobs:
           fi
           echo "version=$crate_version" >> "$GITHUB_OUTPUT"
 
+      # Says whether the builds carry the Google Drive OAuth client (the secrets below
+      # arrive as empty strings when unset). The app shows Drive only with both values,
+      # so the notice says "enabled" only then. Never prints a value.
+      - name: Google Drive destination
+        env:
+          CLIENT_ID: ${{ secrets.HOPRS_GOOGLE_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.HOPRS_GOOGLE_CLIENT_SECRET }}
+        run: |
+          if [ -n "$CLIENT_ID" ] && [ -n "$CLIENT_SECRET" ]; then
+            echo "::notice::Google Drive destination: enabled"
+          else
+            echo "::notice::Google Drive destination: hidden (the client id and the client secret must both be in the repository secrets)"
+          fi
+
       # Before the builds: a missing or empty CHANGELOG section fails in seconds.
       - name: Release notes
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
@@ -86,6 +104,9 @@ jobs:
           persist-credentials: false
 
       - name: Build the .deb
+        env:
+          HOPRS_GOOGLE_CLIENT_ID: ${{ secrets.HOPRS_GOOGLE_CLIENT_ID }}
+          HOPRS_GOOGLE_CLIENT_SECRET: ${{ secrets.HOPRS_GOOGLE_CLIENT_SECRET }}
         run: |
           deb=$(scripts/package-deb.sh)
           echo "DEB=$deb" >> "$GITHUB_ENV"
@@ -120,6 +141,9 @@ jobs:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
 
       - name: Build the .dmg
+        env:
+          HOPRS_GOOGLE_CLIENT_ID: ${{ secrets.HOPRS_GOOGLE_CLIENT_ID }}
+          HOPRS_GOOGLE_CLIENT_SECRET: ${{ secrets.HOPRS_GOOGLE_CLIENT_SECRET }}
         run: |
           dmg=$(scripts/package-macos.sh)
           echo "DMG=$dmg" >> "$GITHUB_ENV"
@@ -149,6 +173,9 @@ jobs:
           targets: x86_64-pc-windows-msvc
 
       - name: Build the .msi and the .zip
+        env:
+          HOPRS_GOOGLE_CLIENT_ID: ${{ secrets.HOPRS_GOOGLE_CLIENT_ID }}
+          HOPRS_GOOGLE_CLIENT_SECRET: ${{ secrets.HOPRS_GOOGLE_CLIENT_SECRET }}
         shell: bash
         run: |
           paths=$(scripts/package-windows.sh)

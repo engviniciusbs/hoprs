@@ -1,11 +1,12 @@
-//! Encrypted backup of the whole vault: profiles, workspaces and secrets.
+//! Encrypted backup of the vault, or of one site or workspace: profiles,
+//! workspaces and secrets.
 //!
 //! File layout (integers big-endian):
 //!
 //! | bytes | content                                   |
 //! |-------|-------------------------------------------|
 //! | 8     | magic `HOPRSVLT`                          |
-//! | 2     | format version, `1`                       |
+//! | 2     | format version: `1` full, `2` partial     |
 //! | 4 x 3 | Argon2id `m_cost` (KiB), `t_cost`, `p_cost` |
 //! | 16    | random salt                               |
 //! | 24    | random nonce                              |
@@ -20,6 +21,13 @@
 //! The plaintext is UTF-8 JSON: `{ "sites": [...], "workspaces": [...],
 //! "secrets": [{ "site": id, "kind": "password" | "key-passphrase",
 //! "value": "..." }] }`. It only ever lives in zeroized buffers.
+//!
+//! A backup of one site or one workspace is *partial*: its header version is
+//! `2` and its JSON carries `"partial": true`. A full backup has version `1`
+//! and no `partial` key, laid out exactly as older releases wrote it. A
+//! partial file restores with [`ImportMode::Merge`] only: either marker alone
+//! refuses [`ImportMode::Replace`] (the header is authenticated, so the
+//! version cannot be flipped without the password).
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -29,17 +37,23 @@ use std::path::Path;
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, AeadInOut, Generate, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use hoprs_core::{Error, ErrorKind, Result, Site, SiteId, Workspace};
+use hoprs_core::{Error, ErrorKind, Result, Site, SiteId, Workspace, WorkspaceId};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::atomic::write_atomic;
 use crate::profiles::{self, Profiles};
-use crate::{SecretKind, UnreadableEntry, Vault, append_detail, describe, flag, flag_mut};
+use crate::{
+    SecretKind, UnreadableEntry, Vault, append_detail, describe, flag, flag_mut, unknown_site,
+    unknown_workspace,
+};
 
 const MAGIC: &[u8; 8] = b"HOPRSVLT";
-const FORMAT_VERSION: u16 = 1;
+/// Format version of a full backup.
+const FORMAT_FULL: u16 = 1;
+/// Format version of a partial backup (one site or one workspace).
+const FORMAT_PARTIAL: u16 = 2;
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 24;
 const HEADER_LEN: usize = MAGIC.len() + 2 + 3 * 4 + SALT_LEN + NONCE_LEN;
@@ -76,6 +90,17 @@ impl Default for ExportParams {
             p_cost: 1,
         }
     }
+}
+
+/// What an export covers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ExportScope {
+    /// Every readable site and workspace.
+    All,
+    /// One workspace and the readable sites it holds.
+    Workspace(WorkspaceId),
+    /// One site, without any workspace.
+    Site(SiteId),
 }
 
 /// What an export wrote.
@@ -135,6 +160,7 @@ fn argon_params(p: ExportParams) -> Result<Params> {
 }
 
 struct Header {
+    version: u16,
     params: ExportParams,
     salt: [u8; SALT_LEN],
     nonce: [u8; NONCE_LEN],
@@ -145,7 +171,7 @@ impl Header {
         let mut out = [0u8; HEADER_LEN];
         let fields = [
             &MAGIC[..],
-            &FORMAT_VERSION.to_be_bytes(),
+            &self.version.to_be_bytes(),
             &self.params.m_cost.to_be_bytes(),
             &self.params.t_cost.to_be_bytes(),
             &self.params.p_cost.to_be_bytes(),
@@ -185,7 +211,7 @@ impl Header {
             u32::from_be_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]])
         };
         let version = u16_at(8);
-        if version != FORMAT_VERSION {
+        if version != FORMAT_FULL && version != FORMAT_PARTIAL {
             return Err(Error::coded(
                 ErrorKind::Protocol,
                 "backup-unsupported-version",
@@ -204,6 +230,7 @@ impl Header {
         let mut nonce = [0u8; NONCE_LEN];
         nonce.copy_from_slice(&header[22 + SALT_LEN..HEADER_LEN]);
         Ok(Header {
+            version,
             params,
             salt,
             nonce,
@@ -243,9 +270,15 @@ fn random<const N: usize>() -> Result<[u8; N]> {
 }
 
 /// Encrypts `plaintext` into a complete backup file.
-fn seal(plaintext: &[u8], password: &SecretString, params: ExportParams) -> Result<Vec<u8>> {
+fn seal(
+    plaintext: &[u8],
+    password: &SecretString,
+    params: ExportParams,
+    version: u16,
+) -> Result<Vec<u8>> {
     argon_params(params)?;
     let header = Header {
+        version,
         params,
         salt: random()?,
         nonce: random()?,
@@ -299,10 +332,11 @@ fn unseal(file: &[u8], password: &SecretString) -> Result<Zeroizing<Vec<u8>>> {
     decrypt(&header, aad, Zeroizing::new(body.to_vec()), password)
 }
 
-/// Reads and decrypts the backup at `path`. The header is read and checked
+/// Reads and decrypts the backup at `path`, returning its (authenticated)
+/// format version too. The header is read and checked
 /// first, then the size against [`MAX_BACKUP_BYTES`]; only then is the rest
 /// read, into one exactly-sized buffer that is decrypted in place.
-fn read_backup(path: &Path, password: &SecretString) -> Result<Zeroizing<Vec<u8>>> {
+fn read_backup(path: &Path, password: &SecretString) -> Result<(u16, Zeroizing<Vec<u8>>)> {
     let mut file = fs::File::open(path)?;
     let mut prefix = [0u8; HEADER_LEN];
     let mut filled = 0;
@@ -330,7 +364,8 @@ fn read_backup(path: &Path, password: &SecretString) -> Result<Zeroizing<Vec<u8>
     // Bounded even if the file grows meanwhile.
     file.take((MAX_BACKUP_BYTES as usize - HEADER_LEN) as u64)
         .read_to_end(&mut body)?;
-    decrypt(&header, &prefix, body, password)
+    let version = header.version;
+    Ok((version, decrypt(&header, &prefix, body, password)?))
 }
 
 /// The encrypted JSON document. No `Debug`: it holds secret values.
@@ -339,6 +374,13 @@ struct Backup {
     sites: Vec<Site>,
     workspaces: Vec<Workspace>,
     secrets: Vec<BackupSecret>,
+    /// Set by an export of one site or workspace; absent from a full one.
+    #[serde(default, skip_serializing_if = "is_false")]
+    partial: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Serialize, Deserialize)]
@@ -485,26 +527,52 @@ fn validate(backup: &Backup) -> Result<()> {
 const KINDS: [SecretKind; 2] = [SecretKind::Password, SecretKind::KeyPassphrase];
 
 impl Vault {
-    /// Writes an encrypted backup of every readable site and workspace, with
-    /// all their secrets, to `path` (atomically, `0o600` on Unix).
+    /// Writes an encrypted backup of `scope` to `path` (atomically, `0o600`
+    /// on Unix): [`Vault::export_bytes`] plus the write. If the sealing
+    /// fails, nothing is written.
     ///
-    /// Secrets are read from the store; if one cannot be read, nothing is
-    /// written. Entries this version cannot read
-    /// ([`Vault::unreadable_entries`]) are not exported: they are listed in
-    /// the report, and workspace references to such sites are dropped from
-    /// the backup. A site flagged as having a secret the store no longer
-    /// holds is exported without it and listed in `missing_secrets`.
+    /// Blocking: see [`Vault::export_bytes`].
+    pub fn export(
+        &self,
+        path: &Path,
+        scope: &ExportScope,
+        password: &SecretString,
+        params: ExportParams,
+    ) -> Result<ExportReport> {
+        let (report, file) = self.export_bytes(scope, password, params)?;
+        write_atomic(path, &file)?;
+        Ok(report)
+    }
+
+    /// Builds an encrypted backup of `scope` and returns it with its report.
+    ///
+    /// - [`ExportScope::All`]: every readable site and workspace, with all
+    ///   their secrets; a full file (version 1).
+    /// - [`ExportScope::Workspace`]: the workspace's members that are
+    ///   readable sites (vault order) with their secrets, and that workspace
+    ///   with its `sites` trimmed to them; a partial file (version 2).
+    ///   Members that are unreadable sites are listed in
+    ///   `skipped_unreadable`.
+    /// - [`ExportScope::Site`]: that site and its secrets, no workspace; a
+    ///   partial file.
+    ///
+    /// An unknown id is `NotFound`. Secrets are read from the store; if one
+    /// cannot be read, nothing is produced. Entries this version cannot read
+    /// ([`Vault::unreadable_entries`]) are not exported, and workspace
+    /// references to such sites are dropped. A site flagged as having a
+    /// secret the store no longer holds is exported without it and listed in
+    /// `missing_secrets`.
     ///
     /// An empty `password` is refused with `Protocol`.
     ///
     /// Blocking: runs Argon2id (64 MiB of memory with the default
     /// parameters) and keyring calls; call it from `spawn_blocking`.
-    pub fn export(
+    pub fn export_bytes(
         &self,
-        path: &Path,
+        scope: &ExportScope,
         password: &SecretString,
         params: ExportParams,
-    ) -> Result<ExportReport> {
+    ) -> Result<(ExportReport, Vec<u8>)> {
         if password.expose_secret().is_empty() {
             return Err(Error::coded(
                 ErrorKind::Protocol,
@@ -513,13 +581,64 @@ impl Vault {
             ));
         }
         argon_params(params)?;
+
+        let exported: HashSet<&SiteId> = self.sites().iter().map(|s| &s.id).collect();
+        let trimmed = |ws: &Workspace| {
+            let mut ws = ws.clone();
+            ws.sites.retain(|s| exported.contains(&s.site));
+            ws
+        };
+        let (sites, workspaces, skipped_unreadable, partial): (
+            Vec<&Site>,
+            Vec<Workspace>,
+            Vec<UnreadableEntry>,
+            bool,
+        ) = match scope {
+            ExportScope::All => (
+                self.sites().iter().collect(),
+                self.workspaces().iter().map(trimmed).collect(),
+                self.unreadable_entries().to_vec(),
+                false,
+            ),
+            ExportScope::Workspace(id) => {
+                let ws = self
+                    .workspaces()
+                    .iter()
+                    .find(|w| &w.id == id)
+                    .ok_or_else(|| unknown_workspace(id))?;
+                let members: HashSet<&SiteId> = ws.sites.iter().map(|s| &s.site).collect();
+                let skipped = ws
+                    .sites
+                    .iter()
+                    .filter_map(|s| self.profiles.unreadable_site(&s.site.0))
+                    .cloned()
+                    .collect();
+                (
+                    self.sites()
+                        .iter()
+                        .filter(|s| members.contains(&s.id))
+                        .collect(),
+                    vec![trimmed(ws)],
+                    skipped,
+                    true,
+                )
+            }
+            ExportScope::Site(id) => (
+                vec![self.site(id).ok_or_else(|| unknown_site(id))?],
+                Vec::new(),
+                Vec::new(),
+                true,
+            ),
+        };
+
         let mut missing_secrets = Vec::new();
         let mut backup = Backup {
-            sites: Vec::with_capacity(self.sites().len()),
-            workspaces: Vec::with_capacity(self.workspaces().len()),
+            sites: Vec::with_capacity(sites.len()),
+            workspaces,
             secrets: Vec::new(),
+            partial,
         };
-        for original in self.sites() {
+        for original in sites {
             let mut site = original.clone();
             for kind in KINDS {
                 let value = if flag(&site, kind) {
@@ -551,28 +670,26 @@ impl Vault {
             }
             backup.sites.push(site);
         }
-        let exported: HashSet<&SiteId> = self.sites().iter().map(|s| &s.id).collect();
-        for ws in self.workspaces() {
-            let mut ws = ws.clone();
-            ws.sites.retain(|s| exported.contains(&s.site));
-            backup.workspaces.push(ws);
-        }
 
         let report = ExportReport {
             sites: backup.sites.len(),
             workspaces: backup.workspaces.len(),
             secrets: backup.secrets.len(),
-            skipped_unreadable: self.unreadable_entries().to_vec(),
+            skipped_unreadable,
             missing_secrets,
         };
+        let version = if partial { FORMAT_PARTIAL } else { FORMAT_FULL };
         let json = to_json(&backup)?;
         drop(backup);
-        let file = seal(&json, password, params)?;
-        write_atomic(path, &file)?;
-        Ok(report)
+        let file = seal(&json, password, params, version)?;
+        Ok((report, file))
     }
 
     /// Restores a backup written by [`Vault::export`].
+    ///
+    /// A partial file (one site or workspace) is refused with `Protocol`
+    /// (`backup-partial-no-replace`) in [`ImportMode::Replace`], before
+    /// anything changes.
     ///
     /// The file is authenticated, decrypted, parsed and validated before
     /// anything changes; a file over 64 MiB is refused (`Protocol`) after
@@ -602,10 +719,17 @@ impl Vault {
         password: &SecretString,
         mode: ImportMode,
     ) -> Result<BackupImportReport> {
-        let json = read_backup(path, password)?;
+        let (version, json) = read_backup(path, password)?;
         let backup = from_json(&json)?;
         drop(json);
         validate(&backup)?;
+        if (version == FORMAT_PARTIAL || backup.partial) && mode == ImportMode::Replace {
+            return Err(Error::coded(
+                ErrorKind::Protocol,
+                "backup-partial-no-replace",
+                "This file holds only part of a backup. Restore it with Merge.",
+            ));
+        }
 
         let names: HashMap<&SiteId, &str> = backup
             .sites
@@ -809,7 +933,8 @@ mod tests {
     use std::sync::Arc;
 
     use hoprs_core::{
-        Error, ErrorKind, Protocol, Site, SiteId, Workspace, WorkspaceId, WorkspaceSite,
+        Error, ErrorKind, Protocol, SavedTab, Site, SiteId, TabKind, Workspace, WorkspaceId,
+        WorkspaceSite,
     };
     use secrecy::ExposeSecret;
 
@@ -904,7 +1029,9 @@ mod tests {
 
     fn export_to(vault: &Vault, dir: &Path) -> std::path::PathBuf {
         let path = dir.join("backup.hoprs");
-        vault.export(&path, &pw("correct horse"), LOW).unwrap();
+        vault
+            .export(&path, &ExportScope::All, &pw("correct horse"), LOW)
+            .unwrap();
         path
     }
 
@@ -939,7 +1066,10 @@ mod tests {
         let src = source();
         let out = tempfile::tempdir().unwrap();
         let path = out.path().join("backup.hoprs");
-        let report = src.vault.export(&path, &pw("correct horse"), LOW).unwrap();
+        let report = src
+            .vault
+            .export(&path, &ExportScope::All, &pw("correct horse"), LOW)
+            .unwrap();
         assert_eq!(
             report,
             ExportReport {
@@ -1062,7 +1192,7 @@ mod tests {
         let mut magic = original.clone();
         magic[0] = b'X';
         let mut version = original.clone();
-        version[9] = 2;
+        version[9] = 3;
         let truncated = original[..HEADER - 1].to_vec();
         let no_tag = original[..HEADER + 15].to_vec();
         for (what, bytes) in [
@@ -1122,6 +1252,7 @@ mod tests {
             .vault
             .export(
                 &target,
+                &ExportScope::All,
                 &pw("correct horse"),
                 ExportParams {
                     m_cost: 1024 * 1024 + 1,
@@ -1419,7 +1550,9 @@ mod tests {
             .unwrap();
         let down = Vault::open(tmp.path(), Arc::new(FailingStore)).unwrap();
         let path = tmp.path().join("backup.hoprs");
-        let err = down.export(&path, &pw("correct horse"), LOW).unwrap_err();
+        let err = down
+            .export(&path, &ExportScope::All, &pw("correct horse"), LOW)
+            .unwrap_err();
         assert_eq!(err.kind, ErrorKind::Io);
         assert!(!path.exists());
     }
@@ -1441,7 +1574,9 @@ mod tests {
 
         let out = tempfile::tempdir().unwrap();
         let path = out.path().join("backup.hoprs");
-        let report = vault.export(&path, &pw("correct horse"), LOW).unwrap();
+        let report = vault
+            .export(&path, &ExportScope::All, &pw("correct horse"), LOW)
+            .unwrap();
         assert_eq!(report.sites, 1);
         assert_eq!(report.workspaces, 1);
         assert_eq!(report.skipped_unreadable, vault.unreadable_entries());
@@ -1459,7 +1594,7 @@ mod tests {
     fn import_plaintext(json: &str) -> (tempfile::TempDir, Vault, Result<BackupImportReport>) {
         let out = tempfile::tempdir().unwrap();
         let path = out.path().join("backup.hoprs");
-        let sealed = seal(json.as_bytes(), &pw("pw"), LOW).unwrap();
+        let sealed = seal(json.as_bytes(), &pw("pw"), LOW, FORMAT_FULL).unwrap();
         fs::write(&path, sealed).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let mut vault = Vault::open(tmp.path(), Arc::new(MemoryStore::new())).unwrap();
@@ -1469,7 +1604,7 @@ mod tests {
 
     #[test]
     fn seal_and_unseal_roundtrip() {
-        let sealed = seal(b"payload", &pw("pw"), LOW).unwrap();
+        let sealed = seal(b"payload", &pw("pw"), LOW, FORMAT_FULL).unwrap();
         assert_eq!(&unseal(&sealed, &pw("pw")).unwrap()[..], b"payload");
         assert_eq!(
             unseal(&sealed, &pw("other")).unwrap_err().kind,
@@ -1534,6 +1669,7 @@ mod tests {
     #[test]
     fn header_is_bound_as_associated_data() {
         let header = Header {
+            version: FORMAT_FULL,
             params: LOW,
             salt: [7; SALT_LEN],
             nonce: [9; NONCE_LEN],
@@ -1583,7 +1719,12 @@ mod tests {
 
         let out = tempfile::tempdir().unwrap();
         let report = vault
-            .export(&out.path().join("b.hoprs"), &pw("correct horse"), LOW)
+            .export(
+                &out.path().join("b.hoprs"),
+                &ExportScope::All,
+                &pw("correct horse"),
+                LOW,
+            )
             .unwrap();
         assert_eq!(report.secrets, 1);
         assert_eq!(report.missing_secrets, ["Alpha"]);
@@ -1594,7 +1735,10 @@ mod tests {
         let src = source();
         let out = tempfile::tempdir().unwrap();
         let path = out.path().join("b.hoprs");
-        let err = src.vault.export(&path, &pw(""), LOW).unwrap_err();
+        let err = src
+            .vault
+            .export(&path, &ExportScope::All, &pw(""), LOW)
+            .unwrap_err();
         assert_eq!(err.kind, ErrorKind::Protocol);
         assert_eq!(err.message, "Backup password is empty");
         assert!(!path.exists());
@@ -1641,5 +1785,278 @@ mod tests {
         // The old local value does not survive under the backup's site.
         assert_eq!(stored(&*store, &mine.id, SecretKind::Password), None);
         assert!(!vault.site(&mine.id).unwrap().has_password);
+    }
+
+    /// An empty vault holding site X with a password.
+    fn target_with_x() -> (tempfile::TempDir, Arc<MemoryStore>, Vault, Site) {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(MemoryStore::new());
+        let mut vault = Vault::open(tmp.path(), store.clone()).unwrap();
+        let x = ssh_site("Xray");
+        vault.upsert_site(x.clone()).unwrap();
+        vault
+            .set_secret(&x.id, SecretKind::Password, &pw("x-secret"))
+            .unwrap();
+        (tmp, store, vault, x)
+    }
+
+    fn plaintext_of(file: &[u8]) -> String {
+        String::from_utf8(unseal(file, &pw("correct horse")).unwrap().to_vec()).unwrap()
+    }
+
+    #[test]
+    fn scope_all_writes_version_1_without_the_marker() {
+        let src = source();
+        let (report, bytes) = src
+            .vault
+            .export_bytes(&ExportScope::All, &pw("correct horse"), LOW)
+            .unwrap();
+        assert_eq!(&bytes[8..10], &[0, 1]);
+        assert!(!plaintext_of(&bytes).contains("partial"));
+        assert_eq!((report.sites, report.workspaces, report.secrets), (2, 1, 2));
+    }
+
+    #[test]
+    fn scope_site_exports_that_site_only() {
+        let src = source();
+        let (report, bytes) = src
+            .vault
+            .export_bytes(
+                &ExportScope::Site(src.a.id.clone()),
+                &pw("correct horse"),
+                LOW,
+            )
+            .unwrap();
+        assert_eq!((report.sites, report.workspaces, report.secrets), (1, 0, 1));
+        assert!(report.skipped_unreadable.is_empty());
+        assert_eq!(&bytes[8..10], &[0, 2]);
+        let json = plaintext_of(&bytes);
+        assert!(json.contains("\"partial\":true"));
+        assert!(json.contains("alpha-secret-1"));
+        assert!(!json.contains("Bravo"));
+        assert!(!json.contains("bravo-phrase-2"));
+
+        let out = tempfile::tempdir().unwrap();
+        let path = out.path().join("one.hoprs");
+        fs::write(&path, &bytes).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut vault = Vault::open(tmp.path(), Arc::new(MemoryStore::new())).unwrap();
+        vault
+            .import_backup(&path, &pw("correct horse"), ImportMode::Merge)
+            .unwrap();
+        assert_eq!(vault.sites().len(), 1);
+        assert!(vault.workspaces().is_empty());
+        assert_eq!(
+            secret_of(&vault, &src.a.id, SecretKind::Password).as_deref(),
+            Some("alpha-secret-1")
+        );
+    }
+
+    #[test]
+    fn scope_workspace_trims_missing_and_unreadable_members() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("sites.toml"),
+            "version = 1\n\n[[site]]\nid = \"odd\"\nname = \"Odd\"\nprotocol = \"s3\"\n",
+        )
+        .unwrap();
+        let mut vault = Vault::open(tmp.path(), Arc::new(MemoryStore::new())).unwrap();
+        let a = ssh_site("Alpha");
+        let charlie = ssh_site("Charlie");
+        vault.upsert_site(a.clone()).unwrap();
+        vault.upsert_site(charlie.clone()).unwrap();
+        let odd = SiteId("odd".into());
+        let mut ws = workspace("Mixed", &[&odd, &a.id]);
+        ws.sites[1].tabs.push(SavedTab {
+            kind: TabKind::Files,
+            remote_dir: Some("/srv".into()),
+            local_dir: None,
+        });
+        vault.upsert_workspace(ws.clone()).unwrap();
+
+        let (report, bytes) = vault
+            .export_bytes(
+                &ExportScope::Workspace(ws.id.clone()),
+                &pw("correct horse"),
+                LOW,
+            )
+            .unwrap();
+        assert_eq!((report.sites, report.workspaces), (1, 1));
+        assert_eq!(report.skipped_unreadable, vault.unreadable_entries());
+        assert_eq!(report.skipped_unreadable.len(), 1);
+        assert_eq!(&bytes[8..10], &[0, 2]);
+
+        let out = tempfile::tempdir().unwrap();
+        let path = out.path().join("ws.hoprs");
+        fs::write(&path, &bytes).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let mut target = Vault::open(tmp.path(), Arc::new(MemoryStore::new())).unwrap();
+        target
+            .import_backup(&path, &pw("correct horse"), ImportMode::Merge)
+            .unwrap();
+        let names: Vec<_> = target.sites().iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Alpha"]);
+        assert_eq!(target.workspaces().len(), 1);
+        let restored = &target.workspaces()[0];
+        assert_eq!(restored.sites.len(), 1);
+        assert_eq!(restored.sites[0].site, a.id);
+        assert_eq!(restored.sites[0].tabs, ws.sites[1].tabs);
+    }
+
+    #[test]
+    fn scope_of_unknown_site_or_workspace_is_not_found() {
+        let src = source();
+        let out = tempfile::tempdir().unwrap();
+        let path = out.path().join("none.hoprs");
+        let cases = [
+            (
+                ExportScope::Site(SiteId("nope".into())),
+                "vault-unknown-site",
+            ),
+            (
+                ExportScope::Workspace(WorkspaceId("nope".into())),
+                "vault-unknown-workspace",
+            ),
+        ];
+        for (scope, code) in cases {
+            let err = src
+                .vault
+                .export(&path, &scope, &pw("correct horse"), LOW)
+                .unwrap_err();
+            assert_eq!(err.kind, ErrorKind::NotFound);
+            assert_eq!(err.code, Some(code), "{scope:?}");
+            assert!(!path.exists());
+        }
+    }
+
+    fn partial_site_file(src: &Source, dir: &Path) -> std::path::PathBuf {
+        let path = dir.join("partial.hoprs");
+        src.vault
+            .export(
+                &path,
+                &ExportScope::Site(src.a.id.clone()),
+                &pw("correct horse"),
+                LOW,
+            )
+            .unwrap();
+        path
+    }
+
+    #[test]
+    fn partial_file_merges() {
+        let src = source();
+        let out = tempfile::tempdir().unwrap();
+        let path = partial_site_file(&src, out.path());
+        let (tmp, _store, mut vault, x) = target_with_x();
+        let _ = &tmp;
+        let report = vault
+            .import_backup(&path, &pw("correct horse"), ImportMode::Merge)
+            .unwrap();
+        assert_eq!(report.added_sites, 1);
+        let names: Vec<_> = vault.sites().iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["Xray", "Alpha"]);
+        assert_eq!(
+            secret_of(&vault, &x.id, SecretKind::Password).as_deref(),
+            Some("x-secret")
+        );
+        assert_eq!(
+            secret_of(&vault, &src.a.id, SecretKind::Password).as_deref(),
+            Some("alpha-secret-1")
+        );
+    }
+
+    #[test]
+    fn partial_file_refuses_replace_and_changes_nothing() {
+        let src = source();
+        let out = tempfile::tempdir().unwrap();
+        let path = partial_site_file(&src, out.path());
+        let (tmp, store, mut vault, x) = target_with_x();
+        let before = snapshot(tmp.path());
+        let err = vault
+            .import_backup(&path, &pw("correct horse"), ImportMode::Replace)
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Protocol);
+        assert_eq!(err.code, Some("backup-partial-no-replace"));
+        assert_eq!(snapshot(tmp.path()), before);
+        assert_eq!(vault.sites().len(), 1);
+        assert_eq!(
+            stored(&*store, &x.id, SecretKind::Password).as_deref(),
+            Some("x-secret")
+        );
+    }
+
+    #[test]
+    fn either_marker_alone_refuses_replace() {
+        let with_marker = r#"{"sites":[],"workspaces":[],"secrets":[],"partial":true}"#;
+        let without = r#"{"sites":[],"workspaces":[],"secrets":[]}"#;
+        let out = tempfile::tempdir().unwrap();
+        for (json, version) in [(with_marker, FORMAT_FULL), (without, FORMAT_PARTIAL)] {
+            let path = out.path().join("marker.hoprs");
+            fs::write(
+                &path,
+                seal(json.as_bytes(), &pw("pw"), LOW, version).unwrap(),
+            )
+            .unwrap();
+            let (tmp, _store, mut vault, _x) = target_with_x();
+            let before = snapshot(tmp.path());
+            let err = vault
+                .import_backup(&path, &pw("pw"), ImportMode::Replace)
+                .unwrap_err();
+            assert_eq!(err.code, Some("backup-partial-no-replace"), "v{version}");
+            assert_eq!(snapshot(tmp.path()), before);
+            vault
+                .import_backup(&path, &pw("pw"), ImportMode::Merge)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn flipped_version_byte_fails_authentication() {
+        let src = source();
+        let out = tempfile::tempdir().unwrap();
+        let partial = partial_site_file(&src, out.path());
+        let full = export_to(&src.vault, out.path());
+        for (path, flipped) in [(partial, 1u8), (full, 2u8)] {
+            let mut bytes = fs::read(&path).unwrap();
+            bytes[9] = flipped;
+            fs::write(&path, &bytes).unwrap();
+            for mode in [ImportMode::Merge, ImportMode::Replace] {
+                let (tmp, store, mut vault, x) = target_with_x();
+                let before = snapshot(tmp.path());
+                let err = vault
+                    .import_backup(&path, &pw("correct horse"), mode)
+                    .unwrap_err();
+                assert_eq!(
+                    err.code,
+                    Some("backup-wrong-password"),
+                    "{flipped} {mode:?}"
+                );
+                assert_eq!(snapshot(tmp.path()), before);
+                assert_eq!(
+                    stored(&*store, &x.id, SecretKind::Password).as_deref(),
+                    Some("x-secret")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bytes_entry_point_equals_the_file_one() {
+        let src = source();
+        let out = tempfile::tempdir().unwrap();
+        for scope in [ExportScope::All, ExportScope::Site(src.a.id.clone())] {
+            let path = out.path().join("eq.hoprs");
+            let report = src
+                .vault
+                .export(&path, &scope, &pw("correct horse"), LOW)
+                .unwrap();
+            let (bytes_report, bytes) = src
+                .vault
+                .export_bytes(&scope, &pw("correct horse"), LOW)
+                .unwrap();
+            assert_eq!(report, bytes_report);
+            let on_disk = fs::read(&path).unwrap();
+            assert_eq!(plaintext_of(&on_disk), plaintext_of(&bytes), "{scope:?}");
+        }
     }
 }

@@ -10,8 +10,8 @@ use crate::ui::icons::Icon;
 use crate::ui::strings;
 use crate::ui::theme::{self, palette};
 use crate::ui::{
-    dialogs, drag, edits, files, import, log, menu, palette as command_palette, pointer, queue,
-    settings, sidebar, site_form, status, tabs, terminal, update, widgets, workspace_form,
+    dialogs, drag, edits, export, files, import, log, menu, palette as command_palette, pointer,
+    queue, settings, sidebar, site_form, status, tabs, terminal, update, widgets, workspace_form,
 };
 
 pub const SIDEBAR_WIDTH: f32 = sidebar::WIDTH;
@@ -147,6 +147,7 @@ fn center(app: &App) -> Element<'_, Message> {
         }
         Some(Form::Workspace(form)) => return workspace_form::view(form, &app.sites),
         Some(Form::Import) => return import::view(app),
+        Some(Form::Export) => return export::view(app),
         Some(Form::QuitEdits) => return edits::quit_view(app),
         None => {}
     }

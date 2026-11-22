@@ -1,9 +1,9 @@
 //! Task 11: "Import from FileZilla" (three steps in the center, no modal), the encrypted
-//! backup (export and restore) and the settings page.
+//! backup's restore and the settings page (the export screen: `tests/export.rs`).
 
 use hoprs_import::{ImportReport, ImportedSite, SkippedSite};
 use hoprs_transfer::ConflictPolicy;
-use hoprs_vault::{BackupImportReport, ExportReport, ImportMode};
+use hoprs_vault::{BackupImportReport, ExportScope, ImportMode};
 
 use std::path::PathBuf;
 
@@ -300,215 +300,21 @@ fn delete_source_needs_confirmation() {
     let _ = import_view::view(&app);
 }
 
-#[test]
-fn export_refuses_empty_password_in_ui() {
-    let mut app = App::new();
-    app.update(Message::OpenSettings);
-    assert!(app.settings_shown());
-    backup(&mut app, BackupMsg::OpenExport);
-    assert_eq!(app.backup.panel, BackupPanel::Export);
-    backup(
-        &mut app,
-        BackupMsg::ExportPath("/home/me/hoprs.backup".into()),
-    );
-
-    // Empty password: refused inline, nothing sent.
-    assert!(backup(&mut app, BackupMsg::Export).is_empty());
-    assert_eq!(
-        app.backup.field_error,
-        Some(strings::backup_password_required())
-    );
-    assert_eq!(app.backup.export, BackupState::Idle);
-
-    // A confirmation that differs: refused too.
-    backup(
-        &mut app,
-        BackupMsg::ExportPassword(Password("correct horse".into())),
-    );
-    backup(
-        &mut app,
-        BackupMsg::ExportConfirm(Password("correct hose".into())),
-    );
-    assert!(backup(&mut app, BackupMsg::Export).is_empty());
-    assert_eq!(
-        app.backup.field_error,
-        Some(strings::backup_passwords_differ())
-    );
-
-    // No file: refused.
-    backup(
-        &mut app,
-        BackupMsg::ExportConfirm(Password("correct horse".into())),
-    );
-    backup(&mut app, BackupMsg::ExportPath(String::new()));
-    assert!(backup(&mut app, BackupMsg::Export).is_empty());
-    assert_eq!(
-        app.backup.field_error,
-        Some(strings::backup_path_required())
-    );
-    backup(
-        &mut app,
-        BackupMsg::ExportPath("/home/me/hoprs.backup".into()),
-    );
-
-    // A typed path: whether the file exists is checked first (off the UI thread).
-    let effects = backup(&mut app, BackupMsg::Export);
-    match &effects[..] {
-        [Effect::CheckExportTarget(path)] => {
-            assert_eq!(path, &PathBuf::from("/home/me/hoprs.backup"));
-        }
-        other => panic!("expected one CheckExportTarget, got {other:?}"),
-    }
-    assert!(!app.busy(), "nothing runs yet");
-    assert_eq!(
-        app.backup.export_password.0, "correct horse",
-        "kept until sent"
-    );
-
-    // The password leaves the UI state with the effect; its Debug never shows it.
-    let effects = app.update(Message::ExportTargetChecked {
-        path: PathBuf::from("/home/me/hoprs.backup"),
-        exists: false,
-    });
-    match &effects[..] {
-        [Effect::ExportBackup { path, password }] => {
-            assert_eq!(path, &PathBuf::from("/home/me/hoprs.backup"));
-            assert_eq!(password.expose_secret(), "correct horse");
-        }
-        other => panic!("expected one ExportBackup, got {other:?}"),
-    }
-    assert!(!format!("{effects:?}").contains("correct horse"));
-    assert!(app.backup.export_password.0.is_empty());
-    assert!(app.backup.export_confirm.0.is_empty());
-    assert!(!format!("{app:?}").contains("correct horse"));
-    assert_eq!(app.backup.field_error, None);
-    assert_eq!(app.backup.export, BackupState::Running);
-    assert!(app.busy());
-    // A second export while one runs: nothing.
-    backup(
-        &mut app,
-        BackupMsg::ExportPassword(Password("again".into())),
-    );
-    backup(&mut app, BackupMsg::ExportConfirm(Password("again".into())));
-    assert!(backup(&mut app, BackupMsg::Export).is_empty());
-
-    // The report.
-    let report = ExportReport {
-        sites: 3,
-        workspaces: 1,
-        secrets: 2,
-        skipped_unreadable: Vec::new(),
-        missing_secrets: vec!["Old box".into()],
-    };
-    assert!(
-        app.update(Message::BackupExported(Ok(report.clone())))
-            .is_empty()
-    );
-    assert_eq!(app.backup.export, BackupState::Done(report));
-    assert!(!app.busy());
-
-    // "Choose…" asks where to save.
-    let effects = backup(&mut app, BackupMsg::Choose(PickTarget::ExportBackup));
-    assert!(matches!(
-        effects[..],
-        [Effect::PickFile(PickTarget::ExportBackup)]
-    ));
-    app.update(Message::FilePicked {
-        target: PickTarget::ExportBackup,
-        path: Some(PathBuf::from("/media/usb/hoprs.backup")),
-    });
-    assert_eq!(app.backup.export_path, "/media/usb/hoprs.backup");
-    // A path from the save dialog (which asked about overwriting) exports at once.
-    backup(&mut app, BackupMsg::ExportPassword(Password("pw".into())));
-    backup(&mut app, BackupMsg::ExportConfirm(Password("pw".into())));
-    let effects = backup(&mut app, BackupMsg::Export);
-    assert!(
-        matches!(effects[..], [Effect::ExportBackup { .. }]),
-        "{effects:?}"
-    );
-}
-
-/// Review fix: a typed export path that already exists needs an inline "Overwrite?".
-#[test]
-fn export_over_an_existing_file_needs_confirmation() {
-    let mut app = App::new();
-    app.update(Message::OpenSettings);
-    backup(&mut app, BackupMsg::OpenExport);
-    backup(&mut app, BackupMsg::ExportPath("/b.hoprs".into()));
-    backup(&mut app, BackupMsg::ExportPassword(Password("pw".into())));
-    backup(&mut app, BackupMsg::ExportConfirm(Password("pw".into())));
-    assert!(matches!(
-        backup(&mut app, BackupMsg::Export)[..],
-        [Effect::CheckExportTarget(_)]
-    ));
-    // While it is checked, Export does nothing more.
-    assert!(backup(&mut app, BackupMsg::Export).is_empty());
-    let exists = |app: &mut App, path: &str| {
-        app.update(Message::ExportTargetChecked {
-            path: PathBuf::from(path),
-            exists: true,
-        })
-    };
-    // An answer for another path (edited meanwhile) is dropped.
-    assert!(exists(&mut app, "/other.hoprs").is_empty());
-    assert!(!app.backup.confirm_overwrite);
-    assert!(exists(&mut app, "/b.hoprs").is_empty());
-    assert!(app.backup.confirm_overwrite, "asked in place");
-    assert_eq!(app.backup.export, BackupState::Idle);
-    assert!(backup(&mut app, BackupMsg::Export).is_empty());
-
-    // Keep: nothing written; the question goes away.
-    assert!(backup(&mut app, BackupMsg::CancelOverwrite).is_empty());
-    assert!(!app.backup.confirm_overwrite);
-    assert!(backup(&mut app, BackupMsg::ConfirmOverwrite).is_empty());
-
-    // Again, and Overwrite.
-    backup(&mut app, BackupMsg::Export);
-    exists(&mut app, "/b.hoprs");
-    let effects = backup(&mut app, BackupMsg::ConfirmOverwrite);
-    assert!(
-        matches!(effects[..], [Effect::ExportBackup { .. }]),
-        "{effects:?}"
-    );
-    assert!(app.backup.export_password.0.is_empty());
-
-    // Editing the path drops a pending question.
-    let mut app = App::new();
-    app.update(Message::OpenSettings);
-    backup(&mut app, BackupMsg::OpenExport);
-    backup(&mut app, BackupMsg::ExportPath("/b.hoprs".into()));
-    backup(&mut app, BackupMsg::ExportPassword(Password("pw".into())));
-    backup(&mut app, BackupMsg::ExportConfirm(Password("pw".into())));
-    backup(&mut app, BackupMsg::Export);
-    exists(&mut app, "/b.hoprs");
-    backup(&mut app, BackupMsg::ExportPath("/c.hoprs".into()));
-    assert!(!app.backup.confirm_overwrite);
-    assert!(backup(&mut app, BackupMsg::ConfirmOverwrite).is_empty());
-}
-
-/// Review fixes: typed passwords travel redacted in messages, are forgotten whenever
-/// the page is left (any route) or the panel changes, and a pending "Replace" question is
-/// dropped when the restore file changes.
+/// Review fixes: the typed restore password travels redacted in messages, is forgotten
+/// whenever the page is left (any route), and a pending "Replace" question is dropped
+/// when the restore file changes. (The export screen's own: `tests/export.rs`.)
 #[test]
 fn backup_passwords_redacted_and_forgotten() {
-    let message = Message::Settings(SettingsMsg::Backup(BackupMsg::ExportPassword(Password(
-        "hunter2".into(),
+    let message = Message::Settings(SettingsMsg::Backup(BackupMsg::RestorePassword(Password(
+        "hunter3".into(),
     ))));
-    let restore = BackupMsg::RestorePassword(Password("hunter3".into()));
-    let confirm = BackupMsg::ExportConfirm(Password("hunter4".into()));
-    let debug = format!("{message:?} {restore:?} {confirm:?}");
+    let debug = format!("{message:?}");
     assert!(!debug.contains("hunter"), "{debug}");
 
     let typed = |app: &mut App| {
-        backup(app, BackupMsg::ExportPassword(Password("e".into())));
-        backup(app, BackupMsg::ExportConfirm(Password("e".into())));
         backup(app, BackupMsg::RestorePassword(Password("r".into())));
     };
-    let empty = |app: &App| {
-        app.backup.export_password.0.is_empty()
-            && app.backup.export_confirm.0.is_empty()
-            && app.backup.restore_password.0.is_empty()
-    };
+    let empty = |app: &App| app.backup.restore_password.0.is_empty();
     // Left through the sidebar (another page), a site click, or a tab.
     let mut app = App::new();
     for leave in [
@@ -518,19 +324,15 @@ fn backup_passwords_redacted_and_forgotten() {
         Message::ConnectSite(SiteId::new()),
     ] {
         app.update(Message::OpenSettings);
-        backup(&mut app, BackupMsg::OpenExport);
+        backup(&mut app, BackupMsg::OpenRestore);
         typed(&mut app);
         assert!(!empty(&app));
         app.update(leave.clone());
         assert!(empty(&app), "{leave:?}");
     }
-    // Switching panels.
+    // Re-opening the panel keeps what is typed.
     app.update(Message::OpenSettings);
-    backup(&mut app, BackupMsg::OpenExport);
-    typed(&mut app);
     backup(&mut app, BackupMsg::OpenRestore);
-    assert!(empty(&app));
-    // Re-opening the same panel keeps what is typed.
     typed(&mut app);
     backup(&mut app, BackupMsg::OpenRestore);
     assert_eq!(app.backup.restore_password.0, "r");
@@ -804,7 +606,8 @@ fn settings_changes_apply_and_save() {
 /// the settings reach it, and come back as messages.
 #[tokio::test]
 async fn effects_reach_the_backend() {
-    let fake = Arc::new(FakeBackend::new());
+    let a = site("a", "a.example", "u", Protocol::Ssh);
+    let fake = Arc::new(FakeBackend::new().with_site(a.clone()));
     let backend: Arc<dyn BackendApi> = fake.clone();
 
     let message = effects::import_filezilla(backend.clone(), PathBuf::from("/s.xml"), true).await;
@@ -813,11 +616,15 @@ async fn effects_reach_the_backend() {
     assert!(matches!(message, Message::SitemanagerDeleted(Ok(()))));
     let message = effects::export_backup(
         backend.clone(),
+        ExportScope::Site(a.id.clone()),
         PathBuf::from("/b"),
         SecretString::from("pw"),
     )
     .await;
-    assert!(matches!(message, Message::BackupExported(Ok(_))));
+    assert!(matches!(
+        message,
+        Message::Export(crate::app::ExportMsg::Done(Ok(_)))
+    ));
     let message = effects::restore_backup(
         backend.clone(),
         PathBuf::from("/b"),
@@ -845,6 +652,7 @@ async fn effects_reach_the_backend() {
             },
             BackupCall::DeleteSitemanager(PathBuf::from("/s.xml")),
             BackupCall::Export {
+                scope: ExportScope::Site(a.id.clone()),
                 path: PathBuf::from("/b"),
                 password: "pw".into(),
             },
@@ -1018,7 +826,7 @@ fn sidebar_menu_hides_and_shows() {
     let open = || Message::Menu(MenuMsg::Open(MenuTarget::SidebarOptions));
     app.update(open());
     let items = app.menu_items(&MenuTarget::SidebarOptions);
-    assert_eq!(items.len(), 2);
+    assert_eq!(items.len(), 3, "two sections and Export everything…");
     assert!(items.iter().all(|item| item.enabled));
     assert_eq!(items[1].checked, Some(true));
     // Show all sites (checked): hides it, and the menu closes.
@@ -1071,13 +879,13 @@ async fn typed_passwords_forgotten_when_settings_not_shown() {
     app.update(Message::ConnectSite(site.id.clone()));
     for leave in [Message::SelectTab(0), Message::CloseSettings] {
         app.update(Message::OpenSettings);
-        backup(&mut app, BackupMsg::OpenExport);
-        backup(&mut app, BackupMsg::ExportPassword(Password("e".into())));
+        backup(&mut app, BackupMsg::OpenRestore);
+        backup(&mut app, BackupMsg::RestorePassword(Password("e".into())));
         app.compare_ignore_input = Some("a, ".into());
         app.update(Message::Modifiers(Mods::default()));
-        assert_eq!(app.backup.export_password.0, "e", "kept while shown");
+        assert_eq!(app.backup.restore_password.0, "e", "kept while shown");
         app.update(leave.clone());
-        assert!(app.backup.export_password.0.is_empty(), "{leave:?}");
+        assert!(app.backup.restore_password.0.is_empty(), "{leave:?}");
         assert_eq!(app.compare_ignore_input, None, "{leave:?}");
     }
 }
@@ -1102,4 +910,49 @@ fn section_msg_switches_section() {
     app.update(Message::CloseSettings);
     settings(&mut app, SettingsMsg::Section(SettingsSection::Backup));
     assert!(app.settings_tab.is_none());
+}
+
+/// The export screen's title: what the scope names, from the profiles the app holds.
+#[tokio::test]
+async fn export_title_per_scope() {
+    use crate::app::export::ExportTitle;
+
+    let a = site("a", "a.example", "u", Protocol::Ssh);
+    let b = site("b", "b.example", "u", Protocol::Ftp);
+    let c = site("c", "c.example", "u", Protocol::Ftp);
+    let missing = SiteId::new();
+    let team = workspace("team", &[&a.id, &b.id, &missing]);
+    let fake = FakeBackend::new()
+        .with_site(a.clone())
+        .with_site(b)
+        .with_site(c)
+        .with_workspace(team.clone());
+    let app = loaded(&fake).await;
+
+    let title = app.export_title(&ExportScope::Site(a.id.clone()));
+    assert_eq!(title, Some(ExportTitle::Site { name: "a".into() }));
+    assert_eq!(title.unwrap().name(), Some("a"));
+    let title = app.export_title(&ExportScope::Workspace(team.id.clone()));
+    assert_eq!(
+        title,
+        Some(ExportTitle::Workspace {
+            name: "team".into(),
+            sites: 2
+        })
+    );
+    assert_eq!(title.unwrap().name(), Some("team"));
+    let title = app.export_title(&ExportScope::All);
+    assert_eq!(
+        title,
+        Some(ExportTitle::All {
+            sites: 3,
+            workspaces: 1
+        })
+    );
+    assert_eq!(title.unwrap().name(), None);
+    assert_eq!(app.export_title(&ExportScope::Site(SiteId::new())), None);
+    assert_eq!(
+        app.export_title(&ExportScope::Workspace(WorkspaceId::new())),
+        None
+    );
 }

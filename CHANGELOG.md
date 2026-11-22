@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.6.0 — unreleased
+
+You can export one site or one workspace, not only everything.
+
+- Right-click a site or a workspace in the sidebar and choose **Export…**. The ⋯ menu and Ctrl+K have **Export everything…**, and the site and workspace forms have an **Export…** button (the keyboard way in). Settings → Backup keeps "Export backup…" and the restore panel.
+- One export screen for all three: a title that names what is exported, a File field that starts as `hoprs-<name>-<date>.hoprs` (`hoprs-backup-<date>.hoprs` for everything), the password typed twice, and a question before overwriting a file you typed the path of.
+- A file of one site or one workspace holds that site or workspace, the sites in it and their passwords. It restores with **Merge** only; Replace is refused with "This file holds only part of a backup. Restore it with Merge." hoprs 1.5.0 and older answer "Unsupported backup version" to it. A file of everything is unchanged and restores on every version.
+
 ## 1.5.0 — 2026-11-18
 
 hoprs speaks Turkish.

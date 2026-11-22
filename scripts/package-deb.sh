@@ -13,7 +13,9 @@
 #
 # Both modes remap the builder's paths ($HOME, $CARGO_HOME, the repository) out of the
 # binary (panic locations, debug info). The toolchain is the one rust-toolchain.toml
-# pins. Package metadata: [package.metadata.deb] in crates/hoprs-app/Cargo.toml. Check
+# pins. HOPRS_GOOGLE_CLIENT_ID and HOPRS_GOOGLE_CLIENT_SECRET, when set, are passed into
+# the build (the compiler bakes them in); without them the Drive destination is hidden.
+# Package metadata: [package.metadata.deb] in crates/hoprs-app/Cargo.toml. Check
 # the result with scripts/check-deb.sh <deb>.
 set -euo pipefail
 
@@ -53,6 +55,7 @@ case "${1:-}" in
             -e HOME=/tmp \
             -e CARGO_HOME="/src/$target/cargo-home" \
             -e CARGO_TARGET_DIR="/src/$target" \
+            -e HOPRS_GOOGLE_CLIENT_ID -e HOPRS_GOOGLE_CLIENT_SECRET \
             "$image" scripts/package-deb.sh --host)
         echo "$repo/${deb#/src/}"
         exit 0
