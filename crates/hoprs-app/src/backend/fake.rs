@@ -207,6 +207,9 @@ fn fake_output(rx: mpsc::UnboundedReceiver<ShellOutput>) -> BoxStream<'static, S
     .boxed()
 }
 
+/// How many agent events the fake keeps unread.
+const AGENT_EVENTS_KEPT: usize = 65_536;
+
 /// See the module docs.
 pub struct FakeBackend {
     /// Shared with the streams that change it (a connect that ends connected).
@@ -329,8 +332,9 @@ impl Default for FakeBackend {
 impl FakeBackend {
     pub fn new() -> Self {
         let (events, receiver) = mpsc::unbounded_channel();
-        // Bounded like the real one's; a test reads what it pushes.
-        let (agent_events, agent_receiver) = mpsc::channel(crate::agent::EVENTS_BUFFER);
+        // Room for any test: the fake delivers every event, in order, unlike the real
+        // backend's latest-state queue.
+        let (agent_events, agent_receiver) = mpsc::channel(AGENT_EVENTS_KEPT);
         Self {
             state: Arc::new(Mutex::new(State::default())),
             next_session: AtomicU64::new(1),
@@ -568,8 +572,9 @@ impl FakeBackend {
         self.state().local.clone()
     }
 
-    /// Sends an agent event to the UI's subscription (at most
-    /// [`EVENTS_BUFFER`](crate::agent::EVENTS_BUFFER) unread).
+    /// Sends an agent event to the UI's subscription. The fake delivers every event it is
+    /// given, in order, nothing coalesced (up to [`AGENT_EVENTS_KEPT`] unread, far more
+    /// than a test pushes).
     pub fn push_agent_event(&self, event: AgentEvent) {
         self.agent_events
             .try_send(event)

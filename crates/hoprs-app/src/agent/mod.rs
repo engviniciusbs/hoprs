@@ -27,25 +27,23 @@ pub enum AgentEvent {
     Relays(usize),
     /// The sites whose session only an agent uses, sorted.
     Sites(Vec<SiteId>),
-    /// A session an agent asked for is up.
-    Connected(SessionId),
+    /// A session an agent asked for is up: the site and its session.
+    Connected(SiteId, SessionId),
     /// The channel could not start (`Some`), or started after a failure (`None`).
     Channel(Option<Error>),
 }
 
 /// The most agent events waiting for the UI (see [`latest_events`]).
 pub const EVENTS_BUFFER: usize = 16;
-/// The most [`AgentEvent::Connected`] kept while the UI does not read.
-const CONNECTED_KEPT: usize = 16;
-
 /// What [`latest_events`] holds back while the UI's channel is full: the latest of each
-/// state, and the last few sessions that came up.
+/// state, and the latest session that came up per site (so at most one entry per saved
+/// site).
 #[derive(Default)]
 struct Held {
     channel: Option<Option<Error>>,
     relays: Option<usize>,
     sites: Option<Vec<SiteId>>,
-    connected: VecDeque<SessionId>,
+    connected: VecDeque<(SiteId, SessionId)>,
 }
 
 impl Held {
@@ -54,11 +52,10 @@ impl Held {
             AgentEvent::Channel(state) => self.channel = Some(state),
             AgentEvent::Relays(n) => self.relays = Some(n),
             AgentEvent::Sites(sites) => self.sites = Some(sites),
-            AgentEvent::Connected(session) => {
-                if self.connected.len() == CONNECTED_KEPT {
-                    self.connected.pop_front();
-                }
-                self.connected.push_back(session);
+            AgentEvent::Connected(site, session) => {
+                // Latest per site: an older session of the same site gives way.
+                self.connected.retain(|(held, _)| *held != site);
+                self.connected.push_back((site, session));
             }
         }
     }
@@ -73,7 +70,9 @@ impl Held {
         if let Some(sites) = self.sites.take() {
             return Some(AgentEvent::Sites(sites));
         }
-        self.connected.pop_front().map(AgentEvent::Connected)
+        self.connected
+            .pop_front()
+            .map(|(site, session)| AgentEvent::Connected(site, session))
     }
 
     fn is_empty(&self) -> bool {
@@ -84,11 +83,13 @@ impl Held {
     }
 }
 
-/// The agent side's events for the UI, in constant memory whether or not anyone reads:
+/// The agent side's events for the UI, in bounded memory whether or not anyone reads:
 /// at most [`EVENTS_BUFFER`] wait in the returned channel; past that, each state (the
-/// channel's, the relay count, the agent sites) keeps only its latest value and only
-/// the last few `Connected` are kept, and they follow as soon as there is room. So a
-/// reader that comes late still ends on the current state. Spawns its task (inside the
+/// channel's, the relay count, the agent sites) keeps only its latest value and
+/// `Connected` keeps the latest per site, and they follow as soon as there is room.
+/// Guarantees: for each state the latest value always arrives (a reader that comes
+/// late still ends on the current state); for `Connected`, at least the latest of each
+/// site arrives, never an older one in its place. Spawns its task (inside the
 /// tokio runtime); it ends when `from` closes and all is handed on, or the receiver is
 /// dropped.
 pub fn latest_events(mut from: mpsc::UnboundedReceiver<AgentEvent>) -> mpsc::Receiver<AgentEvent> {
@@ -269,7 +270,11 @@ mod tests {
             tx.send(AgentEvent::Relays(n % 17)).unwrap();
             tx.send(AgentEvent::Sites(vec![SiteId(format!("s{n}"))]))
                 .unwrap();
-            tx.send(AgentEvent::Connected(SessionId(n as u64))).unwrap();
+            tx.send(AgentEvent::Connected(
+                SiteId(format!("c{}", n % 20)),
+                SessionId(n as u64),
+            ))
+            .unwrap();
         }
         tx.send(AgentEvent::Relays(3)).unwrap();
         drop(tx);
@@ -280,8 +285,9 @@ mod tests {
         while let Some(event) = events.recv().await {
             got.push(event);
         }
+        // The buffer, the three states, one `Connected` per site (20 sites).
         assert!(
-            got.len() <= EVENTS_BUFFER + 3 + CONNECTED_KEPT,
+            got.len() <= EVENTS_BUFFER + 3 + 20,
             "{} events kept",
             got.len()
         );
@@ -295,11 +301,18 @@ mod tests {
             _ => None,
         });
         assert_eq!(last_sites, Some(vec![SiteId("s999".into())]));
-        assert_eq!(
-            got.last(),
-            Some(&AgentEvent::Connected(SessionId(999))),
-            "the last sessions that came up are kept"
-        );
+        // Every site's latest session arrives, after any older one of that site.
+        for site in 0..20u64 {
+            let latest = (0..1000u64).rev().find(|n| n % 20 == site).unwrap();
+            let sessions: Vec<u64> = got
+                .iter()
+                .filter_map(|e| match e {
+                    AgentEvent::Connected(s, SessionId(n)) if s.0 == format!("c{site}") => Some(*n),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(sessions.last(), Some(&latest), "site c{site}: {sessions:?}");
+        }
     }
 
     #[tokio::test]

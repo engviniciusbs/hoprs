@@ -459,7 +459,7 @@ async fn connects_once_and_reuses() {
     assert_eq!(
         fx.events(),
         [
-            AgentEvent::Connected(session),
+            AgentEvent::Connected(fx.ssh.id.clone(), session),
             AgentEvent::Sites(vec![fx.ssh.id.clone()])
         ]
     );
@@ -543,7 +543,7 @@ async fn failed_agent_connect_closes_its_session() {
     assert!(
         !fx.events()
             .iter()
-            .any(|e| matches!(e, AgentEvent::Connected(_)))
+            .any(|e| matches!(e, AgentEvent::Connected(..)))
     );
 
     // A tab's session that is down is the user's: answered, never closed.
@@ -1155,7 +1155,7 @@ async fn concurrent_calls_share_one_connection() {
     assert_eq!(
         fx.events(),
         [
-            AgentEvent::Connected(session),
+            AgentEvent::Connected(fx.ssh.id.clone(), session),
             AgentEvent::Sites(vec![fx.ssh.id.clone()])
         ]
     );

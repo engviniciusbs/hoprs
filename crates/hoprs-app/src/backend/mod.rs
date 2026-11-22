@@ -328,8 +328,10 @@ pub trait BackendApi: Send + Sync {
     /// `settings.toml` saved afterwards sets it too (the stored setting wins).
     async fn set_agents_enabled(&self, on: bool);
     /// What the agent side reports (relays connected, the channel's state, the sites an
-    /// agent holds), for the UI's subscription. Only the first call gets it. Bounded,
-    /// the latest state winning while nobody reads (see [`crate::agent::latest_events`]).
+    /// agent holds, the sessions an agent brought up), for the UI's subscription. Only
+    /// the first call gets it. Bounded while nobody reads (see
+    /// [`crate::agent::latest_events`]): of `Relays`, `Sites` and `Channel` the latest
+    /// value always arrives; of `Connected`, at least the latest of each site.
     // TODO(Task 14): remove
     #[allow(dead_code)]
     fn agent_events(&self) -> Option<mpsc::Receiver<AgentEvent>>;

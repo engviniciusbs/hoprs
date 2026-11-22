@@ -27,7 +27,9 @@
 //! reading its replies holds up only itself (its calls wait for their replies to be
 //! written before their turn is free), never another relay or the service. Memory stays
 //! bounded: at most [`MAX_IN_FLIGHT`] running and [`WAITING_MAX`] waiting calls, and a
-//! relay with [`WAITING_MAX`] refusals not yet written is closed. A goodbye is given
+//! relay that leaves [`REFUSALS_UNWRITTEN_MAX`] refusals unwritten (it does not read its
+//! lines at all) is closed; an agent that fans out many calls and reads at a normal
+//! pace only loses the calls beyond the queue, each with its error. A goodbye is given
 //! [`BYE_WAIT`], then the connection is closed anyway.
 //!
 //! **Switch off.** Once the channel is closed the service's reaper runs at once: with
@@ -57,8 +59,14 @@ use super::{AgentEvent, HELLO_WAIT, MAX_IN_FLIGHT, MAX_RELAYS, REAP_EVERY};
 /// How long a goodbye, or the answer to a mismatched hello, may take to be written.
 const BYE_WAIT: Duration = Duration::from_secs(1);
 /// Calls read from a relay and waiting for a turn; one more is refused (see
-/// [`TOO_MANY`]). Also the most refusals a relay may leave unread before it is closed.
+/// [`TOO_MANY`]).
 const WAITING_MAX: usize = MAX_IN_FLIGHT;
+/// Refusals not written yet past which a relay is closed: what bounds the memory of a
+/// relay that sends calls and never reads (a refusal is about 150 bytes, so about
+/// 150 KB per relay and 2.4 MB for [`MAX_RELAYS`]). Not 8: refusals queue behind an
+/// answer still being written (up to 8 MiB, a 1 MiB file is about 1.4 MB of line), and
+/// an agent that fans out a few dozen calls meanwhile must keep its connection.
+const REFUSALS_UNWRITTEN_MAX: usize = 1024;
 /// Connections still in their hello at once; more are closed at once.
 const HANDSHAKES_MAX: usize = MAX_RELAYS;
 /// The pause after the channel failed to take a connection (out of descriptors, say).
@@ -469,7 +477,7 @@ impl Connection {
                         }
                         if self.waiting.len() < WAITING_MAX {
                             self.waiting.push_back((call, tool, args));
-                        } else if self.refused < WAITING_MAX {
+                        } else if self.refused < REFUSALS_UNWRITTEN_MAX {
                             // This call only; it holds nothing.
                             self.refused += 1;
                             let _ = self.out.send(Outgoing::Answer {

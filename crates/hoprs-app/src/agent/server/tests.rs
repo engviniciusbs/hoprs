@@ -303,6 +303,67 @@ async fn a_relay_that_floods_without_reading_is_closed() {
     assert_eq!(reply_id(&other.recv().await.unwrap()), 1);
 }
 
+/// An agent that fans out many calls while a large answer is still going out, and reads
+/// at a normal pace: it keeps its connection; only the calls beyond the queue fail, each
+/// with its own error, and every call gets one reply.
+#[tokio::test]
+async fn a_fan_out_behind_a_large_answer_keeps_its_connection() {
+    let fx = fixture(true);
+    let big = "x".repeat(crate::agent::FILE_MAX);
+    let fs = fx.host.add_site(fx.site.clone());
+    fs.add_file(FILE, big.as_bytes(), SystemTime::UNIX_EPOCH);
+    let mut other = Site::new("Other", "other.example", "u", Protocol::Ssh);
+    other.agent_access = AgentAccess::Read;
+    let other_fs = fx.host.add_site(other.clone());
+    other_fs.add_file(FILE, b"small", SystemTime::UNIX_EPOCH);
+    let hold = fx.host.hold(&other.id, FsOp::Read);
+    let mut client = Client::greeted(&fx.endpoint).await;
+
+    // A 1 MiB answer: about 1.4 MB of line, more than the socket holds unread.
+    client.call(1, "read_file", fx.read_args()).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Forty calls meanwhile. The large answer keeps its turn until written: seven run,
+    // eight wait, the others are refused behind it.
+    let held = json!({"site": other.id.0, "path": FILE});
+    const FAN: u64 = 40;
+    for id in 2..=FAN + 1 {
+        client.call(id, "read_file", held.clone()).await;
+    }
+    until("seven held calls run", || {
+        fx.host.calls(&other.id, FsOp::Read) == MAX_IN_FLIGHT - 1
+    })
+    .await;
+
+    let large = client.recv().await.expect("the large answer");
+    assert_eq!(reply_id(&large), 1);
+    assert_eq!(
+        large["blocks"][1].as_str().unwrap().len(),
+        crate::agent::FILE_MAX
+    );
+    let refusals = FAN as usize - (MAX_IN_FLIGHT - 1) - WAITING_MAX;
+    let mut answered = Vec::new();
+    for _ in 0..refusals {
+        let reply = client.recv().await.expect("a refusal, not the end");
+        assert_eq!(reply["error"], TOO_MANY, "{reply}");
+        answered.push(reply_id(&reply));
+    }
+    hold.release();
+    for _ in 0..(MAX_IN_FLIGHT - 1 + WAITING_MAX) {
+        let reply = client.recv().await.expect("an answer, not the end");
+        assert_eq!(reply["ok"], true, "{reply}");
+        answered.push(reply_id(&reply));
+    }
+    answered.sort_unstable();
+    assert_eq!(
+        answered,
+        (2..=FAN + 1).collect::<Vec<_>>(),
+        "one reply per call"
+    );
+    // Still connected.
+    client.call(100, "list_sites", json!({})).await;
+    assert_eq!(reply_id(&client.recv().await.unwrap()), 100);
+}
+
 #[tokio::test]
 async fn a_call_whose_task_panics_is_answered() {
     let dir = tempfile::tempdir().unwrap();

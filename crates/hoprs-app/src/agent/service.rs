@@ -1000,7 +1000,7 @@ impl Service {
         };
         drop(waiter);
         if let (AttemptEnd::Up(session), true) = (&end, first) {
-            self.send(AgentEvent::Connected(*session));
+            self.send(AgentEvent::Connected(site.id.clone(), *session));
         }
         self.send_sites();
         match end {
