@@ -11,6 +11,12 @@ export const langs: readonly Lang[] = ["en", "pt-BR"];
 export const dicts: Record<Lang, Dict> = { en, "pt-BR": ptBr };
 /** Where each language's page lives on the site (and in dist/). */
 export const pagePath: Record<Lang, string> = { en: "/", "pt-BR": "/pt-br/" };
+export type Page = "home" | "privacy";
+/** Every page, per language: where it lives on the site (and in dist/). */
+export const pagePaths: Record<Page, Record<Lang, string>> = {
+  home: pagePath,
+  privacy: { en: "/privacy/", "pt-BR": "/pt-br/privacy/" },
+};
 export const otherLang = (lang: Lang): Lang => (lang === "en" ? "pt-BR" : "en");
 
 export function isLang(value: string): value is Lang {
