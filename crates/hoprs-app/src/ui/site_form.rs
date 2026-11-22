@@ -7,7 +7,7 @@
 use std::fmt;
 use std::path::PathBuf;
 
-use hoprs_core::{Error, FtpMode, OpenAs, Protocol, Site, SiteId};
+use hoprs_core::{AgentAccess, Error, FtpMode, OpenAs, Protocol, Site, SiteId};
 use iced::widget::{
     button, checkbox, column, container, pick_list, row, scrollable, space, text, text_input,
 };
@@ -53,6 +53,7 @@ pub enum SiteFormMsg {
     NatWorkaround(bool),
     RemoteDir(String),
     LocalDir(String),
+    AgentAccess(AgentAccess),
     Save,
     Cancel,
     Export,
@@ -112,6 +113,7 @@ pub struct SiteForm {
     pub nat_workaround: bool,
     pub remote_dir: String,
     pub local_dir: String,
+    pub agent_access: AgentAccess,
     /// Shown once a save was attempted, then kept current while typing.
     pub errors: Option<SiteErrors>,
     pub confirm_delete: bool,
@@ -157,6 +159,7 @@ impl SiteForm {
                 .as_ref()
                 .map(|p| p.display().to_string())
                 .unwrap_or_default(),
+            agent_access: site.agent_access,
             errors: None,
             confirm_delete: false,
             busy: false,
@@ -209,6 +212,7 @@ impl SiteForm {
         site.ftp.nat_workaround = self.nat_workaround;
         site.remote_dir = non_empty(&self.remote_dir);
         site.local_dir = non_empty(&self.local_dir).map(PathBuf::from);
+        site.agent_access = self.agent_access;
         Some(site)
     }
 
@@ -236,6 +240,7 @@ impl SiteForm {
             SiteFormMsg::NatWorkaround(v) => self.nat_workaround = v,
             SiteFormMsg::RemoteDir(v) => self.remote_dir = v,
             SiteFormMsg::LocalDir(v) => self.local_dir = v,
+            SiteFormMsg::AgentAccess(v) => self.agent_access = v,
             SiteFormMsg::Save => return self.save(),
             SiteFormMsg::Cancel => return SiteFormOutcome::Close,
             SiteFormMsg::Export => {
@@ -290,6 +295,17 @@ impl SiteForm {
     pub fn finished(&mut self, failure: Option<Error>) {
         self.busy = false;
         self.failure = failure;
+    }
+}
+
+/// The line under the level buttons: what an agent may do. "Everything" means files only
+/// on an FTP site, and the hint says so.
+pub fn agent_hint(access: AgentAccess, protocol: Protocol) -> Option<&'static str> {
+    match access {
+        AgentAccess::None => None,
+        AgentAccess::Read => Some(strings::agent_access_read_hint()),
+        AgentAccess::All if protocol == Protocol::Ssh => Some(strings::agent_access_all_hint_ssh()),
+        AgentAccess::All => Some(strings::agent_access_all_hint_ftp()),
     }
 }
 
@@ -524,6 +540,26 @@ pub fn view(form: &SiteForm, delete_note: Option<String>) -> Element<'_, Message
         .into(),
     );
 
+    let level = |label, access: AgentAccess| {
+        button(text(label))
+            .padding(Padding::from([theme::SPACE_2XS, theme::SPACE_MD]))
+            .style(theme::segment(form.agent_access == access))
+            .on_press(msg(SiteFormMsg::AgentAccess(access)))
+    };
+    let mut agents_body = column![
+        row![
+            level(strings::agent_access_none(), AgentAccess::None),
+            level(strings::agent_access_read(), AgentAccess::Read),
+            level(strings::agent_access_all(), AgentAccess::All),
+        ]
+        .spacing(theme::SPACE_2XS)
+    ]
+    .spacing(theme::SPACE_XS);
+    if let Some(hint) = agent_hint(form.agent_access, form.protocol) {
+        agents_body = agents_body.push(muted(hint));
+    }
+    let agents = section(strings::agents_section(), agents_body.into());
+
     let content = column![
         text(title).size(theme::TEXT_MD).font(theme::INTER_SEMIBOLD),
         name,
@@ -533,6 +569,7 @@ pub fn view(form: &SiteForm, delete_note: Option<String>) -> Element<'_, Message
         password,
         options,
         folders,
+        agents,
         failure(form.failure.as_ref()),
         actions(form, delete_note),
     ]
@@ -634,4 +671,63 @@ fn muted(label: &str) -> Element<'_, Message> {
         .size(theme::TEXT_XS)
         .color(palette().muted)
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_access_starts_from_the_site_and_is_saved() {
+        let mut site = Site::new("a", "h", "u", Protocol::Ssh);
+        site.agent_access = AgentAccess::Read;
+        let mut form = SiteForm::edit(&site);
+        assert_eq!(form.agent_access, AgentAccess::Read);
+        assert_eq!(form.build().unwrap().agent_access, AgentAccess::Read);
+        form.update(SiteFormMsg::AgentAccess(AgentAccess::All));
+        assert_eq!(form.build().unwrap().agent_access, AgentAccess::All);
+
+        let mut fresh = SiteForm::new_site();
+        fresh.update(SiteFormMsg::Host("h".into()));
+        assert_eq!(fresh.agent_access, AgentAccess::None);
+        assert_eq!(fresh.build().unwrap().agent_access, AgentAccess::None);
+    }
+
+    #[test]
+    fn agent_hint_per_level_and_protocol() {
+        assert_eq!(agent_hint(AgentAccess::None, Protocol::Ssh), None);
+        assert_eq!(agent_hint(AgentAccess::None, Protocol::Ftp), None);
+        assert_eq!(
+            agent_hint(AgentAccess::Read, Protocol::Ssh),
+            Some(strings::agent_access_read_hint())
+        );
+        assert_eq!(
+            agent_hint(AgentAccess::All, Protocol::Ssh),
+            Some(strings::agent_access_all_hint_ssh())
+        );
+        for protocol in [
+            Protocol::Ftp,
+            Protocol::FtpsExplicit,
+            Protocol::FtpsImplicit,
+        ] {
+            assert_eq!(
+                agent_hint(AgentAccess::All, protocol),
+                Some(strings::agent_access_all_hint_ftp())
+            );
+        }
+        assert_ne!(
+            strings::agent_access_all_hint_ssh(),
+            strings::agent_access_all_hint_ftp()
+        );
+    }
+
+    #[test]
+    fn changing_the_protocol_keeps_the_level() {
+        let mut form = SiteForm::new_site();
+        form.update(SiteFormMsg::Host("h".into()));
+        form.update(SiteFormMsg::AgentAccess(AgentAccess::All));
+        form.update(SiteFormMsg::Protocol(Protocol::Ftp));
+        assert_eq!(form.agent_access, AgentAccess::All);
+        assert_eq!(form.build().unwrap().agent_access, AgentAccess::All);
+    }
 }

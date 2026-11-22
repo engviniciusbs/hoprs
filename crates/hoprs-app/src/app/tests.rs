@@ -811,6 +811,27 @@ async fn edit_site_from_sidebar_does_not_connect() {
     assert_eq!(site_form(&mut app).site_id(), &a.id);
 }
 
+#[tokio::test]
+async fn saving_the_form_stores_the_level() {
+    let a = site("a", "h", "u", Protocol::Ssh);
+    let fake = Arc::new(FakeBackend::new().with_site(a.clone()));
+    let mut app = loaded(&fake).await;
+    app.update(Message::EditSite(a.id.clone()));
+    type_site(
+        &mut app,
+        SiteFormMsg::AgentAccess(hoprs_core::AgentAccess::All),
+    );
+    let effects = type_site(&mut app, SiteFormMsg::Save);
+    let Ok([Effect::SaveSite { site, password }]) = <[Effect; 1]>::try_from(effects) else {
+        panic!("one SaveSite effect");
+    };
+    effects::save_site(fake.clone(), site, password)
+        .await
+        .unwrap();
+    let saved = fake.sites().await.unwrap();
+    assert_eq!(saved[0].agent_access, hoprs_core::AgentAccess::All);
+}
+
 /// A save result that arrives after its form was replaced never touches the new form.
 #[tokio::test]
 async fn late_form_result_leaves_other_form_untouched() {

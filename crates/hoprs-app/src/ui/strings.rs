@@ -426,6 +426,27 @@ pub fn start_folders() -> &'static str {
 pub fn remote_dir() -> &'static str {
     tr("remote-dir")
 }
+pub fn agents_section() -> &'static str {
+    tr("agents-section")
+}
+pub fn agent_access_none() -> &'static str {
+    tr("agent-access-none")
+}
+pub fn agent_access_read() -> &'static str {
+    tr("agent-access-read")
+}
+pub fn agent_access_all() -> &'static str {
+    tr("agent-access-all")
+}
+pub fn agent_access_read_hint() -> &'static str {
+    tr("agent-access-read-hint")
+}
+pub fn agent_access_all_hint_ssh() -> &'static str {
+    tr("agent-access-all-hint-ssh")
+}
+pub fn agent_access_all_hint_ftp() -> &'static str {
+    tr("agent-access-all-hint-ftp")
+}
 pub fn local_dir() -> &'static str {
     tr("local-dir")
 }
