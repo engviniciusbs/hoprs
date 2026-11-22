@@ -5,6 +5,7 @@
 //! library so that the benchmarks in `benches/` reach the view ([`bench`]) and the
 //! start-up probe; nothing else is public.
 
+mod agent;
 mod app;
 mod backend;
 #[doc(hidden)]

@@ -124,8 +124,8 @@ fn menu_ignored_while_closing() {
 
 // ---- Plan 13 Task 13: the pane menus ----
 
+use crate::agent::paths::local_os_path;
 use crate::app::actions::{Busy, BusyKind, PaneAction};
-use crate::app::files::local_os_path;
 use crate::app::menu::{MenuAction, MenuItem};
 use crate::backend::ConnectError;
 

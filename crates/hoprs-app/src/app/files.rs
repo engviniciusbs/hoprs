@@ -14,6 +14,7 @@ use iced::{Point, Rectangle};
 use super::actions::{Busy, PaneAction};
 use super::menu::{ContextMenu, MenuTarget};
 use super::{App, Drag, Effect, TabId};
+use crate::agent::paths::local_os_path;
 use crate::backend::Side;
 use crate::ui::virtual_list::ROW_HEIGHT;
 
@@ -423,17 +424,6 @@ pub fn local_path(path: &std::path::Path) -> Option<RemotePath> {
 /// workspace saves as `local_dir`).
 pub fn local_fs_path(path: &RemotePath) -> std::path::PathBuf {
     std::path::PathBuf::from(path.as_str())
-}
-
-/// The file the local side opens for `path`, as the system writes it: its components
-/// pushed onto the root, as `LocalFs::new("/")` does, made absolute without touching the
-/// disk (on Windows that adds the current drive: `/Users/me` is `C:\Users\me`).
-pub fn local_os_path(path: &RemotePath) -> std::path::PathBuf {
-    let mut out = std::path::PathBuf::from("/");
-    for comp in path.as_str().split('/').filter(|s| !s.is_empty()) {
-        out.push(comp);
-    }
-    std::path::absolute(&out).unwrap_or(out)
 }
 
 /// A pane's selection by entry name (`None`: the `..` row), to find it again after the
@@ -1322,27 +1312,6 @@ mod tests {
         assert_eq!(pane.row(7), Some(Row::Entry(&pane.entries[6])));
         assert_eq!(pane.row(0), Some(Row::Up));
         assert_eq!(pane.row(8), None);
-    }
-
-    #[test]
-    fn local_os_path_is_the_native_path() {
-        let path = RemotePath::new("/home/me/a b.txt").unwrap();
-        let os = local_os_path(&path);
-        assert!(os.is_absolute(), "{os:?}");
-        assert!(os.ends_with(std::path::Path::new("home").join("me").join("a b.txt")));
-        #[cfg(unix)]
-        assert_eq!(os, std::path::PathBuf::from("/home/me/a b.txt"));
-        // On Windows: a drive, backslashes (`C:\home\me\a b.txt`).
-        #[cfg(windows)]
-        {
-            let text = os.display().to_string();
-            assert!(text.ends_with(r"\home\me\a b.txt"), "{text}");
-            assert_eq!(text.chars().nth(1), Some(':'), "{text}");
-        }
-        assert_eq!(
-            local_os_path(&RemotePath::root()),
-            std::path::absolute("/").unwrap()
-        );
     }
 
     #[test]
