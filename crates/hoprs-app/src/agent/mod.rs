@@ -3,6 +3,8 @@
 //! reports.
 
 pub mod paths;
+pub mod proto;
+pub mod tools;
 
 use std::time::Duration;
 
@@ -98,6 +100,66 @@ impl Default for Limits {
     }
 }
 
+// ---- The texts an agent receives (English only, not in the Fluent catalogs) ----
+
+/// The relay could not reach the app.
+// TODO(Task 13): remove
+#[allow(dead_code)]
+pub const UNREACHABLE: &str = "hoprs is not reachable: it is not running, or agent access is off. Open hoprs and turn on Settings › Agents (MCP), then call the tool again.";
+/// The app closed the channel because the user turned agent access off.
+// TODO(Task 9): remove
+#[allow(dead_code)]
+pub const TURNED_OFF: &str = "Agent access was turned off in hoprs. Turn on Settings › Agents (MCP) in the hoprs window, then call the tool again.";
+/// The running window is another version than the relay.
+// TODO(Task 13): remove
+#[allow(dead_code)]
+pub fn version_mismatch(app: &str, relay: &str) -> String {
+    format!(
+        "hoprs was updated while its window stayed open (window {app}, this program {relay}). Restart hoprs, then call the tool again."
+    )
+}
+/// An unknown site id, and a site with no access: one text for both.
+// TODO(Task 9): remove
+#[allow(dead_code)]
+pub const SITE_UNAVAILABLE: &str =
+    "No site with this id is open to agents. Call list_sites to see the sites you can use.";
+/// The site's level is reading only.
+// TODO(Task 9): remove
+#[allow(dead_code)]
+pub fn read_only(site: &str) -> String {
+    format!(
+        "The site \"{site}\" allows reading only. The user can allow more in hoprs: edit the site, Agents (MCP)."
+    )
+}
+/// `run_command` on a site that is not SSH.
+// TODO(Task 9): remove
+#[allow(dead_code)]
+pub fn ssh_only(site: &str) -> String {
+    format!(
+        "The site \"{site}\" is not an SSH site, and only SSH sites can run commands. Use the file tools on it instead."
+    )
+}
+/// A protected local path.
+// TODO(Task 11): remove
+#[allow(dead_code)]
+pub fn protected(path: &str) -> String {
+    format!(
+        "{path} is protected: agents cannot transfer to or from hoprs's own files, ~/.ssh or the key files of saved sites."
+    )
+}
+/// A connection needs an answer from the user.
+// TODO(Task 9): remove
+#[allow(dead_code)]
+pub const WAITING_FOR_USER: &str = "hoprs is waiting for the user: a question about this connection (host key, certificate, password or passphrase) must be answered in the hoprs window. Ask the user, then call the tool again.";
+/// The server's host key changed.
+// TODO(Task 9): remove
+#[allow(dead_code)]
+pub const HOST_KEY_CHANGED: &str = "The server's host key changed. The user has to resolve it in the hoprs window; an agent cannot accept a new key.";
+/// The server's `instructions`.
+// TODO(Task 13): remove
+#[allow(dead_code)]
+pub const INSTRUCTIONS: &str = "hoprs is a desktop client for SSH, SFTP, FTP and FTPS. These tools work on the sites the user saved in hoprs and opened to agents; the user sees every action in hoprs's log. Call list_sites first: it returns the sites you can use, with the id every other tool wants. Each site has one of two levels: read (list folders, read files, download) or all (also write, rename, delete, change permissions, upload, and run commands on SSH sites). A tool that needs more than the site allows is refused with a message saying so. Remote paths are absolute. There is no interactive terminal. If hoprs needs the user to answer a question about a connection, the tool says so: ask the user, then call it again.";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -120,5 +182,21 @@ mod tests {
             (MAX_IN_FLIGHT, MAX_RELAYS, HELLO_WAIT),
             (8, 16, Duration::from_secs(5))
         );
+    }
+    #[test]
+    fn texts_tell_what_to_do() {
+        assert!(UNREACHABLE.contains("Settings › Agents (MCP)"));
+        assert!(TURNED_OFF.contains("Settings › Agents (MCP)"));
+        assert!(version_mismatch("1.6.0", "1.6.1").contains("Restart hoprs"));
+        assert!(version_mismatch("1.6.0", "1.6.1").contains("window 1.6.0"));
+        assert!(SITE_UNAVAILABLE.contains("list_sites"));
+        assert!(read_only("Acme").contains("\"Acme\" allows reading only"));
+        assert!(ssh_only("Acme").contains("\"Acme\""));
+        assert!(ssh_only("Acme").contains("SSH"));
+        assert!(protected("/home/u/.ssh/id").starts_with("/home/u/.ssh/id is protected"));
+        assert!(WAITING_FOR_USER.contains("hoprs window"));
+        assert!(HOST_KEY_CHANGED.contains("host key changed"));
+        assert!(INSTRUCTIONS.contains("list_sites"));
+        assert!(INSTRUCTIONS.contains("log"));
     }
 }
