@@ -12,7 +12,7 @@ use hoprs_transfer::{Event, TransferSpec};
 use tokio::sync::{broadcast, mpsc, watch};
 
 use hoprs_import::ImportOptions;
-use hoprs_vault::ImportMode;
+use hoprs_vault::{ExportScope, ImportMode};
 use secrecy::SecretString;
 
 use crate::app::edit::{EditsFor, FLUSH_LIMIT, Settle, Settled};
@@ -285,9 +285,11 @@ pub fn run(
             folders_as_workspaces,
         } => Task::future(import_filezilla(backend, path, folders_as_workspaces)),
         Effect::DeleteSitemanager(path) => Task::future(delete_sitemanager(backend, path)),
-        Effect::ExportBackup { path, password } => {
-            Task::future(export_backup(backend, path, password))
-        }
+        Effect::ExportBackup {
+            scope,
+            path,
+            password,
+        } => Task::future(export_backup(backend, scope, path, password)),
         Effect::RestoreBackup {
             path,
             password,
@@ -567,10 +569,11 @@ pub async fn delete_sitemanager(backend: Arc<dyn BackendApi>, path: PathBuf) -> 
 /// Writes a backup; the password goes straight from the effect to the vault.
 pub async fn export_backup(
     backend: Arc<dyn BackendApi>,
+    scope: ExportScope,
     path: PathBuf,
     password: SecretString,
 ) -> Message {
-    Message::BackupExported(backend.export_backup(path, password).await)
+    Message::BackupExported(backend.export_backup(scope, path, password).await)
 }
 
 pub async fn restore_backup(

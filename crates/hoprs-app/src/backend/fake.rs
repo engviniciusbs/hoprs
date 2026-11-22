@@ -73,7 +73,7 @@ use hoprs_core::{
 use hoprs_import::{ImportOptions, ImportReport};
 use hoprs_remote::{CompareOptions, CompareSignals, MemFs, Progress, RemoteFs, Summary};
 use hoprs_transfer::{ConflictPolicy, Event, TransferId, TransferItem, TransferSpec};
-use hoprs_vault::{BackupImportReport, ExportReport, ImportMode, UnreadableEntry};
+use hoprs_vault::{BackupImportReport, ExportReport, ExportScope, ImportMode, UnreadableEntry};
 use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -101,6 +101,7 @@ pub enum BackupCall {
     },
     DeleteSitemanager(PathBuf),
     Export {
+        scope: ExportScope,
         path: PathBuf,
         password: String,
     },
@@ -251,6 +252,8 @@ struct State {
     hang_save_tabs: bool,
     panic_shutdown: bool,
     backup_calls: Vec<BackupCall>,
+    /// The next `export_backup` calls fail with these.
+    export_failures: VecDeque<Error>,
     /// What `settings` returns.
     settings: SettingsLoad,
     /// What `queue_error` returns.
@@ -636,6 +639,13 @@ impl FakeBackend {
     /// The next `save_workspace_tabs` fails with `error`.
     pub fn fail_next_save_tabs(&self, error: Error) {
         self.state().save_tab_failures.push_back(error);
+    }
+
+    /// The next `export_backup` fails with `error`.
+    // No test fails an export until the export screen (Task 3); remove this then.
+    #[allow(dead_code)]
+    pub fn fail_next_export(&self, error: Error) {
+        self.state().export_failures.push_back(error);
     }
 
     /// From now on `save_workspace_tabs` never returns.
@@ -1251,15 +1261,46 @@ impl BackendApi for FakeBackend {
         Ok(())
     }
 
-    async fn export_backup(&self, path: PathBuf, password: SecretString) -> Result<ExportReport> {
+    async fn export_backup(
+        &self,
+        scope: ExportScope,
+        path: PathBuf,
+        password: SecretString,
+    ) -> Result<ExportReport> {
         self.record(BackupCall::Export {
+            scope: scope.clone(),
             path,
             password: password.expose_secret().to_owned(),
         });
-        let state = self.state();
+        let mut state = self.state();
+        if let Some(error) = state.export_failures.pop_front() {
+            return Err(error);
+        }
+        let (sites, workspaces) = match &scope {
+            ExportScope::All => (state.sites.len(), state.workspaces.len()),
+            ExportScope::Site(id) => {
+                if !state.sites.iter().any(|s| &s.id == id) {
+                    return Err(Self::not_found("Unknown site"));
+                }
+                (1, 0)
+            }
+            ExportScope::Workspace(id) => {
+                let workspace = state
+                    .workspaces
+                    .iter()
+                    .find(|w| &w.id == id)
+                    .ok_or_else(|| Self::not_found("Unknown workspace"))?;
+                let held = workspace
+                    .sites
+                    .iter()
+                    .filter(|entry| state.sites.iter().any(|s| s.id == entry.site))
+                    .count();
+                (held, 1)
+            }
+        };
         Ok(ExportReport {
-            sites: state.sites.len(),
-            workspaces: state.workspaces.len(),
+            sites,
+            workspaces,
             secrets: 0,
             skipped_unreadable: Vec::new(),
             missing_secrets: Vec::new(),

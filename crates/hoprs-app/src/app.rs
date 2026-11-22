@@ -10,7 +10,7 @@ use hoprs_core::{
 };
 use hoprs_import::ImportReport;
 use hoprs_transfer::{ConflictPolicy, Event, TransferId, TransferSpec};
-use hoprs_vault::{BackupImportReport, ExportReport, ImportMode, UnreadableEntry};
+use hoprs_vault::{BackupImportReport, ExportReport, ExportScope, ImportMode, UnreadableEntry};
 use secrecy::SecretString;
 
 use crate::backend::{
@@ -60,6 +60,7 @@ pub mod actions;
 pub mod compare;
 pub mod dialogs;
 pub mod edit;
+pub mod export;
 pub mod files;
 pub mod import;
 pub mod lifecycle;
@@ -719,6 +720,7 @@ pub enum Effect {
     /// Writes an encrypted backup; back as [`Message::BackupExported`]. The only holder
     /// of the password once emitted (its `Debug` is redacted).
     ExportBackup {
+        scope: ExportScope,
         path: PathBuf,
         password: SecretString,
     },

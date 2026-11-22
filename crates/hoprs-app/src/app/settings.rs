@@ -18,7 +18,7 @@ use std::path::PathBuf;
 
 use hoprs_core::Error;
 use hoprs_transfer::ConflictPolicy;
-use hoprs_vault::{BackupImportReport, ExportReport, ImportMode};
+use hoprs_vault::{BackupImportReport, ExportReport, ExportScope, ImportMode};
 use secrecy::SecretString;
 
 use super::{App, DividerMsg, Effect, Panel, PickTarget, Resize, TabId};
@@ -622,7 +622,11 @@ impl App {
         let password = SecretString::from(std::mem::take(&mut backup.export_password.0));
         backup.export_confirm = Password::default();
         backup.export = BackupState::Running;
-        vec![Effect::ExportBackup { path, password }]
+        vec![Effect::ExportBackup {
+            scope: ExportScope::All,
+            path,
+            password,
+        }]
     }
 
     /// Sends the restore with the typed password, which leaves the page.

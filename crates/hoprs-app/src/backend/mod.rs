@@ -290,7 +290,12 @@ pub trait BackendApi: Send + Sync {
     async fn delete_sitemanager(&self, path: PathBuf) -> Result<()>;
     /// Writes the encrypted backup of every site, workspace and secret to `path`. Slow on
     /// purpose (Argon2id).
-    async fn export_backup(&self, path: PathBuf, password: SecretString) -> Result<ExportReport>;
+    async fn export_backup(
+        &self,
+        scope: ExportScope,
+        path: PathBuf,
+        password: SecretString,
+    ) -> Result<ExportReport>;
     /// Restores a backup made by [`export_backup`](Self::export_backup).
     async fn restore_backup(
         &self,
@@ -927,10 +932,15 @@ impl BackendApi for Backend {
         Ok(())
     }
 
-    async fn export_backup(&self, path: PathBuf, password: SecretString) -> Result<ExportReport> {
+    async fn export_backup(
+        &self,
+        scope: ExportScope,
+        path: PathBuf,
+        password: SecretString,
+    ) -> Result<ExportReport> {
         let params = self.backup_params;
         self.vault
-            .call(move |vault| vault.export(&path, &ExportScope::All, &password, params))
+            .call(move |vault| vault.export(&path, &scope, &password, params))
             .await
     }
 
@@ -1635,6 +1645,43 @@ mod tests {
         assert!(!source.exists());
     }
 
+    /// One site exported alone restores as one site with Merge, and never with Replace.
+    #[tokio::test]
+    async fn export_of_one_site_restores_as_one_site() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = open(dir.path());
+        let a = Site::new("a", "ha", "u", Protocol::Ssh);
+        let b = Site::new("b", "hb", "u", Protocol::Ftp);
+        backend.save_site(a.clone()).await.unwrap();
+        backend.save_site(b).await.unwrap();
+        let path = dir.path().join("one.hoprs");
+        let report = backend
+            .export_backup(
+                ExportScope::Site(a.id),
+                path.clone(),
+                SecretString::from("pw"),
+            )
+            .await
+            .unwrap();
+        assert_eq!((report.sites, report.workspaces), (1, 0));
+
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = open(other_dir.path());
+        let restored = other
+            .restore_backup(path.clone(), SecretString::from("pw"), ImportMode::Merge)
+            .await
+            .unwrap();
+        assert_eq!(restored.added_sites, 1);
+        assert_eq!(other.sites().await.unwrap().len(), 1);
+
+        let err = other
+            .restore_backup(path, SecretString::from("pw"), ImportMode::Replace)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some("backup-partial-no-replace"));
+        assert_eq!(other.sites().await.unwrap().len(), 1);
+    }
+
     /// Export, then restore (merge and replace), through the vault on the blocking pool.
     #[tokio::test]
     async fn backup_export_and_restore() {
@@ -1649,13 +1696,13 @@ mod tests {
         let path = dir.path().join("out").join("hoprs.backup");
 
         let err = backend
-            .export_backup(path.clone(), SecretString::from(""))
+            .export_backup(ExportScope::All, path.clone(), SecretString::from(""))
             .await
             .unwrap_err();
         assert_eq!(err.kind, ErrorKind::Protocol);
         assert!(!path.exists());
         let report = backend
-            .export_backup(path.clone(), SecretString::from("pw"))
+            .export_backup(ExportScope::All, path.clone(), SecretString::from("pw"))
             .await
             .unwrap();
         assert_eq!((report.sites, report.workspaces, report.secrets), (1, 0, 1));

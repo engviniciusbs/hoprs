@@ -3,7 +3,7 @@
 
 use hoprs_import::{ImportReport, ImportedSite, SkippedSite};
 use hoprs_transfer::ConflictPolicy;
-use hoprs_vault::{BackupImportReport, ExportReport, ImportMode};
+use hoprs_vault::{BackupImportReport, ExportReport, ExportScope, ImportMode};
 
 use std::path::PathBuf;
 
@@ -371,7 +371,14 @@ fn export_refuses_empty_password_in_ui() {
         exists: false,
     });
     match &effects[..] {
-        [Effect::ExportBackup { path, password }] => {
+        [
+            Effect::ExportBackup {
+                scope,
+                path,
+                password,
+            },
+        ] => {
+            assert_eq!(scope, &ExportScope::All);
             assert_eq!(path, &PathBuf::from("/home/me/hoprs.backup"));
             assert_eq!(password.expose_secret(), "correct horse");
         }
@@ -804,7 +811,8 @@ fn settings_changes_apply_and_save() {
 /// the settings reach it, and come back as messages.
 #[tokio::test]
 async fn effects_reach_the_backend() {
-    let fake = Arc::new(FakeBackend::new());
+    let a = site("a", "a.example", "u", Protocol::Ssh);
+    let fake = Arc::new(FakeBackend::new().with_site(a.clone()));
     let backend: Arc<dyn BackendApi> = fake.clone();
 
     let message = effects::import_filezilla(backend.clone(), PathBuf::from("/s.xml"), true).await;
@@ -813,6 +821,7 @@ async fn effects_reach_the_backend() {
     assert!(matches!(message, Message::SitemanagerDeleted(Ok(()))));
     let message = effects::export_backup(
         backend.clone(),
+        ExportScope::Site(a.id.clone()),
         PathBuf::from("/b"),
         SecretString::from("pw"),
     )
@@ -845,6 +854,7 @@ async fn effects_reach_the_backend() {
             },
             BackupCall::DeleteSitemanager(PathBuf::from("/s.xml")),
             BackupCall::Export {
+                scope: ExportScope::Site(a.id.clone()),
                 path: PathBuf::from("/b"),
                 password: "pw".into(),
             },
@@ -1102,4 +1112,49 @@ fn section_msg_switches_section() {
     app.update(Message::CloseSettings);
     settings(&mut app, SettingsMsg::Section(SettingsSection::Backup));
     assert!(app.settings_tab.is_none());
+}
+
+/// The export screen's title: what the scope names, from the profiles the app holds.
+#[tokio::test]
+async fn export_title_per_scope() {
+    use crate::app::export::ExportTitle;
+
+    let a = site("a", "a.example", "u", Protocol::Ssh);
+    let b = site("b", "b.example", "u", Protocol::Ftp);
+    let c = site("c", "c.example", "u", Protocol::Ftp);
+    let missing = SiteId::new();
+    let team = workspace("team", &[&a.id, &b.id, &missing]);
+    let fake = FakeBackend::new()
+        .with_site(a.clone())
+        .with_site(b)
+        .with_site(c)
+        .with_workspace(team.clone());
+    let app = loaded(&fake).await;
+
+    let title = app.export_title(&ExportScope::Site(a.id.clone()));
+    assert_eq!(title, Some(ExportTitle::Site { name: "a".into() }));
+    assert_eq!(title.unwrap().name(), Some("a"));
+    let title = app.export_title(&ExportScope::Workspace(team.id.clone()));
+    assert_eq!(
+        title,
+        Some(ExportTitle::Workspace {
+            name: "team".into(),
+            sites: 2
+        })
+    );
+    assert_eq!(title.unwrap().name(), Some("team"));
+    let title = app.export_title(&ExportScope::All);
+    assert_eq!(
+        title,
+        Some(ExportTitle::All {
+            sites: 3,
+            workspaces: 1
+        })
+    );
+    assert_eq!(title.unwrap().name(), None);
+    assert_eq!(app.export_title(&ExportScope::Site(SiteId::new())), None);
+    assert_eq!(
+        app.export_title(&ExportScope::Workspace(WorkspaceId::new())),
+        None
+    );
 }
