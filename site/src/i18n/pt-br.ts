@@ -124,13 +124,13 @@ export const ptBr: Dict = {
         heading: "O app não coleta nada",
         paragraphs: [
           "O hoprs não tem conta, não envia telemetria e não tem servidor próprio. Seus sites, workspaces e configurações ficam em arquivos no seu computador, e as senhas ficam no chaveiro do sistema.",
-          "O app só se conecta aos servidores que você adiciona.",
+          "Fora o que está descrito abaixo (a checagem de atualização e, nas versões que o oferecem, o Google Drive), o app só se conecta aos servidores que você adiciona.",
         ],
       },
       {
         heading: "Checagem de atualização",
         paragraphs: [
-          "Poucos segundos depois de abrir, e depois uma vez por dia, o hoprs faz um pedido à API do GitHub para saber qual é a versão mais recente. O pedido leva só o cabeçalho User-Agent, hoprs/<versão>.",
+          "Poucos segundos depois de abrir, e depois uma vez por dia, o hoprs faz um pedido à API do GitHub para saber qual é a versão mais recente. O pedido não leva nenhum identificador: só a versão do app no cabeçalho User-Agent (hoprs/<versão>) e um cabeçalho Accept padrão.",
           "Em Configurações → Geral dá para desligar a checagem. Ao clicar em Atualizar, o instalador é baixado do GitHub.",
         ],
       },
