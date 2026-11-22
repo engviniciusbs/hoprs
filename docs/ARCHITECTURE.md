@@ -86,7 +86,7 @@ agent ──stdio, MCP──▶ hoprs mcp ──socket or pipe──▶ hoprs (t
   only while the Settings switch is on. It admits the same user only. A hello with the
   version comes first: a relay and a window of different versions are refused.
 - **The service** (`agent/service.rs`) is the single path to everything: `Service::call`
-  checks the switch, the site's level (`access_matrix`) and the protocol, then runs the tool.
+  checks the switch, the site's level and the protocol (`Service::admit`), then runs the tool.
   It reaches the app only through `AgentHost`, so it is tested against `FakeHost` (an
   in-memory host over `MemFs`), not through `BackendApi`. `BackendApi` gained only
   `set_agents_enabled` and `agent_events`.

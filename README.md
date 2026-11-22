@@ -402,7 +402,7 @@ every site starts at "No access".
    claude mcp add hoprs -- "/usr/bin/hoprs" mcp
    ```
 
-   Other MCP clients take the JSON snippet in the same section: `{"command": "<path to hoprs>", "args": ["mcp"]}`.
+   Other MCP clients take the JSON snippet in the same section: for example `{"command":"/usr/bin/hoprs","args":["mcp"]}` (the section shows yours, with your path).
 3. Edit a site and choose its level under "Agents (MCP)".
 
 **The levels** (per site, in the site's form):
@@ -540,7 +540,7 @@ tests check that every catalog has the same keys and variables as `en.ftl` (`car
 | Config: `sites.toml` (no secrets), `workspaces.toml`, `settings.toml` | `~/.config/hoprs/` | `~/Library/Application Support/hoprs/` | `%APPDATA%\hoprs\` |
 | Transfer queue `queue.db` (SQLite), `recovered/` (remote edits that could not be uploaded) | `~/.local/share/hoprs/` | `~/Library/Application Support/hoprs/` | `%APPDATA%\hoprs\` |
 | Working copies of files being edited | `$XDG_RUNTIME_DIR/hoprs/edit/` (cleared at logout) | a temporary folder | a temporary folder |
-| `agent.sock`, the channel for agents (only while Settings › Agents (MCP) is on and hoprs runs; the pipe `\\.\pipe\hoprs-agent-<your SID>` on Windows) | beside `instance.lock`: `$XDG_RUNTIME_DIR/hoprs/` | `~/Library/Application Support/hoprs/` | none: a named pipe |
+| `agent.sock`, the channel for agents (only while Settings › Agents (MCP) is on and hoprs runs; the pipe `\\.\pipe\hoprs-agent-<your SID>` on Windows) | beside `instance.lock` (normally `$XDG_RUNTIME_DIR/hoprs/`; if that is unusable, `~/.config/hoprs/`, then the temporary folder) | `~/Library/Application Support/hoprs/` | none: a named pipe |
 | Passwords and key passphrases, service `hoprs/<site-id>` | Secret Service (GNOME Keyring, KWallet) | macOS Keychain | Windows Credential Manager |
 
 The TOML files are plain text and safe to keep in a dotfiles repository: they never hold a
@@ -597,8 +597,9 @@ needed.
 - **Docker** (optional) for the integration tests and for building the `.deb`.
 
 The MCP server for agents uses [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk), the
-official Rust SDK, for the protocol on stdio. It adds a handful of pure-Rust crates (`rmcp`,
-`schemars` and its helpers) and needs nothing to install: no TLS, no HTTP, no OpenSSL.
+official Rust SDK, for the protocol on stdio. It adds exactly ten packages to `Cargo.lock` (`rmcp`, `schemars`, `schemars_derive`,
+`serde_derive_internals`, `dyn-clone`, `ref-cast`, `ref-cast-impl`, `pastey`,
+`unicode-general-category`, `unicode-normalization`) and needs nothing to install: no TLS, no HTTP, no OpenSSL.
 
 ### Build and run
 

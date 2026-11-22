@@ -36,3 +36,6 @@ on Windows) that admits the same user only. Any program running as that user can
 use the sites whose level allows it, which is the bar the app accepts: such a program can
 already read `sites.toml` and ask the keyring. That is why the switch is off by default and
 why each site starts at "No access". Nothing listens on the network.
+
+An agent with access can read and change whatever the remote account can, and what it reads
+leaves through the agent (to wherever that agent sends it), not through hoprs.

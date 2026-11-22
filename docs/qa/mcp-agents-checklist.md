@@ -35,7 +35,7 @@ rows were written, so the NEEDS HUMAN rows are the first real run.
 | A symbolic link inside an uploaded folder is skipped, never opened | Pass: `symlink_is_skipped`, `root_symlink_is_skipped` |
 | Local path rules: absolute, no `..`, one Windows drive, a regular file or a folder only | Pass: `local_path_rules`, `engine_path_rules`, `engine_path_rules_unix`, `engine_path_rules_windows` |
 | The channel on Unix: directory `0700`, socket `0600`, the peer's user id checked, a symlinked directory and another user's directory refused, a stale socket replaced, a file that is not a socket never replaced, the socket removed on drop | Pass: `socket_and_directory_modes`, `directory_rule`, `peer_rule`, `same_user_connects`, `a_symlinked_directory_is_refused`, `a_directory_of_another_user_is_refused`, `stale_socket_is_replaced`, `what_is_not_a_socket_is_never_replaced`, `drop_removes_the_socket`, `drop_leaves_a_newer_socket_alone` |
-| The channel on Windows: the pipe's name carries the SID, its security descriptor admits only the user, a second first instance is refused | Runs on the Windows CI job only: `pipe_name_carries_the_sid`, `pipe_admits_its_owner`, `second_first_instance_is_refused`, `descriptor_names_only_the_user` |
+| The channel on Windows: the pipe's name carries the SID, its security descriptor admits only the user, a second first instance is refused | Pass (Windows CI job): `pipe_name_carries_the_sid`, `pipe_admits_its_owner`, `second_first_instance_is_refused`, `descriptor_names_only_the_user` |
 | The channel's messages: the wire shapes, the hello and its limits, malformed lines are errors and never a panic, lines cut at the limit | Pass: `wire_shapes`, `hello_rule`, `the_hello_is_small`, `malformed_messages_are_errors_not_panics`, `read_line_limits`, `read_line_does_not_buffer_past_the_limit`, `read_message_wants_one_json_object` |
 | A hostile peer: junk and oversized lines close the connection, a silent client is dropped, a mismatch is answered and closed, duplicate ids close it, a relay that floods without reading is closed, a ninth call waits, a seventeenth relay is refused | Pass: `junk_and_oversized_lines_close_the_connection`, `silent_client_is_dropped`, `mismatch_is_answered_and_closed`, `duplicate_ids_close_and_unknown_cancels_are_ignored`, `a_relay_that_floods_without_reading_is_closed`, `a_relay_that_does_not_read_holds_up_nobody`, `a_ninth_call_waits_its_turn`, `a_seventeenth_call_is_refused_and_cancels_are_still_read`, `seventeenth_relay_is_refused`, `hellos_in_progress_are_capped`, `a_call_whose_task_panics_is_answered` |
 | Calls overlap and match their ids; a cancel stops a call and sends no answer; calls end with their relay | Pass: `hello_then_calls`, `calls_overlap_and_match_their_ids`, `cancel_stops_a_call_and_sends_nothing`, `calls_end_with_their_relay` |
@@ -76,11 +76,16 @@ Have Claude Code (a recent version) in a terminal on the same computer.
       Ask for `none` by name: the agent cannot find it, with the same answer it gets for a
       site that does not exist.
    2. *List a folder* on `ro`; ask for the second page of a big folder (`offset`).
-   3. *Read a file* on `ro`: its text comes back; a binary file is refused with a pointer to
+   3. *Describe a path (`stat`)* on `ro`: once for a file and once for a folder; the answer
+      names the kind, size, modification time and permissions.
+   3b. *Read a file* on `ro`: its text comes back; a binary file is refused with a pointer to
       download.
    4. *Download* a file and then a folder from `ro` into a new folder of your home. Rows
       with the "agent" tag appear in the queue and finish. Download again: the files are
-      skipped (overwrite is false); ask for overwrite: they are replaced.
+      skipped (overwrite is false); ask for overwrite: they are replaced. For a slow
+      download (a large file, or throttle the network) the answer says "running" with a
+      transfer number: ask for `transfer_status` on that number, then again after it
+      finishes: "running", then "done" with the counts.
    5. *Write a file* on `rw`, then edit it (read, then write with overwrite). The same on
       `ro`: refused with a message that says the site allows reading only.
    6. *Make a folder* on `rw`; *rename* the file into it; *change its permissions* to `600`
@@ -89,7 +94,7 @@ Have Claude Code (a recent version) in a terminal on the same computer.
    8. *Delete* the uploaded file, then the folder (it needs `recursive`).
    9. *Run a command* on `rw` (`uname -a`, then `sleep 120` with `timeout_seconds` 5). The
       first answers with its output and exit code. See step 11 for the second.
-   10. Ask for a command on `ftp`: refused, "only SSH sites run commands".
+   10. Ask for a command on `ftp`: refused with "The site \"<name>\" is not an SSH site, and only SSH sites can run commands. Use the file tools on it instead."
 3. **No tab, no focus, no sound.** While the agent works, no tab opens, the focus stays where
    it was (type in a rename field in a pane while the agent lists folders), and nothing
    makes a sound. The sidebar shows the site as "Connected (by an agent)" (hover or the
@@ -126,7 +131,7 @@ Have Claude Code (a recent version) in a terminal on the same computer.
     says it timed out after about five seconds. On the server, check `ps`: the process is
     gone (the KILL arrived) or, if it is still there, the answer said it might be. Ask for
     a command that never ends and cancel it in Claude Code (Esc): the process on the server
-    ends too, and the log line says cancelled.
+    ends too, or, since the KILL is best effort, it may keep running (check `ps`); the log line says cancelled.
 12. **An updated binary against the old window.** With hoprs running, replace the
     executable on disk (install a newer build over it, or copy one in) without quitting
     hoprs, then make a call: the agent gets "hoprs was updated while its window stayed

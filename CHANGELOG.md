@@ -16,6 +16,7 @@ Coding agents can work on your saved sites.
 - What you see: an "Agent connected" indicator in the status bar, an "agent" tag on its transfers in the queue, "Connected (by an agent)" on the site in the sidebar, and one line in the log per action (the command line included; never file content or command output). Turning the switch off closes agent sessions at once.
 - The channel is local: a socket (`agent.sock`) or, on Windows, a named pipe, open to your user only and only while the switch is on. Nothing listens on the network.
 - An agent can be misled by what it reads, and hoprs does not review its actions: keep production sites on "Allow reading" unless the agent really must change them.
+- A file sent from the compare panel with Overwrite now replaces a file another transfer wrote after it was queued; before, hoprs asked.
 - A queue file written by this version is refused by hoprs 1.5.0 and older, which then run on an empty in-memory queue.
 
 ## 1.5.0 — 2026-11-18
