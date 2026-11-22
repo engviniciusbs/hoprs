@@ -32,7 +32,8 @@ use hoprs_transfer::{
     TransferItem, TransferSpec,
 };
 use hoprs_vault::{
-    BackupImportReport, ExportParams, ExportReport, ExportScope, ImportMode, SecretStore, Vault,
+    AppSecretStore, BackupImportReport, ExportParams, ExportReport, ExportScope, ImportMode,
+    MemoryStore, SecretStore, Vault,
 };
 use secrecy::SecretString;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -49,6 +50,7 @@ pub use sessions::{
 pub use shells::ShellId;
 pub use vault::{LazyKeyringStore, ProfileSnapshot, VaultHandle};
 
+use crate::drive::{ConnectEvent, Drive, DriveAccount, DriveFile, Pages, Sealed};
 use crate::settings::{self, Settings, SettingsLoad};
 use crate::update::Release;
 use crate::update::download::{self, DownloadEvent, DownloadJob};
@@ -327,6 +329,44 @@ pub trait BackendApi: Send + Sync {
     /// asset runs (even one whose stream was dropped), another is refused at once with
     /// `update-download-busy`; nothing is started twice.
     fn download_update(&self, job: DownloadJob) -> BoxStream<'static, DownloadEvent>;
+
+    // Google Drive (see [`crate::drive`]). Without an OAuth client in the build every call
+    // fails with `drive-not-configured`.
+    /// The connected account: the connection in memory, else the keyring entry (read
+    /// once). `None`: not connected.
+    // TODO(task 11): the export flow's effects call this; remove this allow then.
+    #[allow(dead_code)]
+    async fn drive_status(&self) -> Result<Option<DriveAccount>>;
+    /// Signs in through the browser (see [`Drive::connect`]): `Waiting { url }`, then
+    /// exactly one `Done`, last. `pages` are the texts the browser sees afterwards.
+    // TODO(task 11): the export flow's effects call this; remove this allow then.
+    #[allow(dead_code)]
+    fn drive_connect(&self, pages: Pages) -> BoxStream<'static, ConnectEvent>;
+    /// Ends the wait of a running connect (its `Done` is `drive-connect-cancelled`).
+    // TODO(task 11): the export flow's effects call this; remove this allow then.
+    #[allow(dead_code)]
+    fn drive_cancel(&self);
+    /// Revokes the connection at Google (a failure is only logged) and deletes it here.
+    // TODO(task 11): the export flow's effects call this; remove this allow then.
+    #[allow(dead_code)]
+    async fn drive_disconnect(&self) -> Result<()>;
+    /// Seals the encrypted backup of `scope` in memory (like
+    /// [`export_backup`](Self::export_backup), without writing it). Slow on purpose.
+    // TODO(task 11): the export flow's effects call this; remove this allow then.
+    #[allow(dead_code)]
+    async fn seal_export(
+        &self,
+        scope: ExportScope,
+        password: SecretString,
+    ) -> Result<(ExportReport, Sealed)>;
+    /// Uploads a sealed file as `name` into the `hoprs` folder of the connected Drive.
+    // TODO(task 11): the export flow's effects call this; remove this allow then.
+    #[allow(dead_code)]
+    async fn drive_upload(&self, name: String, sealed: Sealed) -> Result<DriveFile>;
+    /// Writes a sealed file to `path` (atomically, `0o600` on Unix).
+    // TODO(task 11): the export flow's effects call this; remove this allow then.
+    #[allow(dead_code)]
+    async fn save_sealed(&self, path: PathBuf, sealed: Sealed) -> Result<()>;
 }
 
 /// The concurrent listings per side for a session's protocol: `(local, remote)`.
@@ -351,14 +391,9 @@ fn not_connected() -> Error {
 async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<T> {
-    tokio::task::spawn_blocking(work).await.map_err(|e| {
-        Error::coded(
-            hoprs_core::ErrorKind::Io,
-            "app-background-task-failed",
-            "Background task failed",
-        )
-        .with_detail(e.to_string())
-    })?
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(background_failed)?
 }
 
 /// The update client, built on first use (reading the system roots is not free).
@@ -374,6 +409,44 @@ fn update_client(cell: &OnceLock<Option<Arc<Client>>>) -> Result<Arc<Client>> {
                 "Update checks are off in development builds (set HOPRS_UPDATE_URL)",
             )
         })
+}
+
+fn background_failed(err: tokio::task::JoinError) -> Error {
+    Error::coded(
+        hoprs_core::ErrorKind::Io,
+        "app-background-task-failed",
+        "Background task failed",
+    )
+    .with_detail(err.to_string())
+}
+
+/// Runs `work` on the blocking pool, streaming what it sends; the stream ends when the
+/// worker does. A panicking worker ends it with `failed(app-background-task-failed)`.
+/// Starts on the stream's first poll, inside the runtime.
+fn blocking_stream<E: Send + 'static>(
+    work: impl FnOnce(&mut dyn FnMut(E)) + Send + 'static,
+    failed: impl FnOnce(Error) -> E + Send + 'static,
+) -> BoxStream<'static, E> {
+    use futures_util::StreamExt;
+    futures_util::stream::once(async move {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            work(&mut |event| {
+                let _ = tx.send(event);
+            });
+        });
+        futures_util::stream::unfold(Some((rx, worker, failed)), |state| async move {
+            let (mut rx, worker, failed) = state?;
+            if let Some(event) = rx.recv().await {
+                return Some((event, Some((rx, worker, failed))));
+            }
+            // The channel closed: after the last event, or because the worker panicked.
+            let err = worker.await.err()?;
+            Some((failed(background_failed(err)), None))
+        })
+    })
+    .flatten()
+    .boxed()
 }
 
 /// The asset names being downloaded (see [`BackendApi::download_update`]).
@@ -420,28 +493,13 @@ fn start_download(
             set: downloading,
             name,
         };
-        let (tx, rx) = mpsc::unbounded_channel();
-        let worker = tokio::task::spawn_blocking(move || {
-            let _guard = guard;
-            work(&mut |event| {
-                let _ = tx.send(event);
-            });
-        });
-        futures_util::stream::unfold(Some((rx, worker)), |state| async move {
-            let (mut rx, worker) = state?;
-            if let Some(event) = rx.recv().await {
-                return Some((event, Some((rx, worker))));
-            }
-            // The channel closed: after `Done`, or because the worker panicked.
-            let err = worker.await.err()?;
-            let err = Error::coded(
-                hoprs_core::ErrorKind::Io,
-                "app-background-task-failed",
-                "Background task failed",
-            )
-            .with_detail(err.to_string());
-            Some((DownloadEvent::Done(Err(err)), None))
-        })
+        blocking_stream(
+            move |send| {
+                let _guard = guard;
+                work(send);
+            },
+            |err| DownloadEvent::Done(Err(err)),
+        )
         .right_stream()
     })
     .flatten()
@@ -498,6 +556,8 @@ pub struct Backend {
     broker: PromptBroker,
     update: UpdateClient,
     downloading: Downloading,
+    /// The Google Drive connection (its keyring entry in the app secret store).
+    drive: Arc<Drive>,
 }
 
 impl Backend {
@@ -549,7 +609,15 @@ impl Backend {
             broker,
             update: UpdateClient::default(),
             downloading: Downloading::default(),
+            drive: Arc::new(Drive::new(Arc::new(MemoryStore::new()))),
         })
+    }
+
+    /// Where the app's own secrets (the Google Drive connection) are kept; by default in
+    /// memory only. Makes no call to `store`.
+    pub fn with_app_secrets(mut self, store: Arc<dyn AppSecretStore>) -> Backend {
+        self.drive = Arc::new(Drive::new(store));
+        self
     }
 }
 
@@ -999,6 +1067,50 @@ impl BackendApi for Backend {
                 Err(err) => send(DownloadEvent::Done(Err(err))),
             }
         })
+    }
+
+    async fn drive_status(&self) -> Result<Option<DriveAccount>> {
+        let drive = self.drive.clone();
+        blocking(move || drive.status()).await
+    }
+
+    fn drive_connect(&self, pages: Pages) -> BoxStream<'static, ConnectEvent> {
+        let drive = self.drive.clone();
+        blocking_stream(
+            move |send| drive.connect(&pages, send),
+            |err| ConnectEvent::Done(Err(err)),
+        )
+    }
+
+    fn drive_cancel(&self) {
+        self.drive.cancel();
+    }
+
+    async fn drive_disconnect(&self) -> Result<()> {
+        let drive = self.drive.clone();
+        blocking(move || drive.disconnect()).await
+    }
+
+    async fn seal_export(
+        &self,
+        scope: ExportScope,
+        password: SecretString,
+    ) -> Result<(ExportReport, Sealed)> {
+        let params = self.backup_params;
+        let (report, bytes) = self
+            .vault
+            .call(move |vault| vault.export_bytes(&scope, &password, params))
+            .await?;
+        Ok((report, Sealed::new(bytes)))
+    }
+
+    async fn drive_upload(&self, name: String, sealed: Sealed) -> Result<DriveFile> {
+        let drive = self.drive.clone();
+        blocking(move || drive.upload(&name, sealed.bytes())).await
+    }
+
+    async fn save_sealed(&self, path: PathBuf, sealed: Sealed) -> Result<()> {
+        blocking(move || hoprs_vault::write_atomic(&path, sealed.bytes())).await
     }
 }
 
@@ -1680,6 +1792,106 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, Some("backup-partial-no-replace"));
         assert_eq!(other.sites().await.unwrap().len(), 1);
+    }
+
+    /// A site sealed in memory, then saved: the file restores with Merge elsewhere, and
+    /// its header says partial (version 2).
+    #[tokio::test]
+    async fn seal_then_save_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = open(dir.path());
+        let a = Site::new("a", "ha", "u", Protocol::Ssh);
+        backend.save_site(a.clone()).await.unwrap();
+        backend
+            .save_site(Site::new("b", "hb", "u", Protocol::Ftp))
+            .await
+            .unwrap();
+        let (report, sealed) = backend
+            .seal_export(ExportScope::Site(a.id.clone()), SecretString::from("pw"))
+            .await
+            .unwrap();
+        assert_eq!((report.sites, report.workspaces), (1, 0));
+        let path = dir.path().join("out").join("a.hoprs");
+        backend
+            .save_sealed(path.clone(), sealed.clone())
+            .await
+            .unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes, sealed.bytes());
+        assert_eq!(&bytes[..8], b"HOPRSVLT");
+        assert_eq!(&bytes[8..10], &2u16.to_be_bytes(), "version 2: partial");
+        assert_eq!(
+            format!("{sealed:?}"),
+            format!("Sealed({} bytes)", bytes.len())
+        );
+
+        let other_dir = tempfile::tempdir().unwrap();
+        let other = open(other_dir.path());
+        let restored = other
+            .restore_backup(path, SecretString::from("pw"), ImportMode::Merge)
+            .await
+            .unwrap();
+        assert_eq!(restored.added_sites, 1);
+        assert_eq!(other.sites().await.unwrap()[0].id, a.id);
+        // An empty password seals nothing.
+        let err = backend
+            .seal_export(ExportScope::All, SecretString::from(""))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, Some("backup-password-empty"));
+    }
+
+    /// A connect worker that panics still ends its stream with one `Done`.
+    #[tokio::test]
+    async fn a_panicking_connect_worker_ends_with_done() {
+        use futures_util::StreamExt;
+        let events: Vec<ConnectEvent> = blocking_stream(
+            |send: &mut dyn FnMut(ConnectEvent)| {
+                send(ConnectEvent::Waiting { url: "u".into() });
+                panic!("the worker fell over");
+            },
+            |err| ConnectEvent::Done(Err(err)),
+        )
+        .collect()
+        .await;
+        assert!(
+            matches!(
+                events.as_slice(),
+                [ConnectEvent::Waiting { .. }, ConnectEvent::Done(Err(err))]
+                    if err.code == Some("app-background-task-failed")
+            ),
+            "{events:?}"
+        );
+    }
+
+    /// Without an OAuth client in the build, the Drive calls answer at once, without a
+    /// keyring call (a debug build may have one in its environment: then nothing to check).
+    #[tokio::test]
+    async fn drive_calls_without_a_client() {
+        use futures_util::StreamExt;
+        if crate::drive::client_configured() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let backend = open(dir.path());
+        let code = Some("drive-not-configured");
+        assert_eq!(backend.drive_status().await.unwrap_err().code, code);
+        assert_eq!(backend.drive_disconnect().await.unwrap_err().code, code);
+        let pages = crate::drive::Pages {
+            connected: "c".into(),
+            failed: "f".into(),
+        };
+        let events: Vec<_> = backend.drive_connect(pages).collect().await;
+        assert!(
+            matches!(events.as_slice(), [crate::drive::ConnectEvent::Done(Err(err))] if err.code == code),
+            "{events:?}"
+        );
+        let err = backend
+            .drive_upload("n".into(), crate::drive::Sealed::new(vec![1]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, code);
+        backend.drive_cancel();
     }
 
     /// Export, then restore (merge and replace), through the vault on the blocking pool.

@@ -857,6 +857,7 @@ error-drive-connect-denied = O acesso ao Google Drive não foi concedido
 error-drive-connect-failed = Não foi possível conectar ao Google Drive
 error-drive-not-connected = Não conectado ao Google Drive
 error-drive-upload-failed = Não foi possível enviar para o Google Drive
+error-drive-not-configured = O Google Drive não está disponível neste build
 
 # The folder compare panel (between the panes and the queue).
 compare-button = Comparar

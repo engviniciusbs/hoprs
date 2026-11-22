@@ -43,29 +43,21 @@ pub fn random<const N: usize>() -> Result<[u8; N], Error> {
 }
 
 /// The PKCE code verifier: base64url without padding (43 characters for 32 bytes).
-// TODO(task 9 or 10): the connect flow; remove this allow then.
-#[allow(dead_code)]
 pub fn verifier(random: [u8; 32]) -> String {
     URL_SAFE_NO_PAD.encode(random)
 }
 
 /// The PKCE code challenge (S256): base64url without padding of the verifier's SHA-256.
-// TODO(task 9 or 10): the connect flow; remove this allow then.
-#[allow(dead_code)]
 pub fn challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
 /// The `state` value that ties the callback to this attempt.
-// TODO(task 9 or 10): the connect flow; remove this allow then.
-#[allow(dead_code)]
 pub fn state_token(random: [u8; 16]) -> String {
     URL_SAFE_NO_PAD.encode(random)
 }
 
 /// The URL the browser is opened at.
-// TODO(task 9 or 10): the connect flow; remove this allow then.
-#[allow(dead_code)]
 pub fn auth_url(
     endpoints: &Endpoints,
     client_id: &str,
@@ -97,8 +89,6 @@ pub fn auth_url(
 
 /// What a request to the loopback listener means.
 #[derive(PartialEq, Eq)]
-// TODO(task 9 or 10): the connect flow; remove this allow then.
-#[allow(dead_code)]
 pub enum Callback {
     /// Google sent the authorisation code.
     Code(String),
@@ -130,8 +120,6 @@ fn same(a: &str, b: &str) -> bool {
 
 /// Reads the request `head` (the request up to the blank line). Only `GET /?...` with a
 /// `state` equal to `state` is a `Code` (non-empty, percent-decoded) or a `Denied`.
-// TODO(task 9 or 10): the listener's `wait`, itself unused until then; remove this allow then.
-#[allow(dead_code)]
 pub fn parse_callback(head: &[u8], state: &str) -> Callback {
     let line = head.split(|&b| b == b'\n').next().unwrap_or_default();
     let line = line.strip_suffix(b"\r").unwrap_or(line);

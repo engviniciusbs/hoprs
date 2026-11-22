@@ -33,8 +33,6 @@ impl fmt::Debug for OAuthClient {
 }
 
 /// The client of this build, or `None` when the build has none (Drive is then hidden).
-// TODO(task 9 or 10): the connect flow calls this; remove this allow then.
-#[allow(dead_code)]
 pub fn client() -> Option<OAuthClient> {
     choose(
         (
@@ -110,8 +108,6 @@ pub fn under(base: &str) -> Option<Endpoints> {
 }
 
 /// The endpoints in use: Google's, or in a debug build those under `HOPRS_DRIVE_URL`.
-// TODO(task 9 or 10): the OAuth and upload calls use this; remove this allow then.
-#[allow(dead_code)]
 pub fn current() -> Endpoints {
     if cfg!(debug_assertions)
         && let Ok(base) = std::env::var(BASE_URL_ENV)

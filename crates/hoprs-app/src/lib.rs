@@ -178,7 +178,8 @@ fn open_backend() -> hoprs_core::Result<Backend> {
             "No configuration directory",
         )
     })?;
-    Backend::open(config, Arc::new(LazyKeyringStore::new()))
+    let keyring = Arc::new(LazyKeyringStore::new());
+    Ok(Backend::open(config, keyring.clone())?.with_app_secrets(keyring))
 }
 
 /// Thin wrapper: the pure update decides, `effects::run` performs.

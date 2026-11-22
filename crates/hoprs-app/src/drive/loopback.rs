@@ -15,8 +15,6 @@ use secrecy::SecretString;
 use super::oauth::{Callback, connect_failed, parse_callback};
 
 /// How long the browser has to come back.
-// TODO(task 9 or 10): the connect flow passes this to `wait`; remove this allow then.
-#[allow(dead_code)]
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 const POLL: Duration = Duration::from_millis(50);
@@ -39,16 +37,12 @@ fn retryable(kind: IoKind) -> bool {
 }
 
 /// The texts of the two pages the browser sees (plain text; the module wraps them).
-// TODO(task 9 or 10): the connect flow builds these from the catalog; remove this allow then.
-#[allow(dead_code)]
 pub struct Pages {
     pub connected: String,
     pub failed: String,
 }
 
 /// A listener on a free port of `127.0.0.1`.
-// TODO(task 9 or 10): the connect flow; remove this allow then.
-#[allow(dead_code)]
 pub struct Listener {
     inner: TcpListener,
 }
@@ -115,7 +109,6 @@ fn read_head(stream: &mut TcpStream) -> Option<Vec<u8>> {
     }
 }
 
-#[allow(dead_code)] // TODO(task 9 or 10): reached from `wait` once the connect flow calls it.
 fn handle(
     mut stream: TcpStream,
     state: &str,
@@ -149,8 +142,6 @@ fn handle(
     }
 }
 
-// TODO(task 9 or 10): the connect flow; remove this allow then.
-#[allow(dead_code)]
 impl Listener {
     /// Binds `127.0.0.1` on a free port (never another address).
     pub fn bind() -> Result<Listener, Error> {

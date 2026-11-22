@@ -813,6 +813,7 @@ error-drive-connect-denied = Google Drive erişimi verilmedi
 error-drive-connect-failed = Google Drive'a bağlanılamadı
 error-drive-not-connected = Google Drive'a bağlı değil
 error-drive-upload-failed = Google Drive'a yüklenemedi
+error-drive-not-configured = Google Drive bu derlemede kullanılamıyor
 
 # Klasör karşılaştırma paneli (paneller ile kuyruk arasında).
 compare-button = Karşılaştır

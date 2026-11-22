@@ -59,7 +59,7 @@ fn upload_failed(detail: impl Into<String>) -> Error {
     .with_detail(detail)
 }
 
-fn not_connected() -> Error {
+pub(super) fn not_connected() -> Error {
     Error::coded(
         ErrorKind::Auth,
         "drive-not-connected",
@@ -70,10 +70,16 @@ fn not_connected() -> Error {
 /// What a failed call says, never a body or a URL.
 const UNEXPECTED: &str = "unexpected answer";
 const REDIRECT: &str = "redirect refused";
+/// The detail of a Drive call that Google refused with 401 (the access token is no good).
+const UNAUTHORIZED: &str = "HTTP 401";
+
+/// The Drive call failed because Google refused the access token (401): a refresh may
+/// help.
+pub fn unauthorized(err: &Error) -> bool {
+    err.code == Some("drive-upload-failed") && err.detail.as_deref() == Some(UNAUTHORIZED)
+}
 
 /// The tokens of a sign-in or a refresh.
-// TODO(task 10): the connect and export flows read these fields; remove this allow then.
-#[allow(dead_code)]
 pub struct Tokens {
     pub access: SecretString,
     /// Seconds the access token lives.
@@ -93,8 +99,6 @@ impl fmt::Debug for Tokens {
 
 /// The Google Drive client (see the module docs).
 #[derive(Clone)]
-// TODO(task 10): the connect and export flows use the client; remove this allow then.
-#[allow(dead_code)]
 pub struct Client {
     agent: Agent,
     endpoints: Endpoints,
@@ -135,6 +139,15 @@ impl Reply {
             && code.len() <= 40
             && code.bytes().all(|b| b.is_ascii_lowercase() || b == b'_');
         word.then_some(code)
+    }
+
+    /// A failed Drive API call: [`UNAUTHORIZED`] for a 401, else [`Reply::failure`].
+    fn drive_failure(&self) -> String {
+        if self.status == 401 {
+            UNAUTHORIZED.to_owned()
+        } else {
+            self.failure()
+        }
     }
 
     /// `Google's error code`, else `HTTP <status>`.
@@ -227,8 +240,6 @@ fn safe_link(link: Option<&str>) -> Option<String> {
 
 impl Client {
     /// A client that trusts `roots` only, through the system proxy if one is set.
-    // TODO(task 10): the flows build the client; remove this allow then.
-    #[allow(dead_code)]
     pub fn new(
         endpoints: Endpoints,
         oauth: OAuthClient,
@@ -237,7 +248,9 @@ impl Client {
         Client::with_proxy(endpoints, oauth, roots, Proxy::try_from_env())
     }
 
-    fn with_proxy(
+    /// [`Client::new`] with an explicit proxy (`None`: none, whatever the environment
+    /// says); the tests use it.
+    pub(super) fn with_proxy(
         endpoints: Endpoints,
         oauth: OAuthClient,
         roots: Vec<CertificateDer<'static>>,
@@ -275,10 +288,20 @@ impl Client {
     }
 
     /// A client that trusts the system's roots.
-    // TODO(task 10): the flows build the client; remove this allow then.
-    #[allow(dead_code)]
     pub fn system(endpoints: Endpoints, oauth: OAuthClient) -> Client {
         Client::new(endpoints, oauth, crate::update::http::system_roots())
+    }
+
+    /// The URL the browser is opened at, for this client and the listener at
+    /// `redirect_uri`.
+    pub fn auth_url(&self, redirect_uri: &str, challenge: &str, state: &str) -> String {
+        super::oauth::auth_url(
+            &self.endpoints,
+            &self.oauth.id,
+            redirect_uri,
+            challenge,
+            state,
+        )
     }
 
     fn base(&self, endpoint: Endpoint) -> &str {
@@ -386,8 +409,6 @@ impl Client {
     }
 
     /// Trades the authorisation `code` (with its PKCE `verifier`) for tokens.
-    // TODO(task 10): the connect flow; remove this allow then.
-    #[allow(dead_code)]
     pub fn exchange(
         &self,
         code: &str,
@@ -415,8 +436,6 @@ impl Client {
 
     /// A new access token from the refresh token. Google saying the grant is gone
     /// (revoked, expired) is [`not_connected`]; any other failure is a connect failure.
-    // TODO(task 10): the export flow; remove this allow then.
-    #[allow(dead_code)]
     pub fn refresh(&self, refresh: &SecretString) -> Result<Tokens, Error> {
         let reply = self
             .post_form(
@@ -441,8 +460,6 @@ impl Client {
     }
 
     /// Revokes the refresh token at Google.
-    // TODO(task 10): the disconnect flow; remove this allow then.
-    #[allow(dead_code)]
     pub fn revoke(&self, refresh: &SecretString) -> Result<(), Error> {
         let reply = self
             .post_form(Endpoint::Revoke, &[("token", refresh.expose_secret())])
@@ -455,8 +472,6 @@ impl Client {
     }
 
     /// The signed-in account's e-mail address; any failure means "no email".
-    // TODO(task 10): the connect flow; remove this allow then.
-    #[allow(dead_code)]
     pub fn email(&self, access: &SecretString) -> Option<String> {
         let reply = self
             .send(
@@ -479,8 +494,6 @@ impl Client {
     }
 
     /// The id of the `hoprs` folder, created when there is none.
-    // TODO(task 10): the export flow; remove this allow then.
-    #[allow(dead_code)]
     pub fn folder(&self, access: &SecretString) -> Result<String, Error> {
         self.folder_id(access).map_err(upload_failed)
     }
@@ -490,7 +503,7 @@ impl Client {
         let suffix = format!("/files?q={}&fields=files(id)&pageSize=1", encode(&q));
         let reply = self.send(Endpoint::Api, &suffix, Some(access), "", None, TIMEOUT)?;
         if !reply.ok() {
-            return Err(reply.failure());
+            return Err(reply.drive_failure());
         }
         let object = reply.object().ok_or(UNEXPECTED)?;
         let files = object
@@ -515,7 +528,7 @@ impl Client {
             TIMEOUT,
         )?;
         if !reply.ok() {
-            return Err(reply.failure());
+            return Err(reply.drive_failure());
         }
         let id = reply
             .object()
@@ -526,8 +539,6 @@ impl Client {
     }
 
     /// Uploads `bytes` as `name` into `folder` (multipart, at most 5 MB).
-    // TODO(task 10): the export flow; remove this allow then.
-    #[allow(dead_code)]
     pub fn upload(
         &self,
         access: &SecretString,
@@ -559,7 +570,7 @@ impl Client {
             UPLOAD_TIMEOUT,
         )?;
         if !reply.ok() {
-            return Err(reply.failure());
+            return Err(reply.drive_failure());
         }
         let object = reply.object().ok_or(UNEXPECTED)?;
         object
