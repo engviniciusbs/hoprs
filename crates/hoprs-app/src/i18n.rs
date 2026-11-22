@@ -1,6 +1,6 @@
 //! The app's text catalogs (Fluent) and the process-wide active language.
 //!
-//! `en.ftl` is the reference; `pt-BR.ftl` translates it. A lookup tries the active
+//! `en.ftl` is the reference; `pt-BR.ftl` and `tr.ftl` translate it. A lookup tries the active
 //! language, then English, then returns the key itself, and never panics: a missing key
 //! or a formatting error is logged once per key.
 
@@ -16,22 +16,25 @@ use crate::settings::LanguageChoice;
 
 const EN_SRC: &str = include_str!("../i18n/en.ftl");
 const PT_BR_SRC: &str = include_str!("../i18n/pt-BR.ftl");
+const TR_SRC: &str = include_str!("../i18n/tr.ftl");
 
 /// A language the interface is available in.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Language {
     En,
     PtBr,
+    Tr,
 }
 
 impl Language {
-    pub const ALL: [Language; 2] = [Language::En, Language::PtBr];
+    pub const ALL: [Language; 3] = [Language::En, Language::PtBr, Language::Tr];
 
     /// The BCP 47 tag: also the settings value and the catalog's file name.
     pub fn tag(self) -> &'static str {
         match self {
             Language::En => "en",
             Language::PtBr => "pt-BR",
+            Language::Tr => "tr",
         }
     }
 
@@ -39,6 +42,7 @@ impl Language {
         match self {
             Language::En => None,
             Language::PtBr => Some(PT_BR_SRC),
+            Language::Tr => Some(TR_SRC),
         }
     }
 }
@@ -97,11 +101,11 @@ impl From<f64> for Arg<'_> {
     }
 }
 
-/// `1000` as `1,000` (English) or `1.000` (Brazilian Portuguese).
+/// `1000` as `1,000` (English) or `1.000` (Brazilian Portuguese, Turkish).
 pub fn group_digits(lang: Language, n: u64) -> String {
     let sep = match lang {
         Language::En => ',',
-        Language::PtBr => '.',
+        Language::PtBr | Language::Tr => '.',
     };
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
@@ -131,7 +135,7 @@ fn format_number(lang: Language, value: f64) -> String {
         if !frac.is_empty() {
             out.push(match lang {
                 Language::En => '.',
-                Language::PtBr => ',',
+                Language::PtBr | Language::Tr => ',',
             });
             out.push_str(frac);
         }
@@ -152,6 +156,9 @@ fn en_formatter<M>(value: &FluentValue, memoizer: &M) -> Option<String> {
 fn pt_br_formatter<M>(value: &FluentValue, memoizer: &M) -> Option<String> {
     number_formatter(Language::PtBr, value, memoizer)
 }
+fn tr_formatter<M>(value: &FluentValue, memoizer: &M) -> Option<String> {
+    number_formatter(Language::Tr, value, memoizer)
+}
 
 type Bundle = FluentBundle<FluentResource>;
 
@@ -162,6 +169,7 @@ fn bundle(lang: Language, source: &str) -> Bundle {
     match lang {
         Language::En => bundle.set_formatter(Some(en_formatter)),
         Language::PtBr => bundle.set_formatter(Some(pt_br_formatter)),
+        Language::Tr => bundle.set_formatter(Some(tr_formatter)),
     }
     match FluentResource::try_new(source.to_owned()) {
         Ok(resource) => {
@@ -377,9 +385,11 @@ impl Catalog {
 pub(crate) fn catalog_for(lang: Language) -> &'static Catalog {
     static EN: OnceLock<Catalog> = OnceLock::new();
     static PT_BR: OnceLock<Catalog> = OnceLock::new();
+    static TR: OnceLock<Catalog> = OnceLock::new();
     match lang {
         Language::En => EN.get_or_init(|| Catalog::new(Language::En)),
         Language::PtBr => PT_BR.get_or_init(|| Catalog::new(Language::PtBr)),
+        Language::Tr => TR.get_or_init(|| Catalog::new(Language::Tr)),
     }
 }
 
@@ -399,6 +409,7 @@ mod active {
     pub fn get() -> Language {
         match ACTIVE.load(Ordering::Relaxed) {
             1 => Language::PtBr,
+            2 => Language::Tr,
             _ => Language::En,
         }
     }
@@ -421,14 +432,17 @@ mod active {
     }
 }
 
-/// The language an OS locale (`pt_BR.UTF-8`, `pt-BR`, `C`, …) asks for: Brazilian
-/// Portuguese when the language subtag is `pt` (any case, any region or suffix), English
-/// otherwise, also for no locale, an empty one, `C` and `POSIX`.
+/// The language an OS locale (`pt_BR.UTF-8`, `tr-TR`, `C`, …) asks for: Brazilian
+/// Portuguese when the language subtag is `pt`, Turkish when it is `tr` (any case, any
+/// region or suffix), English otherwise, also for no locale, an empty one, `C` and
+/// `POSIX`.
 pub fn language_from_locale(locale: Option<&str>) -> Language {
     let tag = locale.unwrap_or("");
     let subtag = tag.split(['_', '-', '.', '@']).next().unwrap_or("");
     if subtag.eq_ignore_ascii_case("pt") {
         Language::PtBr
+    } else if subtag.eq_ignore_ascii_case("tr") {
+        Language::Tr
     } else {
         Language::En
     }
@@ -487,9 +501,11 @@ mod tests {
         "app-title",
         "language-english",
         "language-pt-br",
+        "language-tr",
         // Product names, symbols and shortcut labels.
         "brand",
         "compare-ellipsis",
+        "export-destination-drive",
         "go-to-anything-key",
         "key-settings",
         "key-settings-macos",
@@ -542,9 +558,11 @@ mod tests {
         "decrease",
         "increase",
         "backup",
-        "backup-file-name",
         "editor-command",
     ];
+
+    /// Words that read the same in Turkish as in English.
+    const SAME_IN_TR: &[&str] = &["field-port", "month-3", "month-5"];
 
     fn parse(source: &str) -> ast::Resource<&str> {
         ast::Resource::default_from(source)
@@ -567,8 +585,8 @@ mod tests {
     }
 
     #[test]
-    fn en_and_pt_br_parse_without_errors() {
-        for (name, source) in [("en", EN_SRC), ("pt-BR", PT_BR_SRC)] {
+    fn catalogs_parse_without_errors() {
+        for (name, source) in [("en", EN_SRC), ("pt-BR", PT_BR_SRC), ("tr", TR_SRC)] {
             let resource = match FluentResource::try_new(source.to_owned()) {
                 Ok(resource) => resource,
                 Err((_, errors)) => panic!("{name}.ftl: {errors:?}"),
@@ -585,6 +603,7 @@ mod tests {
     #[test]
     fn same_keys_and_variables_in_both_languages() {
         assert_eq!(variables(EN_SRC), variables(PT_BR_SRC));
+        assert_eq!(variables(EN_SRC), variables(TR_SRC));
         assert!(variables(EN_SRC).contains_key("site-count"));
         assert_eq!(variables(EN_SRC)["site-count"], ["count"]);
     }
@@ -596,6 +615,18 @@ mod tests {
         for (id, plain) in message_ids(EN_SRC) {
             if plain && !SAME_IN_BOTH.contains(&id.as_str()) {
                 assert_ne!(en.tr(&id), pt.tr(&id), "{id} is not translated");
+            }
+        }
+    }
+
+    #[test]
+    fn tr_values_differ_from_english() {
+        let en = Catalog::new(Language::En);
+        let tr = Catalog::new(Language::Tr);
+        for (id, plain) in message_ids(EN_SRC) {
+            let same = SAME_IN_BOTH.contains(&id.as_str()) || SAME_IN_TR.contains(&id.as_str());
+            if plain && !same {
+                assert_ne!(en.tr(&id), tr.tr(&id), "{id} is not translated to Turkish");
             }
         }
     }
@@ -640,6 +671,12 @@ mod tests {
                 .tr_args("site-count", &args)
                 .contains("1,000")
         );
+        assert!(
+            Catalog::new(Language::Tr)
+                .tr_args("site-count", &args)
+                .contains("1.000")
+        );
+        assert_eq!(format_number(Language::Tr, 4.1), "4,1");
         assert_eq!(group_digits(Language::En, 999), "999");
         assert_eq!(group_digits(Language::En, 1_234_567), "1,234,567");
         assert_eq!(format_number(Language::PtBr, 4.1), "4,1");
@@ -657,6 +694,10 @@ mod tests {
         assert_eq!(count(&pt, 0), "0 sites");
         assert_eq!(count(&pt, 1), "1 site");
         assert_eq!(count(&pt, 2), "2 sites");
+        let tr = Catalog::new(Language::Tr);
+        assert_eq!(count(&tr, 0), "0 site");
+        assert_eq!(count(&tr, 1), "1 site");
+        assert_eq!(count(&tr, 1000), "1.000 site");
     }
 
     #[test]
@@ -666,6 +707,9 @@ mod tests {
         assert_eq!(tr("already-running"), "O hoprs já está em execução");
         set_language(Language::En);
         assert_eq!(tr("already-running"), "hoprs is already running");
+        set_language(Language::Tr);
+        assert_eq!(tr("already-running"), "hoprs zaten çalışıyor");
+        set_language(Language::En);
     }
 
     #[test]
@@ -751,6 +795,10 @@ mod tests {
         ] {
             assert_eq!(language_from_locale(Some(other)), Language::En, "{other}");
         }
+        for tr in ["tr_TR.UTF-8", "tr-TR", "tr", "TR", "tr_TR.UTF-8@euro"] {
+            assert_eq!(language_from_locale(Some(tr)), Language::Tr, "{tr}");
+        }
+        assert_eq!(language_from_locale(Some("trx")), Language::En);
         assert_eq!(language_from_locale(None), Language::En);
     }
 
@@ -761,6 +809,7 @@ mod tests {
             resolve(LanguageChoice::Fixed(Language::PtBr)),
             Language::PtBr
         );
+        assert_eq!(resolve(LanguageChoice::Fixed(Language::Tr)), Language::Tr);
         assert_eq!(resolve(LanguageChoice::Fixed(Language::En)), Language::En);
     }
 
@@ -988,6 +1037,7 @@ mod tests {
         );
         let en = variables(EN_SRC);
         let pt = variables(PT_BR_SRC);
+        let tr = variables(TR_SRC);
         let mut texts: std::collections::BTreeMap<String, (String, Vec<String>)> =
             std::collections::BTreeMap::new();
         for site in &sites {
@@ -1002,6 +1052,8 @@ mod tests {
                 "{at}: arguments passed vs. variables of en.ftl"
             );
             assert_eq!(&pt[&key], en_vars, "{at}: pt-BR variables");
+            assert!(tr.contains_key(&key), "{key} is not in tr.ftl: {at}");
+            assert_eq!(&tr[&key], en_vars, "{at}: tr variables");
             // The English the call writes: a literal or a `format!` template.
             let template = if let Some(literal) = string_literal(&site.message) {
                 Some(literal)

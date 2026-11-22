@@ -416,6 +416,7 @@ impl App {
                 answer: PromptAnswer::Cancel,
             }]),
             Message::Edit(msg) if msg.is_user() => Some(Vec::new()),
+            Message::Export(msg) if msg.is_user() => Some(Vec::new()),
             // Nothing new starts, an automatic check included.
             Message::Update(msg)
                 if msg.is_user() || matches!(msg, super::UpdateMsg::CheckDue(_)) =>

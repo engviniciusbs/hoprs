@@ -1468,6 +1468,9 @@ pub fn language_english() -> &'static str {
 pub fn language_pt_br() -> &'static str {
     tr("language-pt-br")
 }
+pub fn language_tr() -> &'static str {
+    tr("language-tr")
+}
 pub fn theme_hoprs_dark() -> &'static str {
     tr("theme-hoprs-dark")
 }
@@ -1522,6 +1525,69 @@ pub fn backup_password_required() -> &'static str {
 }
 pub fn backup_passwords_differ() -> &'static str {
     tr("backup-passwords-differ")
+}
+pub fn drive_name_required() -> &'static str {
+    tr("drive-name-required")
+}
+pub fn drive_page_connected() -> &'static str {
+    tr("drive-page-connected")
+}
+pub fn drive_page_failed() -> &'static str {
+    tr("drive-page-failed")
+}
+pub fn export_destination() -> &'static str {
+    tr("export-destination")
+}
+pub fn export_destination_file() -> &'static str {
+    tr("export-destination-file")
+}
+pub fn export_destination_drive() -> &'static str {
+    tr("export-destination-drive")
+}
+pub fn drive_connect() -> &'static str {
+    tr("drive-connect")
+}
+pub fn drive_account() -> &'static str {
+    tr("drive-account")
+}
+pub fn drive_connected() -> &'static str {
+    tr("drive-connected")
+}
+pub fn drive_disconnect() -> &'static str {
+    tr("drive-disconnect")
+}
+pub fn drive_file_name() -> &'static str {
+    tr("drive-file-name")
+}
+pub fn drive_waiting() -> &'static str {
+    tr("drive-waiting")
+}
+pub fn drive_copy_link() -> &'static str {
+    tr("drive-copy-link")
+}
+pub fn drive_browser_hint() -> &'static str {
+    tr("drive-browser-hint")
+}
+pub fn drive_session_only() -> &'static str {
+    tr("drive-session-only")
+}
+pub fn drive_uploading() -> &'static str {
+    tr("drive-uploading")
+}
+pub fn drive_uploaded(path: &str) -> String {
+    tr_args("drive-uploaded", &[("path", path.into())])
+}
+pub fn drive_open() -> &'static str {
+    tr("drive-open")
+}
+pub fn drive_save_local() -> &'static str {
+    tr("drive-save-local")
+}
+pub fn drive_saved_local(path: &str) -> String {
+    tr_args("drive-saved-local", &[("path", path.into())])
+}
+pub fn drive_settings_line() -> &'static str {
+    tr("drive-settings-line")
 }
 pub fn export() -> &'static str {
     tr("export")
@@ -1580,9 +1646,6 @@ pub fn backup_skipped_sites() -> &'static str {
 pub fn backup_skipped_workspaces() -> &'static str {
     tr("backup-skipped-workspaces")
 }
-pub fn backup_file_name() -> &'static str {
-    tr("backup-file-name")
-}
 pub fn pick_export() -> &'static str {
     tr("pick-export")
 }
@@ -1599,6 +1662,43 @@ pub fn export_done(sites: usize, workspaces: usize, secrets: usize) -> String {
             ("secrets", password_count(secrets).as_str().into()),
         ],
     )
+}
+
+/// `Export "Cliente Acme" (site)`.
+pub fn export_title_site(name: &str) -> String {
+    tr_args("export-title-site", &[("name", name.into())])
+}
+/// `Export "Cliente Acme" (workspace, 4 sites)`.
+pub fn export_title_workspace(name: &str, sites: usize) -> String {
+    tr_args(
+        "export-title-workspace",
+        &[
+            ("name", name.into()),
+            ("sites", site_count(sites).as_str().into()),
+        ],
+    )
+}
+pub fn export_ellipsis() -> &'static str {
+    tr("export-ellipsis")
+}
+pub fn export_everything() -> &'static str {
+    tr("export-everything")
+}
+/// `Export everything (12 sites, 3 workspaces)`.
+pub fn export_title_all(sites: usize, workspaces: usize) -> String {
+    tr_args(
+        "export-title-all",
+        &[
+            ("sites", site_count(sites).as_str().into()),
+            ("workspaces", workspace_count(workspaces).as_str().into()),
+        ],
+    )
+}
+pub fn export_password_hint() -> &'static str {
+    tr("export-password-hint")
+}
+pub fn export_partial_note() -> &'static str {
+    tr("export-partial-note")
 }
 
 /// A number of workspaces: "1 workspace", "3 workspaces".

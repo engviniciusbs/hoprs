@@ -42,7 +42,7 @@ pub fn size_in(lang: Language, bytes: u64) -> String {
         let number = format!("{shown:.1}");
         let number = match lang {
             Language::En => number,
-            Language::PtBr => number.replace('.', ","),
+            Language::PtBr | Language::Tr => number.replace('.', ","),
         };
         format!("{number} {}", unit_name(unit))
     } else {

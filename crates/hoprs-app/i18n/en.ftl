@@ -12,7 +12,7 @@
 #              *[other] { $count } sites
 #           }
 #   Keep technical names (SSH, SFTP, FTP, FTPS) as they are.
-# pt-BR.ftl must define the same keys with the same variables.
+# pt-BR.ftl and tr.ftl must define the same keys with the same variables.
 
 app-title = hoprs
 already-running = hoprs is already running
@@ -31,6 +31,7 @@ settings-language = Language
 language-system = System
 language-english = English
 language-pt-br = Português (Brasil)
+language-tr = Türkçe
 
 ## Top bar
 
@@ -621,11 +622,41 @@ backup-missing-secrets = Saved without their password (not in the keyring)
 backup-skipped-unreadable = Not exported (unreadable entries)
 backup-skipped-sites = Sites already here (kept)
 backup-skipped-workspaces = Workspaces already here (kept)
-backup-file-name = hoprs-backup.hoprs
+export-ellipsis = Export…
+export-everything = Export everything…
+export-title-site = Export "{ $name }" (site)
+# { $sites }: "4 sites".
+export-title-workspace = Export "{ $name }" (workspace, { $sites })
+# { $sites }, { $workspaces }: "12 sites", "3 workspaces".
+export-title-all = Export everything ({ $sites }, { $workspaces })
+export-password-hint = Keep this password: without it the file can't be opened.
+export-partial-note = This file will hold only part of your sites. Restore it with Merge; hoprs 1.5.0 and older cannot open it.
 pick-export = Save the hoprs backup
 pick-restore = Choose a hoprs backup
 # "Exported 12 sites, 3 workspaces and 9 passwords."
 export-done = Exported { $sites }, { $workspaces } and { $secrets }.
+drive-name-required = Enter a name for the file
+# The pages the browser shows after connecting to Google Drive.
+drive-page-connected = hoprs is connected. You can close this tab.
+drive-page-failed = hoprs could not connect. Go back to hoprs and try again.
+export-destination = Destination
+export-destination-file = A file on this computer
+export-destination-drive = Google Drive
+drive-connect = Connect to Google Drive…
+drive-account = Account
+drive-connected = Connected
+drive-disconnect = Disconnect
+drive-file-name = Name
+drive-waiting = Waiting for the browser…
+drive-copy-link = Copy the link
+drive-browser-hint = If the browser did not open, copy the link and open it yourself.
+drive-session-only = The system keyring is unavailable: this connection lasts until hoprs closes.
+drive-uploading = Uploading to Google Drive…
+drive-uploaded = Uploaded to Google Drive: { $path }
+drive-open = Open in Drive
+drive-save-local = Save to this computer…
+drive-saved-local = Saved to { $path }
+drive-settings-line = Google Drive: connected
 workspace-count =
     { $count ->
     [one] { $count } workspace
@@ -813,6 +844,7 @@ error-backup-cannot-build = Cannot build the backup
 error-backup-invalid-content = Invalid backup content
 error-backup-password-empty = Backup password is empty
 error-backup-cannot-read-secret = Cannot read a secret for the backup
+error-backup-partial-no-replace = This file holds only part of a backup. Restore it with Merge.
 error-vault-keyring-error = System keyring error
 error-vault-keyring-unavailable = System keyring unavailable
 error-vault-unknown-site = Unknown site
@@ -884,6 +916,13 @@ error-edit-unmatched-quote = The editor command has an unmatched quote
 error-edit-no-editor = No editor command is set
 error-edit-cannot-start-editor = Cannot start the editor
 error-edit-path-refused = This remote path cannot be edited locally
+error-drive-connect-cancelled = Connection to Google Drive cancelled
+error-drive-connect-timed-out = The browser did not answer in 5 minutes
+error-drive-connect-denied = Access to Google Drive was not granted
+error-drive-connect-failed = Could not connect to Google Drive
+error-drive-not-connected = Not connected to Google Drive
+error-drive-upload-failed = Could not upload to Google Drive
+error-drive-not-configured = Google Drive is not available in this build
 
 # The folder compare panel (between the panes and the queue).
 compare-button = Compare

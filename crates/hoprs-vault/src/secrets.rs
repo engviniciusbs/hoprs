@@ -28,6 +28,29 @@ impl SecretKind {
     }
 }
 
+/// A secret that belongs to the app, not to a site.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum AppSecret {
+    /// The Google Drive connection (its refresh token).
+    GoogleDrive,
+}
+
+impl AppSecret {
+    /// Credential-store service name of this secret.
+    pub fn service(self) -> &'static str {
+        match self {
+            Self::GoogleDrive => "hoprs/google-drive",
+        }
+    }
+
+    /// Account name of this secret in the credential store.
+    pub fn account(self) -> &'static str {
+        match self {
+            Self::GoogleDrive => "refresh-token",
+        }
+    }
+}
+
 /// Credential-store service name of a site's secrets.
 pub(crate) fn service(site: &SiteId) -> String {
     format!("hoprs/{site}")
@@ -41,6 +64,16 @@ pub trait SecretStore: Send + Sync {
     fn set(&self, site: &SiteId, kind: SecretKind, value: &SecretString) -> Result<()>;
     /// Deletes the secret. Deleting a missing secret is `Ok`.
     fn delete(&self, site: &SiteId, kind: SecretKind) -> Result<()>;
+}
+
+/// Where the app's own secrets are kept (the [`SecretStore`] is keyed by site).
+pub trait AppSecretStore: Send + Sync {
+    /// The secret, or `None` if there is none.
+    fn get_app(&self, which: AppSecret) -> Result<Option<SecretString>>;
+    /// Stores `value`, replacing any previous one.
+    fn set_app(&self, which: AppSecret, value: &SecretString) -> Result<()>;
+    /// Deletes the secret. Deleting a missing secret is `Ok`.
+    fn delete_app(&self, which: AppSecret) -> Result<()>;
 }
 
 /// Secrets in the system keyring (Secret Service on Linux, Keychain on
@@ -105,6 +138,12 @@ impl KeyringStore {
             .build(&service(site), kind.account(), None)
             .map_err(|e| map_error(&e))
     }
+
+    fn app_entry(&self, which: AppSecret) -> Result<keyring_core::Entry> {
+        self.store
+            .build(which.service(), which.account(), None)
+            .map_err(|e| map_error(&e))
+    }
 }
 
 impl fmt::Debug for KeyringStore {
@@ -132,6 +171,29 @@ impl SecretStore for KeyringStore {
 
     fn delete(&self, site: &SiteId, kind: SecretKind) -> Result<()> {
         match self.entry(site, kind)?.delete_credential() {
+            Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
+            Err(err) => Err(map_error(&err)),
+        }
+    }
+}
+
+impl AppSecretStore for KeyringStore {
+    fn get_app(&self, which: AppSecret) -> Result<Option<SecretString>> {
+        match self.app_entry(which)?.get_password() {
+            Ok(value) => Ok(Some(SecretString::from(value))),
+            Err(keyring_core::Error::NoEntry) => Ok(None),
+            Err(err) => Err(map_error(&err)),
+        }
+    }
+
+    fn set_app(&self, which: AppSecret, value: &SecretString) -> Result<()> {
+        self.app_entry(which)?
+            .set_password(value.expose_secret())
+            .map_err(|e| map_error(&e))
+    }
+
+    fn delete_app(&self, which: AppSecret) -> Result<()> {
+        match self.app_entry(which)?.delete_credential() {
             Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
             Err(err) => Err(map_error(&err)),
         }
@@ -179,6 +241,7 @@ fn map_error(err: &keyring_core::Error) -> Error {
 #[derive(Default)]
 pub struct MemoryStore {
     entries: Mutex<HashMap<(SiteId, SecretKind), SecretString>>,
+    app: Mutex<HashMap<AppSecret, SecretString>>,
 }
 
 impl MemoryStore {
@@ -190,13 +253,33 @@ impl MemoryStore {
         // A panic while holding the lock cannot leave the map half-updated.
         self.entries.lock().unwrap_or_else(|e| e.into_inner())
     }
+
+    fn lock_app(&self) -> std::sync::MutexGuard<'_, HashMap<AppSecret, SecretString>> {
+        self.app.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl AppSecretStore for MemoryStore {
+    fn get_app(&self, which: AppSecret) -> Result<Option<SecretString>> {
+        Ok(self.lock_app().get(&which).cloned())
+    }
+
+    fn set_app(&self, which: AppSecret, value: &SecretString) -> Result<()> {
+        self.lock_app().insert(which, value.clone());
+        Ok(())
+    }
+
+    fn delete_app(&self, which: AppSecret) -> Result<()> {
+        self.lock_app().remove(&which);
+        Ok(())
+    }
 }
 
 /// Prints the number of entries, never their values.
 impl fmt::Debug for MemoryStore {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MemoryStore")
-            .field("entries", &self.lock().len())
+            .field("entries", &(self.lock().len() + self.lock_app().len()))
             .finish()
     }
 }
@@ -351,5 +434,71 @@ mod tests {
         let err = store.get(&site, SecretKind::Password).unwrap_err();
         assert_eq!(err.kind, ErrorKind::Io);
         assert!(!format!("{err:?}").contains("hunter2"), "{err:?}");
+    }
+
+    #[test]
+    fn app_secret_names() {
+        assert_eq!(AppSecret::GoogleDrive.service(), "hoprs/google-drive");
+        assert_eq!(AppSecret::GoogleDrive.account(), "refresh-token");
+    }
+
+    #[test]
+    fn memory_store_app_roundtrip() {
+        let store = MemoryStore::new();
+        let which = AppSecret::GoogleDrive;
+        assert_eq!(exposed(store.get_app(which).unwrap()), None);
+        store.delete_app(which).unwrap();
+        let site = SiteId("google-drive".into());
+        store
+            .set(&site, SecretKind::Password, &secret("site-pw"))
+            .unwrap();
+        store.set_app(which, &secret("token")).unwrap();
+        assert_eq!(
+            exposed(store.get_app(which).unwrap()).as_deref(),
+            Some("token")
+        );
+        assert_eq!(
+            exposed(store.get(&site, SecretKind::Password).unwrap()).as_deref(),
+            Some("site-pw")
+        );
+        store.delete_app(which).unwrap();
+        assert_eq!(exposed(store.get_app(which).unwrap()), None);
+        assert_eq!(
+            exposed(store.get(&site, SecretKind::Password).unwrap()).as_deref(),
+            Some("site-pw")
+        );
+        assert!(!format!("{store:?}").contains("token"));
+    }
+
+    #[test]
+    fn keyring_store_app_entry_uses_service_and_account() {
+        let mock: Arc<CredentialStore> = mock::Store::new().unwrap();
+        let store = KeyringStore::with_store(mock.clone());
+        let which = AppSecret::GoogleDrive;
+        assert_eq!(exposed(store.get_app(which).unwrap()), None);
+        store.delete_app(which).unwrap();
+
+        store.set_app(which, &secret("token-value")).unwrap();
+        let entry = mock
+            .build("hoprs/google-drive", "refresh-token", None)
+            .unwrap();
+        assert_eq!(entry.get_password().unwrap(), "token-value");
+        assert_eq!(
+            exposed(store.get_app(which).unwrap()).as_deref(),
+            Some("token-value")
+        );
+        assert!(!format!("{store:?}").contains("token-value"));
+
+        let cred: &mock::Cred = entry.as_any().downcast_ref().unwrap();
+        cred.set_error(keyring_core::Error::PlatformFailure("down".into()));
+        let err = store.get_app(which).unwrap_err();
+        assert!(is_keyring_unavailable(&err), "{err:?}");
+        assert!(!format!("{err:?}").contains("token-value"));
+
+        store.delete_app(which).unwrap();
+        assert!(matches!(
+            entry.get_password(),
+            Err(keyring_core::Error::NoEntry)
+        ));
     }
 }

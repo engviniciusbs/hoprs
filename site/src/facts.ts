@@ -1,10 +1,13 @@
 // Filled by hand per release. facts.test.ts checks the version against the workspace Cargo.toml.
 const maintainer = "engviniciusbs";
+// The person responsible for the app and the contact of the privacy page.
+const responsible = "Vinícius Sarmento";
+const privacyEmail = "privacy@hoprs.online";
 const maintainerUrl = `https://github.com/${maintainer}`;
 const repoUrl = `${maintainerUrl}/hoprs`;
-const version = "1.4.0";
+const version = "1.5.0";
 // The date of the GitHub Release above (CHANGELOG.md), shown as "Updated" in the footer.
-const releaseDate = "2026-11-17";
+const releaseDate = "2026-11-18";
 const debName = `hoprs_${version}-1_amd64.deb`;
 const dmgName = `hoprs_${version}_macos_universal.dmg`;
 const msiName = `hoprs_${version}_windows_x64.msi`;
@@ -16,6 +19,8 @@ export const facts = {
   version,
   releaseDate,
   maintainer,
+  responsible,
+  privacyEmail,
   maintainerUrl,
   debName,
   debUrl: `${releaseBase}/${debName}`,

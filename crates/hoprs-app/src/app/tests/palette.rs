@@ -756,3 +756,20 @@ fn palette_lists_the_settings_tab() {
     app.update(palette(PaletteMsg::Run));
     assert!(app.settings_tab.is_none());
 }
+
+#[test]
+fn palette_lists_export_everything() {
+    use crate::app::ExportMsg;
+    use hoprs_vault::ExportScope;
+    let app = App::new();
+    let entries = all(&app);
+    let found = entry(&entries, "Export everything…").expect("the row");
+    assert_eq!(found.group, Group::Action);
+    assert_eq!(
+        format!("{:?}", app.item_message(&found.item)),
+        format!(
+            "{:?}",
+            Some(Message::Export(ExportMsg::Open(ExportScope::All)))
+        )
+    );
+}

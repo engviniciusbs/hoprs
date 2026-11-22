@@ -101,6 +101,58 @@ export const en = {
     licensed: "Licensed MIT OR Apache-2.0.",
     madeBy: "Made by",
     updated: "Updated",
+    privacy: "Privacy",
+  },
+  privacy: {
+    title: "Privacy policy",
+    metaTitle: "Privacy policy | hoprs",
+    metaDescription:
+      "What hoprs does with your data: the app collects nothing, the update check sends one request to GitHub, and Google Drive is used only when you choose it.",
+    updated: "Last changed: November 22, 2026.",
+    back: "Back to hoprs",
+    sections: [
+      {
+        heading: "Who is responsible",
+        paragraphs: [
+          "hoprs is an open source desktop app published by {responsible}. He is responsible for what this page describes.",
+          "Questions about privacy: {email}.",
+        ],
+      },
+      {
+        heading: "The app collects nothing",
+        paragraphs: [
+          "hoprs has no account, no telemetry and no server of its own. Your sites, workspaces and settings stay in files on your computer, and passwords stay in the system keyring.",
+          "Apart from the two things below (the update check and, in versions that offer it, Google Drive), the app connects only to the servers you add.",
+        ],
+      },
+      {
+        heading: "Update check",
+        paragraphs: [
+          "A few seconds after it starts, and once a day after that, hoprs makes one request to GitHub's API to ask for the latest release. The request carries no identifier: only the app's version in the User-Agent header (hoprs/<version>) and a standard Accept header.",
+          "Settings → General turns the check off. When you click Update, the installer is downloaded from GitHub.",
+        ],
+      },
+      {
+        heading: "Google Drive (in versions that offer it)",
+        paragraphs: [
+          "hoprs talks to Google only when you click Connect, Disconnect or export to Google Drive. What goes to Google is the OAuth authorisation exchange, the encrypted export file (uploaded to a folder named hoprs) and, on Disconnect, the request to revoke the authorisation.",
+          "The only permission hoprs asks for is drive.file: access to the files the app itself created. hoprs cannot see, list or change anything else in your Drive.",
+          "The file is encrypted on your computer with a password that never leaves it. The authorisation is kept in the system keyring, and your account's email address is read only to show which account is connected.",
+          "Disconnect in hoprs removes the authorisation from this computer's keyring and asks Google to revoke it; if that request fails (for example, offline), the authorisation is gone from this computer but may remain on Google's side. To remove it from Google's side for certain, use https://myaccount.google.com/permissions.",
+          "hoprs's use of information received from Google APIs adheres to the Google API Services User Data Policy, including the Limited Use requirements.",
+        ],
+      },
+      {
+        heading: "This website",
+        paragraphs: [
+          "Visits to hoprs.online are counted with Cloudflare Web Analytics, which sets no cookies and stores no personal data. The site sits behind Cloudflare.",
+        ],
+      },
+      {
+        heading: "Changes",
+        paragraphs: ["If this policy changes, the new text is published on this page, and the date above changes with it."],
+      },
+    ],
   },
 };
 

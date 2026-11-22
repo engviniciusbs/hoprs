@@ -7,6 +7,7 @@ pub mod dialogs;
 pub mod divider;
 pub mod drag;
 pub mod edits;
+pub mod export;
 pub mod file_actions;
 pub mod files;
 pub mod fit;

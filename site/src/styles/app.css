@@ -116,3 +116,9 @@ html, body { overflow-x: clip; background: var(--color-paper); }
 .os-panel { display: grid; gap: var(--space-sm); justify-items: start; max-width: 48rem; margin-top: var(--space-xs); }
 .os-panel > * { margin: 0; }
 .steps { padding-left: var(--space-lg); display: grid; gap: var(--space-xs); }
+
+/* Privacy page: plain reading column. */
+.privacy { padding-bottom: var(--section-gap-s); }
+.privacy-section { display: grid; gap: var(--space-sm); max-width: 44rem; }
+.privacy p { max-width: 44rem; overflow-wrap: anywhere; }
+.privacy .muted { margin: 0; }

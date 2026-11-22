@@ -94,11 +94,12 @@ of hoprs (see the [License](README.md#license) section of the README).
 
 ## Translating hoprs
 
-All the text the app shows lives in two [Fluent](https://projectfluent.org) files:
+All the text the app shows lives in [Fluent](https://projectfluent.org) files:
 
 - `crates/hoprs-app/i18n/en.ftl`: English, the reference. Its `#` comments say where each
   text appears and what each variable is.
 - `crates/hoprs-app/i18n/pt-BR.ftl`: Brazilian Portuguese.
+- `crates/hoprs-app/i18n/tr.ftl`: Turkish.
 
 **To improve a translation**, edit the `.ftl` file (the GitHub web editor is fine) and open a
 pull request. Keep every `{ $variable }` name as it is, and keep the plural forms

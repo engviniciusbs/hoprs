@@ -56,6 +56,16 @@
 //! The FileZilla import, the delete of its file, the backup export and restore and the
 //! settings calls are recorded in order ([`FakeBackend::backup_calls`]) and succeed with
 //! empty reports.
+//!
+//! Google Drive is scripted: `drive_status` answers [`FakeBackend::with_drive`] (or the
+//! error of [`FakeBackend::fail_drive_status`]), `drive_connect` streams the events of
+//! [`FakeBackend::set_drive_connect`] (once; nothing when none are set), `seal_export`
+//! answers `b"sealed"` with the scope's report (unless [`FakeBackend::fail_next_seal`]),
+//! uploads succeed unless [`FakeBackend::fail_next_upload`] says otherwise; statuses,
+//! uploads, cancels, disconnects and sealed saves are counted or recorded. The fake
+//! follows its own calls as the real backend does: a connect that ends connected makes
+//! `drive_status` answer that account, `drive_disconnect` forgets it, and an upload with
+//! no account fails with `drive-not-connected`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -73,7 +83,7 @@ use hoprs_core::{
 use hoprs_import::{ImportOptions, ImportReport};
 use hoprs_remote::{CompareOptions, CompareSignals, MemFs, Progress, RemoteFs, Summary};
 use hoprs_transfer::{ConflictPolicy, Event, TransferId, TransferItem, TransferSpec};
-use hoprs_vault::{BackupImportReport, ExportReport, ImportMode, UnreadableEntry};
+use hoprs_vault::{BackupImportReport, ExportReport, ExportScope, ImportMode, UnreadableEntry};
 use secrecy::{ExposeSecret, SecretString};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
@@ -86,6 +96,7 @@ use super::{
     ProfileSnapshot, PromptAnswer, PromptId, SessionId, ShellId, ShellOutput, Side,
     TransferSnapshot, WorkspaceTabs,
 };
+use crate::drive::{ConnectEvent, DriveAccount, DriveFile, Pages, Sealed};
 use crate::settings::{Settings, SettingsLoad};
 use crate::update::Release;
 use crate::update::download::{DownloadEvent, DownloadJob};
@@ -101,6 +112,7 @@ pub enum BackupCall {
     },
     DeleteSitemanager(PathBuf),
     Export {
+        scope: ExportScope,
         path: PathBuf,
         password: String,
     },
@@ -108,6 +120,11 @@ pub enum BackupCall {
         path: PathBuf,
         password: String,
         mode: ImportMode,
+    },
+    /// `seal_export`.
+    Seal {
+        scope: ExportScope,
+        password: String,
     },
     SaveSettings(Settings),
     SetPolicy(ConflictPolicy),
@@ -189,7 +206,8 @@ fn fake_output(rx: mpsc::UnboundedReceiver<ShellOutput>) -> BoxStream<'static, S
 
 /// See the module docs.
 pub struct FakeBackend {
-    state: Mutex<State>,
+    /// Shared with the streams that change it (a connect that ends connected).
+    state: Arc<Mutex<State>>,
     next_session: AtomicU64,
     next_transfer: AtomicI64,
     events: mpsc::UnboundedSender<BrokerEvent>,
@@ -251,6 +269,10 @@ struct State {
     hang_save_tabs: bool,
     panic_shutdown: bool,
     backup_calls: Vec<BackupCall>,
+    /// The next `export_backup` calls fail with these.
+    export_failures: VecDeque<Error>,
+    /// The next `seal_export` calls fail with these.
+    seal_failures: VecDeque<Error>,
     /// What `settings` returns.
     settings: SettingsLoad,
     /// What `queue_error` returns.
@@ -270,6 +292,19 @@ struct State {
     /// What the next `download_update` streams.
     download: Vec<DownloadEvent>,
     downloads: Vec<DownloadJob>,
+    /// What `drive_status` answers (unless `drive_status_error`).
+    drive_account: Option<DriveAccount>,
+    drive_status_error: Option<Error>,
+    drive_status_reads: u32,
+    /// What the next `drive_connect` streams.
+    drive_connect: Vec<ConnectEvent>,
+    /// The next `drive_upload` calls fail with these.
+    upload_failures: VecDeque<Error>,
+    /// `(name, byte count)` of every `drive_upload`.
+    drive_uploads: Vec<(String, usize)>,
+    drive_cancels: u32,
+    drive_disconnects: u32,
+    sealed_saves: Vec<PathBuf>,
 }
 
 /// What a scripted `compare` does: sends `progress`, optionally waits on `hold`
@@ -290,7 +325,7 @@ impl FakeBackend {
     pub fn new() -> Self {
         let (events, receiver) = mpsc::unbounded_channel();
         Self {
-            state: Mutex::new(State::default()),
+            state: Arc::new(Mutex::new(State::default())),
             next_session: AtomicU64::new(1),
             next_transfer: AtomicI64::new(1),
             events,
@@ -377,6 +412,50 @@ impl FakeBackend {
     /// Every `download_update` job, in order.
     pub fn downloads(&self) -> Vec<DownloadJob> {
         self.state().downloads.clone()
+    }
+
+    /// What `drive_status` answers (by default `None`: not connected).
+    pub fn with_drive(self, account: Option<DriveAccount>) -> Self {
+        self.state().drive_account = account;
+        self
+    }
+
+    /// From now on `drive_status` fails with `error`.
+    pub fn fail_drive_status(&self, error: Error) {
+        self.state().drive_status_error = Some(error);
+    }
+
+    /// The events the next `drive_connect` streams.
+    pub fn set_drive_connect(&self, events: Vec<ConnectEvent>) {
+        self.state().drive_connect = events;
+    }
+
+    /// The next `drive_upload` fails with `error`.
+    pub fn fail_next_upload(&self, error: Error) {
+        self.state().upload_failures.push_back(error);
+    }
+
+    /// How many times `drive_status` was called.
+    pub fn drive_status_reads(&self) -> u32 {
+        self.state().drive_status_reads
+    }
+
+    /// `(name, byte count)` of every `drive_upload`, in order (failed ones too).
+    pub fn drive_uploads(&self) -> Vec<(String, usize)> {
+        self.state().drive_uploads.clone()
+    }
+
+    pub fn drive_cancels(&self) -> u32 {
+        self.state().drive_cancels
+    }
+
+    pub fn drive_disconnects(&self) -> u32 {
+        self.state().drive_disconnects
+    }
+
+    /// The path of every `save_sealed`, in order.
+    pub fn sealed_saves(&self) -> Vec<PathBuf> {
+        self.state().sealed_saves.clone()
     }
 
     pub fn with_site(self, site: Site) -> Self {
@@ -636,6 +715,49 @@ impl FakeBackend {
     /// The next `save_workspace_tabs` fails with `error`.
     pub fn fail_next_save_tabs(&self, error: Error) {
         self.state().save_tab_failures.push_back(error);
+    }
+
+    /// The report of an export of `scope` (`NotFound` for an unknown id).
+    fn export_report(state: &State, scope: &ExportScope) -> Result<ExportReport> {
+        let (sites, workspaces) = match scope {
+            ExportScope::All => (state.sites.len(), state.workspaces.len()),
+            ExportScope::Site(id) => {
+                if !state.sites.iter().any(|s| &s.id == id) {
+                    return Err(Self::not_found("Unknown site"));
+                }
+                (1, 0)
+            }
+            ExportScope::Workspace(id) => {
+                let workspace = state
+                    .workspaces
+                    .iter()
+                    .find(|w| &w.id == id)
+                    .ok_or_else(|| Self::not_found("Unknown workspace"))?;
+                let held = workspace
+                    .sites
+                    .iter()
+                    .filter(|entry| state.sites.iter().any(|s| s.id == entry.site))
+                    .count();
+                (held, 1)
+            }
+        };
+        Ok(ExportReport {
+            sites,
+            workspaces,
+            secrets: 0,
+            skipped_unreadable: Vec::new(),
+            missing_secrets: Vec::new(),
+        })
+    }
+
+    /// The next `export_backup` fails with `error`.
+    pub fn fail_next_export(&self, error: Error) {
+        self.state().export_failures.push_back(error);
+    }
+
+    /// The next `seal_export` fails with `error`.
+    pub fn fail_next_seal(&self, error: Error) {
+        self.state().seal_failures.push_back(error);
     }
 
     /// From now on `save_workspace_tabs` never returns.
@@ -1251,19 +1373,97 @@ impl BackendApi for FakeBackend {
         Ok(())
     }
 
-    async fn export_backup(&self, path: PathBuf, password: SecretString) -> Result<ExportReport> {
+    async fn export_backup(
+        &self,
+        scope: ExportScope,
+        path: PathBuf,
+        password: SecretString,
+    ) -> Result<ExportReport> {
         self.record(BackupCall::Export {
+            scope: scope.clone(),
             path,
             password: password.expose_secret().to_owned(),
         });
-        let state = self.state();
-        Ok(ExportReport {
-            sites: state.sites.len(),
-            workspaces: state.workspaces.len(),
-            secrets: 0,
-            skipped_unreadable: Vec::new(),
-            missing_secrets: Vec::new(),
+        let mut state = self.state();
+        if let Some(error) = state.export_failures.pop_front() {
+            return Err(error);
+        }
+        Self::export_report(&state, &scope)
+    }
+
+    async fn seal_export(
+        &self,
+        scope: ExportScope,
+        password: SecretString,
+    ) -> Result<(ExportReport, Sealed)> {
+        self.record(BackupCall::Seal {
+            scope: scope.clone(),
+            password: password.expose_secret().to_owned(),
+        });
+        let mut state = self.state();
+        if let Some(error) = state.seal_failures.pop_front() {
+            return Err(error);
+        }
+        let report = Self::export_report(&state, &scope)?;
+        Ok((report, Sealed::new(b"sealed".to_vec())))
+    }
+
+    async fn drive_status(&self) -> Result<Option<DriveAccount>> {
+        let mut state = self.state();
+        state.drive_status_reads += 1;
+        match &state.drive_status_error {
+            Some(error) => Err(error.clone()),
+            None => Ok(state.drive_account.clone()),
+        }
+    }
+
+    fn drive_connect(&self, _pages: Pages) -> BoxStream<'static, ConnectEvent> {
+        // As the real backend: a connect that ends connected is what `drive_status`
+        // answers from then on (from memory: the keyring is not asked again).
+        let state = self.state.clone();
+        futures_util::stream::iter(std::mem::take(&mut self.state().drive_connect))
+            .inspect(move |event| {
+                if let ConnectEvent::Done(Ok(account)) = event {
+                    let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+                    state.drive_account = Some(account.clone());
+                    state.drive_status_error = None;
+                }
+            })
+            .boxed()
+    }
+
+    fn drive_cancel(&self) {
+        self.state().drive_cancels += 1;
+    }
+
+    async fn drive_disconnect(&self) -> Result<()> {
+        let mut state = self.state();
+        state.drive_disconnects += 1;
+        state.drive_account = None;
+        Ok(())
+    }
+
+    async fn drive_upload(&self, name: String, sealed: Sealed) -> Result<DriveFile> {
+        let mut state = self.state();
+        state
+            .drive_uploads
+            .push((name.clone(), sealed.bytes().len()));
+        if let Some(error) = state.upload_failures.pop_front() {
+            return Err(error);
+        }
+        // As the real backend: nothing to upload with.
+        if state.drive_account.is_none() {
+            return Err(crate::drive::not_connected());
+        }
+        Ok(DriveFile {
+            name,
+            link: Some("https://drive.google.com/file/d/fake/view".into()),
         })
+    }
+
+    async fn save_sealed(&self, path: PathBuf, _sealed: Sealed) -> Result<()> {
+        self.state().sealed_saves.push(path);
+        Ok(())
     }
 
     async fn restore_backup(
@@ -1440,6 +1640,94 @@ mod tests {
         ));
         assert_eq!(fake.downloads().len(), 1);
         assert_eq!(fake.downloads()[0].asset, job.asset);
+    }
+
+    /// The Drive calls follow the script: status, connect events, uploads, disconnects,
+    /// cancels and sealed saves, all recorded.
+    #[tokio::test]
+    async fn fake_drive_follows_its_script() {
+        use crate::drive::{ConnectEvent, DriveAccount, DriveFile, Pages, Sealed};
+        let pages = || Pages {
+            connected: "c".into(),
+            failed: "f".into(),
+        };
+        let fake = FakeBackend::new();
+        assert_eq!(fake.drive_status().await.unwrap(), None);
+        let account = DriveAccount {
+            email: Some("me@example.com".into()),
+            stored: true,
+        };
+        let fake = fake.with_drive(Some(account.clone()));
+        assert_eq!(fake.drive_status().await.unwrap(), Some(account.clone()));
+        fake.fail_drive_status(Error::new(ErrorKind::Io, "keyring"));
+        assert_eq!(fake.drive_status().await.unwrap_err().message, "keyring");
+        assert_eq!(fake.drive_status_reads(), 3);
+
+        // Nothing scripted: the stream ends at once.
+        assert!(
+            fake.drive_connect(pages())
+                .collect::<Vec<_>>()
+                .await
+                .is_empty()
+        );
+        fake.set_drive_connect(vec![
+            ConnectEvent::Waiting {
+                url: "https://example.com/auth".into(),
+            },
+            ConnectEvent::Done(Ok(account.clone())),
+        ]);
+        let events: Vec<_> = fake.drive_connect(pages()).collect().await;
+        assert!(matches!(
+            events.as_slice(),
+            [ConnectEvent::Waiting { .. }, ConnectEvent::Done(Ok(_))]
+        ));
+        fake.drive_cancel();
+        assert_eq!(fake.drive_cancels(), 1);
+
+        let scope = ExportScope::All;
+        let (report, sealed) = fake
+            .seal_export(scope.clone(), SecretString::from("pw"))
+            .await
+            .unwrap();
+        assert_eq!(report.sites, 0);
+        assert_eq!(sealed.bytes(), b"sealed");
+        assert_eq!(
+            fake.backup_calls(),
+            vec![BackupCall::Seal {
+                scope,
+                password: "pw".into()
+            }]
+        );
+        let file = fake
+            .drive_upload("a.hoprs".into(), sealed.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            file,
+            DriveFile {
+                name: "a.hoprs".into(),
+                link: Some("https://drive.google.com/file/d/fake/view".into())
+            }
+        );
+        fake.fail_next_upload(Error::new(ErrorKind::Network, "down"));
+        let err = fake
+            .drive_upload("b.hoprs".into(), Sealed::new(vec![0; 3]))
+            .await
+            .unwrap_err();
+        assert_eq!(err.message, "down");
+        assert_eq!(
+            fake.drive_uploads(),
+            vec![("a.hoprs".to_owned(), 6), ("b.hoprs".to_owned(), 3)]
+        );
+        fake.drive_upload("c.hoprs".into(), sealed.clone())
+            .await
+            .unwrap();
+        fake.save_sealed(PathBuf::from("x.hoprs"), sealed)
+            .await
+            .unwrap();
+        assert_eq!(fake.sealed_saves(), vec![PathBuf::from("x.hoprs")]);
+        fake.drive_disconnect().await.unwrap();
+        assert_eq!(fake.drive_disconnects(), 1);
     }
 
     /// Edits run on the real edit manager: a save while the connection is down is held,

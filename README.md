@@ -26,9 +26,9 @@ click) and puts a terminal, a two-pane file browser, folder compare and a persis
 transfer queue behind it, in one quiet window that opens in under 100 ms and idles at about
 33 MB.
 
-- **Version:** 1.4.0 ([changelog](CHANGELOG.md))
+- **Version:** 1.5.0 ([changelog](CHANGELOG.md))
 - **Platforms:** Linux (Ubuntu 24.04 or newer, amd64), macOS 11 or newer (Apple Silicon and Intel), Windows 10 or newer (x64).
-- **Languages:** English and Brazilian Portuguese.
+- **Languages:** English, Brazilian Portuguese and Turkish.
 - **License:** MIT OR Apache-2.0
 
 ## Contents
@@ -76,15 +76,15 @@ transfer queue behind it, in one quiet window that opens in under 100 ms and idl
   file changed on the server you choose what happens instead of losing either side.
 - **Credentials in the system keyring** (Secret Service, macOS Keychain, Windows Credential Manager). Site files hold no secrets.
   `ssh-agent` is supported and preferred.
-- **Encrypted backup:** export and import all sites, workspaces and passwords in one file
-  (Argon2id and XChaCha20-Poly1305).
+- **Encrypted backup:** export everything, one workspace or one site, and restore it, in one
+  encrypted file with the passwords (Argon2id and XChaCha20-Poly1305).
 - **FileZilla import:** reads `sitemanager.xml` and reports what was imported and what was
   skipped.
 - **Security prompts inline:** host key and certificate changes are shown in place, never as
   a cascade of modal dialogs. `known_hosts` is verified; FTPS certificates can be pinned.
 - **Connections that survive:** keepalive, automatic reconnection with backoff, and recovery
   from connections that servers drop while idle.
-- **Language:** English or Brazilian Portuguese. hoprs follows the OS language by default;
+- **Language:** English, Brazilian Portuguese or Turkish. hoprs follows the OS language by default;
   Settings › Language switches it at once.
 - **Command palette:** Ctrl+K (Cmd+K on macOS) jumps to any tab, site, workspace or action.
 - **Update notice:** hoprs tells you when a new version is out and, with one click,
@@ -115,32 +115,32 @@ Every release has these files on the
 
 | System | File |
 |---|---|
-| Linux (Ubuntu 24.04 or newer, amd64) | `hoprs_1.4.0-1_amd64.deb` |
-| macOS 11 or newer, Apple Silicon and Intel | `hoprs_1.4.0_macos_universal.dmg` |
-| Windows 10 or newer, x64 (installer, per machine) | `hoprs_1.4.0_windows_x64.msi` |
-| Windows 10 or newer, x64 (portable) | `hoprs_1.4.0_windows_x64.zip` |
+| Linux (Ubuntu 24.04 or newer, amd64) | `hoprs_1.5.0-1_amd64.deb` |
+| macOS 11 or newer, Apple Silicon and Intel | `hoprs_1.5.0_macos_universal.dmg` |
+| Windows 10 or newer, x64 (installer, per machine) | `hoprs_1.5.0_windows_x64.msi` |
+| Windows 10 or newer, x64 (portable) | `hoprs_1.5.0_windows_x64.zip` |
 
 The macOS and Windows builds are **not signed** with a paid certificate (see the steps
 below), so each system warns once on first launch.
 
 ### Linux: the `.deb` (recommended)
 
-1. Download `hoprs_1.4.0-1_amd64.deb` and `SHA256SUMS`.
+1. Download `hoprs_1.5.0-1_amd64.deb` and `SHA256SUMS`.
 2. Check the download and install it:
 
    ```sh
    sha256sum -c SHA256SUMS --ignore-missing
-   sudo apt install ./hoprs_1.4.0-1_amd64.deb
+   sudo apt install ./hoprs_1.5.0-1_amd64.deb
    ```
 
-   Expected output of the first command: `hoprs_1.4.0-1_amd64.deb: OK`. `apt` installs the
+   Expected output of the first command: `hoprs_1.5.0-1_amd64.deb: OK`. `apt` installs the
    libraries hoprs needs (Wayland, X11, Vulkan/EGL loaders, D-Bus).
 
 3. Start hoprs from the app menu, or run:
 
    ```sh
    hoprs             # opens the window
-   hoprs --version   # prints "hoprs 1.4.0"
+   hoprs --version   # prints "hoprs 1.5.0"
    hoprs --help
    ```
 
@@ -149,7 +149,7 @@ and exits.
 
 ### macOS: the `.dmg`
 
-1. Download `hoprs_1.4.0_macos_universal.dmg` and `SHA256SUMS`, and check it:
+1. Download `hoprs_1.5.0_macos_universal.dmg` and `SHA256SUMS`, and check it:
 
    ```sh
    shasum -a 256 -c SHA256SUMS --ignore-missing
@@ -174,11 +174,11 @@ The `.dmg` is one universal build for Apple Silicon and Intel Macs.
 
 ### Windows: the `.msi` or the `.zip`
 
-1. Download `hoprs_1.4.0_windows_x64.msi` (or the portable `hoprs_1.4.0_windows_x64.zip`)
+1. Download `hoprs_1.5.0_windows_x64.msi` (or the portable `hoprs_1.5.0_windows_x64.zip`)
    and `SHA256SUMS`. In PowerShell, compare the hash with the line in `SHA256SUMS`:
 
    ```powershell
-   (Get-FileHash .\hoprs_1.4.0_windows_x64.msi -Algorithm SHA256).Hash
+   (Get-FileHash .\hoprs_1.5.0_windows_x64.msi -Algorithm SHA256).Hash
    ```
 
 2. Run the `.msi`. It installs per machine (it asks for administrator rights) and adds a
@@ -268,9 +268,11 @@ on macOS. On Windows, Credential Manager shows them as `password.hoprs/<site-id>
    tabs you had ("Close all" closes them again).
 4. **Back everything up.** "Export backup…" writes one encrypted file with your sites,
    workspaces and passwords, protected by a password you choose (without it the backup
-   cannot be opened). "Restore backup…" on another machine brings all three back. Restoring
-   replaces everything: sites, workspaces and passwords not in the backup are removed, and
-   hoprs asks before doing it.
+   cannot be opened). "Restore backup…" on another machine brings all three back. Restore
+   offers two modes: Merge (the default) adds what is new and keeps what you have; Replace
+   makes everything the backup's, removing sites, workspaces and passwords not in it, and
+   hoprs asks before doing it. To export only one site or one workspace, see
+   [Backup and export](#backup-and-export).
 
 The first time hoprs meets an SSH host it shows the host key fingerprint inline and asks
 before trusting it; a changed key is shown as a warning, never accepted silently.
@@ -342,8 +344,37 @@ Items that do not apply are dimmed, not hidden. Right-clicking below the rows gi
 folder, Refresh and Compare. Shift+F10 or the Menu key opens the menu of the selected row
 from the keyboard; arrows move, Enter runs, Escape closes. The compare list (Upload,
 Download, Show in panes), the queue rows (Pause, Resume, Cancel, Retry, Dismiss), the
-sidebar's sites and workspaces (Open, Edit) and the tabs (Close tab, Close other tabs) have
+sidebar's sites and workspaces (Open, Edit, Export…) and the tabs (Close tab, Close other tabs) have
 menus too.
+
+### Backup and export
+
+An export is one encrypted file, protected by a password you type twice (without it the
+file cannot be opened). It holds one of three things:
+
+- **Everything:** every site, every workspace and the saved passwords.
+- **One workspace:** the workspace, with its saved tabs, and the sites in it, with their
+  passwords.
+- **One site:** that site and its password.
+
+Where to start:
+
+- Right-click a site or a workspace in the sidebar and choose "Export…".
+- The sidebar's ⋯ menu and the Ctrl+K palette have "Export everything…".
+- When you edit a site or a workspace, its form has an "Export…" button: this is the way in
+  from the keyboard. It exports the site or workspace as saved, and leaves the form (edits
+  you have not saved are dropped).
+- Settings → Backup has "Export backup…" (everything); "Restore backup…" stays there.
+
+The export screen is a form in the middle of the window. Its title says what is exported,
+the File field starts as `hoprs-<name>-<date>.hoprs` in your Documents folder (or home), and
+"Choose…" opens the save dialog. Everything is `hoprs-backup-<date>.hoprs`. If you type the
+path of a file that exists, hoprs asks before overwriting it.
+
+A file of one site or one workspace is a partial file. Restore it with Merge: Replace is
+refused, because it would remove everything the file does not hold. Partial files need
+hoprs 1.6.0 or newer; hoprs 1.5.0 and older answer "Unsupported backup version" and change
+nothing. A file of everything restores on every version, as before.
 
 ### Settings
 
@@ -352,7 +383,7 @@ menus too.
 Settings open as a tab: Ctrl+, (⌘, on macOS), the gear at the bottom of the sidebar, or
 "Settings" in the Ctrl+K palette. There is only ever one; pressing the shortcut again
 focuses it. A list on the left switches between General, Transfers, Folder compare, Remote
-editing, Terminal and Backup. Closing the tab returns to the tab you came from.
+editing, Terminal and Backup (export and restore). Closing the tab returns to the tab you came from.
 
 ### Remote editing
 
@@ -395,14 +426,15 @@ decisions. It never contains passwords, passphrases, file contents or terminal o
 
 ### Language
 
-The interface is in English and Brazilian Portuguese. "System" (the default) follows the OS
-language: any Portuguese locale gives Portuguese, anything else English. Pick one in
+The interface is in English, Brazilian Portuguese and Turkish. "System" (the default)
+follows the OS language: any Portuguese locale gives Portuguese, any Turkish locale Turkish,
+anything else English. Pick one in
 Settings › Language (Idioma); it applies immediately. Messages that come from servers or
 the OS (for example an SFTP server's own error text) are shown as they are.
 
 Translators: the texts are Fluent files in `crates/hoprs-app/i18n/`. `en.ftl` is the
 reference: copy it, translate the values, and keep the `{ $var }` names unchanged. The
-tests check that both catalogs have the same keys and variables (`cargo test -p hoprs-app`).
+tests check that every catalog has the same keys and variables as `en.ftl` (`cargo test -p hoprs-app`).
 
 ## Where your data lives
 
@@ -479,7 +511,7 @@ The binary ends up in `target/release/hoprs`.
 
 ```sh
 scripts/package-deb.sh                                              # needs Docker
-scripts/check-deb.sh target/deb-ubuntu-24.04/debian/hoprs_1.4.0-1_amd64.deb
+scripts/check-deb.sh target/deb-ubuntu-24.04/debian/hoprs_1.5.0-1_amd64.deb
 ```
 
 `package-deb.sh` builds inside an Ubuntu 24.04 container pinned by digest, with

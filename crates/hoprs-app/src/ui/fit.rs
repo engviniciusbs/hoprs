@@ -173,7 +173,11 @@ impl Toolbar {
 
 /// The toolbar form for a pane `pane` px wide.
 pub fn toolbar(pane: f32, side: Side) -> Toolbar {
-    let pt = crate::i18n::language() == crate::i18n::Language::PtBr;
+    // Portuguese and Turkish labels are wider than English ones.
+    let pt = matches!(
+        crate::i18n::language(),
+        crate::i18n::Language::PtBr | crate::i18n::Language::Tr
+    );
     let trimmed = match side {
         Side::Local => 0.0,
         Side::Remote if pt => TOOLBAR_TRIMMED_REMOTE_PT,

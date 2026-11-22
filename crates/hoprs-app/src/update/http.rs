@@ -87,6 +87,20 @@ fn status_detail(code: u16, remaining: Option<&str>) -> String {
     }
 }
 
+/// The system's root certificates, read once per process.
+pub fn system_roots() -> Vec<CertificateDer<'static>> {
+    static ROOTS: OnceLock<Vec<CertificateDer<'static>>> = OnceLock::new();
+    ROOTS
+        .get_or_init(|| {
+            let loaded = rustls_native_certs::load_native_certs();
+            for error in &loaded.errors {
+                tracing::warn!(%error, "a system root certificate could not be read");
+            }
+            loaded.certs
+        })
+        .clone()
+}
+
 /// The update client (see the module docs).
 pub struct Client {
     agent: Agent,
@@ -142,15 +156,7 @@ impl Client {
 
     /// A client that trusts the system's roots (read once per process).
     pub fn system(api_url: String) -> Client {
-        static ROOTS: OnceLock<Vec<CertificateDer<'static>>> = OnceLock::new();
-        let roots = ROOTS.get_or_init(|| {
-            let loaded = rustls_native_certs::load_native_certs();
-            for error in &loaded.errors {
-                tracing::warn!(%error, "a system root certificate could not be read");
-            }
-            loaded.certs
-        });
-        Client::new(api_url, roots.clone())
+        Client::new(api_url, system_roots())
     }
 
     /// The latest stable release.
@@ -295,11 +301,10 @@ impl Fetch for Client {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_https::{Answer, answer, identity, redirect, serve};
     use crate::update::download::{self, DownloadEvent, DownloadJob};
     use crate::update::{Asset, SUMS_NAME};
-    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
     use sha2::{Digest, Sha256};
-    use std::io::BufRead;
     use std::net::TcpListener;
     use std::sync::Mutex;
 
@@ -336,94 +341,6 @@ mod tests {
         assert!(USER_AGENT.starts_with("hoprs/"));
     }
 
-    /// One canned answer of the test server.
-    struct Answer {
-        status: &'static str,
-        headers: Vec<(String, String)>,
-        body: Vec<u8>,
-        chunked: bool,
-        /// Sends only this many body bytes, then closes.
-        cut: Option<usize>,
-    }
-
-    fn answer(status: &'static str, body: impl Into<Vec<u8>>) -> Answer {
-        Answer {
-            status,
-            headers: Vec::new(),
-            body: body.into(),
-            chunked: false,
-            cut: None,
-        }
-    }
-
-    fn redirect(to: String) -> Answer {
-        let mut a = answer("302 Found", Vec::new());
-        a.headers.push(("Location".into(), to));
-        a
-    }
-
-    /// Serves `route` over TLS on `listener`, one request per connection, recording the
-    /// request heads (lowercase).
-    fn serve(
-        listener: TcpListener,
-        config: Arc<rustls::ServerConfig>,
-        seen: Arc<Mutex<Vec<String>>>,
-        route: impl Fn(&str) -> Answer + Send + 'static,
-    ) {
-        std::thread::spawn(move || {
-            for tcp in listener.incoming() {
-                let Ok(tcp) = tcp else { continue };
-                let Ok(conn) = rustls::ServerConnection::new(config.clone()) else {
-                    continue;
-                };
-                let mut tls = rustls::StreamOwned::new(conn, tcp);
-                let mut head = String::new();
-                {
-                    let mut reader = std::io::BufReader::new(&mut tls);
-                    loop {
-                        let mut line = String::new();
-                        match reader.read_line(&mut line) {
-                            Ok(0) | Err(_) => break,
-                            Ok(_) => {}
-                        }
-                        if line == "\r\n" {
-                            break;
-                        }
-                        head.push_str(&line);
-                    }
-                }
-                if head.is_empty() {
-                    continue; // The client refused the handshake.
-                }
-                seen.lock().unwrap().push(head.to_ascii_lowercase());
-                let path = head.split(' ').nth(1).unwrap_or("/").to_owned();
-                let a = route(&path);
-                let mut out = format!("HTTP/1.1 {}\r\nConnection: close\r\n", a.status);
-                for (name, value) in &a.headers {
-                    out.push_str(&format!("{name}: {value}\r\n"));
-                }
-                let mut bytes;
-                if a.chunked {
-                    out.push_str("Transfer-Encoding: chunked\r\n\r\n");
-                    bytes = out.into_bytes();
-                    for chunk in a.body.chunks(100) {
-                        bytes.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
-                        bytes.extend_from_slice(chunk);
-                        bytes.extend_from_slice(b"\r\n");
-                    }
-                    bytes.extend_from_slice(b"0\r\n\r\n");
-                } else {
-                    out.push_str(&format!("Content-Length: {}\r\n\r\n", a.body.len()));
-                    bytes = out.into_bytes();
-                    bytes.extend_from_slice(&a.body[..a.cut.unwrap_or(a.body.len())]);
-                }
-                let _ = tls.write_all(&bytes);
-                tls.conn.send_close_notify();
-                let _ = tls.flush();
-            }
-        });
-    }
-
     fn hex(bytes: &[u8]) -> String {
         Sha256::digest(bytes)
             .iter()
@@ -456,27 +373,7 @@ mod tests {
     /// Runs in the normal suite: a local server in a thread, no network, ~0.1 s.
     #[test]
     fn local_https_server_redirect_chunked_and_checksum() {
-        // A test CA and a leaf for localhost (and 127.0.0.1, to test the host rule alone).
-        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
-        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        let ca = rcgen::CertifiedIssuer::self_signed(params, rcgen::KeyPair::generate().unwrap())
-            .unwrap();
-        let params =
-            rcgen::CertificateParams::new(vec!["localhost".to_owned(), "127.0.0.1".to_owned()])
-                .unwrap();
-        let key = rcgen::KeyPair::generate().unwrap();
-        let leaf = params.signed_by(&key, &ca).unwrap().der().clone();
-        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
-            rustls::crypto::aws_lc_rs::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .unwrap()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![leaf],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
-        )
-        .unwrap();
+        let (config, ca) = identity();
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -491,9 +388,9 @@ mod tests {
             let (good, bad) = (good.clone(), bad.clone());
             serve(
                 listener,
-                Arc::new(config),
+                config,
                 seen.clone(),
-                move |path| match path {
+                move |_, path, _| match path {
                     "/latest" => Answer {
                         chunked: true,
                         ..answer("200 OK", fixture)
@@ -526,7 +423,6 @@ mod tests {
             );
         }
 
-        let ca = ca.der().clone();
         // No proxy: a proxy set in the developer's environment must not see this server.
         let direct = |path: &str, roots: Vec<CertificateDer<'static>>| {
             Client::with_proxy(format!("{base}{path}"), roots, None)
@@ -607,12 +503,12 @@ mod tests {
         // What the server saw: our User-Agent, and nothing identifying.
         let seen = seen.lock().unwrap();
         assert!(seen.len() >= 8, "{seen:?}");
-        for head in seen.iter() {
+        for (head, _) in seen.iter() {
             assert!(head.contains("\r\nuser-agent: hoprs/"), "{head}");
             assert!(!head.contains("\r\ncookie:"), "{head}");
             assert!(!head.contains("\r\nauthorization:"), "{head}");
         }
-        assert!(seen.iter().any(|h| h.starts_with("get /latest ")
+        assert!(seen.iter().any(|(h, _)| h.starts_with("get /latest ")
             && h.contains("\r\naccept: application/vnd.github+json")));
     }
 }

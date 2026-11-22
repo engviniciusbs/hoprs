@@ -2192,10 +2192,11 @@ dependencies = [
 
 [[package]]
 name = "hoprs-app"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "alacritty_terminal",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "criterion",
  "dirs",
@@ -2214,6 +2215,7 @@ dependencies = [
  "iced_tiny_skia",
  "libc",
  "notify",
+ "percent-encoding",
  "png",
  "rcgen",
  "rfd",
@@ -2241,7 +2243,7 @@ dependencies = [
 
 [[package]]
 name = "hoprs-core"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "serde",
  "thiserror 2.0.21",
@@ -2251,7 +2253,7 @@ dependencies = [
 
 [[package]]
 name = "hoprs-import"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -2266,7 +2268,7 @@ dependencies = [
 
 [[package]]
 name = "hoprs-remote"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "futures-util",
@@ -2287,7 +2289,7 @@ dependencies = [
 
 [[package]]
 name = "hoprs-ssh"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -2307,7 +2309,7 @@ dependencies = [
 
 [[package]]
 name = "hoprs-transfer"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "async-trait",
  "criterion",
@@ -2324,7 +2326,7 @@ dependencies = [
 
 [[package]]
 name = "hoprs-vault"
-version = "1.4.0"
+version = "1.5.0"
 dependencies = [
  "argon2",
  "chacha20poly1305",
