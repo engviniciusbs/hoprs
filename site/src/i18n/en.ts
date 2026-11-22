@@ -135,10 +135,10 @@ export const en = {
       {
         heading: "Google Drive (in versions that offer it)",
         paragraphs: [
-          "hoprs talks to Google only when you click Connect or export to Google Drive. What goes to Google is the OAuth authorisation exchange and the encrypted export file, uploaded to a folder named hoprs.",
+          "hoprs talks to Google only when you click Connect, Disconnect or export to Google Drive. What goes to Google is the OAuth authorisation exchange, the encrypted export file (uploaded to a folder named hoprs) and, on Disconnect, the request to revoke the authorisation.",
           "The only permission hoprs asks for is drive.file: access to the files the app itself created. hoprs cannot see, list or change anything else in your Drive.",
           "The file is encrypted on your computer with a password that never leaves it. The authorisation is kept in the system keyring, and your account's email address is read only to show which account is connected.",
-          "Disconnect in hoprs revokes the authorisation and removes it from the keyring. You can also remove it from Google's side at https://myaccount.google.com/permissions.",
+          "Disconnect in hoprs removes the authorisation from this computer's keyring and asks Google to revoke it; if that request fails (for example, offline), the authorisation is gone from this computer but may remain on Google's side. To remove it from Google's side for certain, use https://myaccount.google.com/permissions.",
           "hoprs's use of information received from Google APIs adheres to the Google API Services User Data Policy, including the Limited Use requirements.",
         ],
       },

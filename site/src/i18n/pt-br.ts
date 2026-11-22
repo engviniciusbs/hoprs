@@ -137,10 +137,10 @@ export const ptBr: Dict = {
       {
         heading: "Google Drive (nas versões que o oferecem)",
         paragraphs: [
-          "O hoprs só fala com o Google quando você clica em Conectar ou exporta para o Google Drive. O que vai para o Google é a troca de autorização OAuth e o arquivo de exportação criptografado, enviado para uma pasta chamada hoprs.",
+          "O hoprs só fala com o Google quando você clica em Conectar ou Desconectar, ou exporta para o Google Drive. O que vai para o Google é a troca de autorização OAuth, o arquivo de exportação criptografado (enviado para uma pasta chamada hoprs) e, ao desconectar, o pedido para revogar a autorização.",
           "A única permissão que o hoprs pede é drive.file: acesso aos arquivos que o próprio app criou. O hoprs não consegue ver, listar nem alterar mais nada no seu Drive.",
           "O arquivo é criptografado no seu computador, com uma senha que nunca sai dele. A autorização fica guardada no chaveiro do sistema, e o e-mail da conta é lido só para mostrar qual conta está conectada.",
-          "Desconectar no hoprs revoga a autorização e a apaga do chaveiro. Você também pode removê-la do lado do Google em https://myaccount.google.com/permissions.",
+          "Desconectar no hoprs apaga a autorização do chaveiro deste computador e pede ao Google que a revogue; se esse pedido falhar (sem internet, por exemplo), a autorização some deste computador, mas pode continuar valendo do lado do Google. Para removê-la do lado do Google com certeza, use https://myaccount.google.com/permissions.",
           "O uso que o hoprs faz das informações recebidas das APIs do Google segue a Google API Services User Data Policy, incluindo os requisitos de Uso Limitado (Limited Use). Em inglês: “hoprs's use of information received from Google APIs adheres to the Google API Services User Data Policy, including the Limited Use requirements.”",
         ],
       },
