@@ -341,7 +341,8 @@ async fn a_relay_that_floods_without_reading_is_closed() {
                 "{}\n",
                 json!({"call": id, "tool": "read_file", "args": args})
             );
-            match tokio::time::timeout(STEP, writer.write_all(line.as_bytes())).await {
+            // Shorter than the outer step, so a stall reports which call.
+            match tokio::time::timeout(STEP / 3, writer.write_all(line.as_bytes())).await {
                 Ok(Ok(())) => {}
                 Ok(Err(_)) => return Ok(id - 1),
                 Err(_) => return Err(format!("flood: stalled writing call {id} of {CALLS}")),
@@ -390,17 +391,27 @@ async fn a_fan_out_behind_a_large_answer_keeps_its_connection() {
     // A 1 MiB answer: about 1.4 MB of line, more than the socket holds unread.
     client.call(1, "read_file", fx.read_args()).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
-    // Forty calls meanwhile. The large answer keeps its turn until written: seven run,
-    // eight wait, the others are refused behind it.
+    // Forty calls meanwhile: some run, eight wait, the others are refused behind it.
+    // How many run depends on when the large answer frees its turn, which is when the
+    // system has taken it: on Unix it does not fit in the socket's buffer, so it keeps
+    // its turn and seven run; on Windows mio copies the whole line for a pending write
+    // and reports it written at once (`Write for &NamedPipe`), so its turn is free and
+    // eight run. Either way the refusals still queue behind that answer.
     let held = json!({"site": other.id.0, "path": FILE});
     const FAN: u64 = 40;
     for id in 2..=FAN + 1 {
         client.call(id, "read_file", held.clone()).await;
     }
     until("seven held calls run", || {
-        fx.host.calls(&other.id, FsOp::Read) == MAX_IN_FLIGHT - 1
+        fx.host.calls(&other.id, FsOp::Read) >= MAX_IN_FLIGHT - 1
     })
     .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let running = fx.host.calls(&other.id, FsOp::Read);
+    assert!(
+        [MAX_IN_FLIGHT - 1, MAX_IN_FLIGHT].contains(&running),
+        "{running} calls run"
+    );
 
     let large = client.recv().await.expect("the large answer");
     assert_eq!(reply_id(&large), 1);
@@ -408,7 +419,7 @@ async fn a_fan_out_behind_a_large_answer_keeps_its_connection() {
         large["blocks"][1].as_str().unwrap().len(),
         crate::agent::FILE_MAX
     );
-    let refusals = FAN as usize - (MAX_IN_FLIGHT - 1) - WAITING_MAX;
+    let refusals = FAN as usize - running - WAITING_MAX;
     let mut answered = Vec::new();
     for _ in 0..refusals {
         let reply = client.recv().await.expect("a refusal, not the end");
@@ -416,7 +427,7 @@ async fn a_fan_out_behind_a_large_answer_keeps_its_connection() {
         answered.push(reply_id(&reply));
     }
     hold.release();
-    for _ in 0..(MAX_IN_FLIGHT - 1 + WAITING_MAX) {
+    for _ in 0..(running + WAITING_MAX) {
         let reply = client.recv().await.expect("an answer, not the end");
         assert_eq!(reply["ok"], true, "{reply}");
         answered.push(reply_id(&reply));

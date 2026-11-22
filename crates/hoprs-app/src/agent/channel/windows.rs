@@ -328,7 +328,14 @@ pub(super) struct Cut(Option<OwnedHandle>);
 
 pub(super) fn cutter(stream: &Stream) -> Cut {
     match stream {
-        Stream::Server(pipe) => Cut(pipe.as_handle().try_clone_to_owned().ok()),
+        Stream::Server(pipe) => match pipe.as_handle().try_clone_to_owned() {
+            Ok(handle) => Cut(Some(handle)),
+            Err(err) => {
+                // Rare (out of handles): the connection then ends only when it is closed.
+                tracing::debug!(error = %err, "could not keep a handle to cut an agent's pipe");
+                Cut(None)
+            }
+        },
         Stream::Client(_) => Cut(None),
     }
 }

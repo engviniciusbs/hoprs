@@ -24,9 +24,15 @@
 //! connection. Cancels and the end of the input are always read.
 //!
 //! **Back-pressure.** Each relay has its own reader and writer: a relay that stops
-//! reading its replies holds up only itself (its calls wait for their replies to be
-//! written before their turn is free), never another relay or the service. Memory stays
-//! bounded: at most [`MAX_IN_FLIGHT`] running and [`WAITING_MAX`] waiting calls, and a
+//! reading its replies holds up only itself, never another relay or the service. A
+//! call's turn is free once its reply is written to the channel, that is taken by the
+//! system, not read by the relay: on Unix once the line is in the socket's buffer; on
+//! Windows once mio has taken the whole line into its own buffer for a pending write
+//! (its `Write for &NamedPipe` copies the line and reports it all written; the next
+//! write waits until that one completes). So per relay, beyond the system's own buffer,
+//! at most one line (on Windows) is held below the server, up to [`proto::MAX_LINE`],
+//! and the server holds at most [`MAX_IN_FLIGHT`] answers waiting for the writer, at
+//! most [`MAX_IN_FLIGHT`] running and [`WAITING_MAX`] waiting calls, and a
 //! relay that leaves [`REFUSALS_UNWRITTEN_MAX`] refusals unwritten (it does not read its
 //! lines at all) is closed; an agent that fans out many calls and reads at a normal
 //! pace only loses the calls beyond the queue, each with its error. A goodbye is given
@@ -414,8 +420,8 @@ struct Connection {
     /// is sent only by the task that still finds its id here (so a cancel that came
     /// first means nothing is sent).
     running: Arc<Mutex<HashMap<u64, AbortHandle>>>,
-    /// Calls started whose answer is not written yet (a cancelled one stops counting at
-    /// once).
+    /// Calls started whose answer the writer has not handed to the system yet (see the
+    /// module docs: not "read by the relay"); a cancelled one stops counting at once.
     busy: usize,
     /// Calls read and waiting for a turn, in order.
     waiting: VecDeque<(u64, String, Value)>,
@@ -423,7 +429,8 @@ struct Connection {
     refused: usize,
     tasks: JoinSet<()>,
     out: mpsc::UnboundedSender<Outgoing>,
-    /// One per answer written: whether it had a turn (now free) or was a refusal.
+    /// One per answer handed to the system: whether it had a turn (now free) or was a
+    /// refusal.
     written: mpsc::UnboundedReceiver<bool>,
     writer: JoinHandle<()>,
 }
