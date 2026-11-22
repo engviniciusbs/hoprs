@@ -10,7 +10,7 @@
 //! not connected, like a real attempt that failed or waits on a dialog.
 //!
 //! Holds: [`hold`](FakeHost::hold) stops one kind of filesystem call of a site, and
-//! [`hold_exec`](FakeHost::hold_exec) every command, until the [`Hold`] is released; the
+//! [`hold_exec`](FakeHost::hold_exec) every command, until the [`Hold`] is released or dropped; the
 //! hold tells when a call reached it and whether a held call was dropped (its caller went
 //! away). [`calls`](FakeHost::calls) counts the calls per site and kind, and
 //! [`streamed`](FakeHost::streamed) the bytes read from a site's files.
@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, Weak};
 use std::task::{Context, Poll};
 use std::time::SystemTime;
 
@@ -52,16 +52,20 @@ pub enum FsOp {
     Chmod,
 }
 
-/// Holds calls until [`release`](Self::release). Cheap to clone; clones are one hold.
+/// Holds calls until [`release`](Self::release), or until the last clone of the handle
+/// is dropped (a test that forgets to release never hangs). Cheap to clone; clones are
+/// one hold.
 #[derive(Clone)]
 pub struct Hold(Arc<HoldState>);
 
+/// The fake keeps only a `Weak` of this: dropping every [`Hold`] drops it, which closes
+/// `released` and lets the held calls through.
 struct HoldState {
     /// Calls that reached the hold.
     entered: watch::Sender<usize>,
     released: watch::Sender<bool>,
     /// Held calls whose future was dropped before the release.
-    dropped: AtomicUsize,
+    dropped: Arc<AtomicUsize>,
 }
 
 impl Hold {
@@ -69,8 +73,12 @@ impl Hold {
         Hold(Arc::new(HoldState {
             entered: watch::Sender::new(0),
             released: watch::Sender::new(false),
-            dropped: AtomicUsize::new(0),
+            dropped: Arc::default(),
         }))
+    }
+
+    fn weak(&self) -> Weak<HoldState> {
+        Arc::downgrade(&self.0)
     }
 
     /// Waits until a call reached the hold.
@@ -88,29 +96,36 @@ impl Hold {
     pub fn dropped(&self) -> bool {
         self.0.dropped.load(Ordering::SeqCst) > 0
     }
+}
 
-    /// Waits here until released; a drop before that is counted.
-    async fn pass(&self) {
-        struct Waiting<'a> {
-            hold: &'a HoldState,
-            done: bool,
-        }
-        impl Drop for Waiting<'_> {
-            fn drop(&mut self) {
-                if !self.done {
-                    self.hold.dropped.fetch_add(1, Ordering::SeqCst);
-                }
+/// Waits at `hold` (if the test still has it) until it is released or its handles are
+/// dropped; a call dropped before that is counted.
+async fn pass(hold: &Weak<HoldState>) {
+    struct Waiting {
+        dropped: Arc<AtomicUsize>,
+        done: bool,
+    }
+    impl Drop for Waiting {
+        fn drop(&mut self) {
+            if !self.done {
+                self.dropped.fetch_add(1, Ordering::SeqCst);
             }
         }
-        let mut released = self.0.released.subscribe();
-        self.0.entered.send_modify(|n| *n += 1);
-        let mut waiting = Waiting {
-            hold: &self.0,
-            done: false,
-        };
-        let _ = released.wait_for(|r| *r).await;
-        waiting.done = true;
     }
+    let Some(hold) = hold.upgrade() else {
+        return;
+    };
+    let mut released = hold.released.subscribe();
+    hold.entered.send_modify(|n| *n += 1);
+    let mut waiting = Waiting {
+        dropped: hold.dropped.clone(),
+        done: false,
+    };
+    // Only the test's handles keep the hold: once they are all dropped, `released`
+    // closes and the wait ends.
+    drop(hold);
+    let _ = released.wait_for(|r| *r).await;
+    waiting.done = true;
 }
 
 /// A site's session in the fake.
@@ -140,8 +155,11 @@ struct State {
     closed: Vec<SiteId>,
     exec_output: Result<ExecOutput>,
     execs: Vec<(SiteId, String, ExecLimits)>,
-    exec_hold: Option<Hold>,
-    holds: HashMap<(SiteId, FsOp), Hold>,
+    exec_hold: Option<Weak<HoldState>>,
+    holds: HashMap<(SiteId, FsOp), Weak<HoldState>>,
+    /// Why a tab's session that is not connected failed (see
+    /// [`FakeHost::disconnect_user`]).
+    tab_errors: HashMap<SiteId, Error>,
     calls: HashMap<(SiteId, FsOp), usize>,
     streamed: HashMap<SiteId, u64>,
     enqueued: Vec<(TransferSpec, ConflictPolicy)>,
@@ -174,7 +192,7 @@ impl Shared {
             state.holds.get(&(site.clone(), op)).cloned()
         };
         if let Some(hold) = hold {
-            hold.pass().await;
+            pass(&hold).await;
         }
     }
 
@@ -219,6 +237,7 @@ impl FakeHost {
                     execs: Vec::new(),
                     exec_hold: None,
                     holds: HashMap::new(),
+                    tab_errors: HashMap::new(),
                     calls: HashMap::new(),
                     streamed: HashMap::new(),
                     enqueued: Vec::new(),
@@ -318,7 +337,21 @@ impl FakeHost {
         if id_now == id {
             state.next_session += 1;
         }
+        state.tab_errors.remove(site);
         id_now
+    }
+
+    /// Gives the site a session a tab uses that is not connected (its connection ended
+    /// with `error`); returns it. An agent's `connect` answers `error` and leaves it
+    /// as it is, like the real host (the user retries a tab's session, not the agent).
+    pub fn disconnect_user(&self, site: &SiteId, error: Error) -> SessionId {
+        let id = self.connect_user(site);
+        let mut state = self.state();
+        if let Some(session) = state.sessions.get_mut(site) {
+            session.connected = false;
+        }
+        state.tab_errors.insert(site.clone(), error);
+        id
     }
 
     /// What the next commands return.
@@ -335,14 +368,14 @@ impl FakeHost {
     /// hold is released.
     pub fn hold_exec(&self) -> Hold {
         let hold = Hold::new();
-        self.state().exec_hold = Some(hold.clone());
+        self.state().exec_hold = Some(hold.weak());
         hold
     }
 
     /// Holds the site's filesystem calls of kind `op` until the hold is released.
     pub fn hold(&self, site: &SiteId, op: FsOp) -> Hold {
         let hold = Hold::new();
-        self.state().holds.insert((site.clone(), op), hold.clone());
+        self.state().holds.insert((site.clone(), op), hold.weak());
         hold
     }
 
@@ -415,6 +448,21 @@ impl AgentHost for FakeHost {
                 let error = Error::new(ErrorKind::NotFound, "No such site");
                 return Err(ConnectFailure { error });
             }
+            // A session the site has: a connected one is reused, whatever the plan; a
+            // tab's that is not connected answers its error and is not retried.
+            if let Some(session) = state.sessions.get(site).copied() {
+                if session.connected {
+                    return Ok(session.id);
+                }
+                if !session.agent_only {
+                    let error = state
+                        .tab_errors
+                        .get(site)
+                        .cloned()
+                        .unwrap_or_else(not_connected);
+                    return Err(ConnectFailure { error });
+                }
+            }
             let id = SessionId(state.next_session);
             let plan = state.plans.get(site).cloned();
             let session = state.sessions.entry(site.clone()).or_insert(FakeSession {
@@ -440,8 +488,10 @@ impl AgentHost for FakeHost {
         }
     }
 
+    /// Only a session can wait on a dialog: `false` without one, whatever was set.
     fn prompt_open(&self, site: &SiteId) -> bool {
-        self.state().prompt_open.get(site).copied().unwrap_or(false)
+        let state = self.state();
+        state.sessions.contains_key(site) && state.prompt_open.get(site).copied().unwrap_or(false)
     }
 
     async fn close_agent_session(&self, site: &SiteId) -> bool {
@@ -504,7 +554,7 @@ impl AgentHost for FakeHost {
             (state.exec_hold.clone(), state.exec_output.clone())
         };
         if let Some(hold) = hold {
-            hold.pass().await;
+            pass(&hold).await;
         }
         output
     }
@@ -717,6 +767,102 @@ mod tests {
         assert_eq!(text, b"hello");
         assert_eq!(host.calls(&ssh.id, FsOp::Read), 1);
         assert_eq!(host.streamed(&ssh.id), 5);
+    }
+
+    /// Where the real host reuses a connected session, the fake does too: a failing plan
+    /// applies only to a site without one.
+    #[tokio::test]
+    async fn fail_connect_spares_a_connected_session() {
+        let host = FakeHost::new();
+        let ssh = site("ssh", Protocol::Ssh);
+        host.add_site(ssh.clone());
+        let id = host.connect(&ssh.id).await.unwrap();
+        host.fail_connect(&ssh.id, Error::new(ErrorKind::Auth, "no"));
+        assert_eq!(host.connect(&ssh.id).await.unwrap(), id);
+        host.hang_connect(&ssh.id);
+        assert_eq!(host.connect(&ssh.id).await.unwrap(), id);
+        assert!(host.close_agent_session(&ssh.id).await);
+        // No session any more: the plan applies.
+        let hung = tokio::time::timeout(Duration::from_millis(50), host.connect(&ssh.id)).await;
+        assert!(hung.is_err());
+    }
+
+    /// A tab's session that is not connected: the agent gets its error, it is not
+    /// retried, and the agent side does not close it.
+    #[tokio::test]
+    async fn a_disconnected_tab_session_answers_its_error() {
+        let host = FakeHost::new();
+        let ftp = site("ftp", Protocol::Ftp);
+        host.add_site(ftp.clone());
+        let tab = host.disconnect_user(&ftp.id, Error::new(ErrorKind::Network, "gone"));
+        for _ in 0..2 {
+            let failure = host.connect(&ftp.id).await.unwrap_err();
+            assert_eq!(failure.error.kind, ErrorKind::Network);
+            assert_eq!(failure.error.message, "gone");
+        }
+        assert_eq!(host.connected(&ftp.id), None, "not retried");
+        assert!(host.agent_sites().is_empty());
+        assert!(!host.close_agent_session(&ftp.id).await);
+        // The user reconnects it: the agent reuses it.
+        assert_eq!(host.connect_user(&ftp.id), tab);
+        assert_eq!(host.connect(&ftp.id).await.unwrap(), tab);
+    }
+
+    /// Without a session nothing can wait on a dialog.
+    #[tokio::test]
+    async fn prompt_open_needs_a_session() {
+        let host = FakeHost::new();
+        let ssh = site("ssh", Protocol::Ssh);
+        host.add_site(ssh.clone());
+        host.set_prompt_open(&ssh.id, true);
+        assert!(!host.prompt_open(&ssh.id));
+        host.hang_connect(&ssh.id);
+        let hung = tokio::time::timeout(Duration::from_millis(50), host.connect(&ssh.id)).await;
+        assert!(hung.is_err());
+        assert!(host.prompt_open(&ssh.id), "the waiting session");
+        assert!(host.close_agent_session(&ssh.id).await);
+        assert!(!host.prompt_open(&ssh.id));
+    }
+
+    /// A test that drops its hold without releasing it lets the held calls go.
+    #[tokio::test]
+    async fn a_dropped_hold_releases_its_calls() {
+        let host = FakeHost::new();
+        let ssh = site("ssh", Protocol::Ssh);
+        host.add_site(ssh.clone());
+        let session = host.connect(&ssh.id).await.unwrap();
+        let remote = host.remote(session).unwrap();
+        let hold = host.hold(&ssh.id, FsOp::List);
+        let listing = tokio::spawn({
+            let remote = remote.clone();
+            async move { remote.list(&RemotePath::root()).await }
+        });
+        hold.entered().await;
+        drop(hold);
+        tokio::time::timeout(Duration::from_secs(1), listing)
+            .await
+            .expect("the held listing ends")
+            .unwrap()
+            .unwrap();
+        // And a later call does not wait.
+        remote.list(&RemotePath::root()).await.unwrap();
+
+        let limits = ExecLimits {
+            stream_bytes: 10,
+            timeout: Duration::from_secs(1),
+        };
+        let hold = host.hold_exec();
+        let run = tokio::spawn({
+            let host = host.clone();
+            async move { host.exec(session, "uptime".into(), limits).await }
+        });
+        hold.entered().await;
+        drop(hold);
+        tokio::time::timeout(Duration::from_secs(1), run)
+            .await
+            .expect("the held command ends")
+            .unwrap()
+            .unwrap();
     }
 
     /// Commands: recorded with their limits, held while asked, refused on FTP.

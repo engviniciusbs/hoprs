@@ -1817,6 +1817,96 @@ mod tests {
         assert!(f.manager.agent_sites().is_empty());
     }
 
+    /// A port nothing listens on: bound, then released (a refused connection, at once, on
+    /// every system).
+    fn closed_port() -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    /// The production path: an agent's connect of a site with no session starts one that
+    /// is the agent's, and its dialogs say so.
+    #[tokio::test]
+    async fn connect_for_agent_starts_an_agent_session() {
+        let f = fixture();
+        let mut site = Site::new("agent", "127.0.0.1", "u", Protocol::Ftp);
+        site.port = closed_port();
+        f.vault.upsert_site(site.clone()).await.unwrap();
+        let mut events = f.broker.take_events().unwrap();
+        let broker = f.broker.clone();
+        let flags = Arc::new(Mutex::new(Vec::new()));
+        let answer = tokio::spawn({
+            let flags = flags.clone();
+            async move {
+                while let Some(event) = events.recv().await {
+                    if let BrokerEvent::Request(r) = event {
+                        flags.lock().unwrap().push(r.by_agent);
+                        broker.answer(r.id, PromptAnswer::Cancel);
+                    }
+                }
+            }
+        });
+
+        let err = f
+            .manager
+            .connect_for_agent(site.id.clone())
+            .await
+            .unwrap_err();
+        let id = err.session.expect("the session is kept");
+        assert_eq!(f.manager.agent_sites(), std::slice::from_ref(&site.id));
+        // Its own connection's dialog (the password) is flagged...
+        let seen = flags.lock().unwrap().clone();
+        assert!(!seen.is_empty() && seen.iter().all(|b| *b), "{seen:?}");
+        // ...and so is any later one of the session.
+        flags.lock().unwrap().clear();
+        let prompter = f.manager.prompter(id).unwrap();
+        assert!(
+            hoprs_ssh::Prompter::password(&prompter, "u", "h")
+                .await
+                .is_none()
+        );
+        assert_eq!(*flags.lock().unwrap(), [true]);
+        answer.abort();
+    }
+
+    /// An agent never retries a tab's `Disconnected` session: it gets the error and the
+    /// tab is left as it is. An agent-only session is retried for the agent.
+    #[tokio::test]
+    async fn connect_for_agent_retries_only_its_own_session() {
+        for agent_only in [false, true] {
+            let f = fixture();
+            let site = saved_site(&f).await;
+            let conn = connected_link();
+            let id = if agent_only {
+                f.manager
+                    .attach_for_agent(site.id.clone(), conn.clone(), Arc::new(MemFs::new()))
+                    .await
+            } else {
+                f.manager
+                    .attach(site.id.clone(), conn.clone(), Arc::new(MemFs::new()))
+                    .await
+            }
+            .unwrap();
+            conn.state
+                .send_replace(ConnectionState::Disconnected(Error::new(
+                    ErrorKind::Network,
+                    "gone",
+                )));
+            let err = f
+                .manager
+                .connect_for_agent(site.id.clone())
+                .await
+                .unwrap_err();
+            assert_eq!(err.session, Some(id));
+            assert_eq!(err.error.kind, ErrorKind::Network);
+            assert_eq!(
+                f.manager.fake_reconnects(id),
+                usize::from(agent_only),
+                "agent_only {agent_only}"
+            );
+        }
+    }
+
     /// The agent side never closes a session a tab uses.
     #[tokio::test]
     async fn close_agent_session_spares_a_tab_session() {
