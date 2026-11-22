@@ -223,6 +223,8 @@ pub struct App {
     pub export_dir: Option<PathBuf>,
     /// This build has an OAuth client: the export screen offers Google Drive.
     pub drive_available: bool,
+    /// The running executable, for the registration command of Settings › Agents (MCP).
+    pub agent_exe: Option<PathBuf>,
     /// The Google Drive connection, as known for this session ([`export`]).
     pub drive_link: export::DriveLink,
     /// The last Google Drive step that failed outside an export (reading the keyring,
@@ -717,6 +719,8 @@ pub enum Effect {
     SetWorkers(usize),
     /// Keepalive (seconds) of the next SSH and FTP connections.
     SetKeepalive(u64),
+    /// The master switch for agents, told to the backend.
+    SetAgents(bool),
     /// Checks whether the typed export file exists; back as
     /// [`ExportMsg::TargetChecked`].
     CheckExportTarget(PathBuf),
@@ -917,6 +921,7 @@ impl App {
             export: None,
             export_dir: dirs::document_dir().or_else(dirs::home_dir),
             drive_available: crate::drive::client_configured(),
+            agent_exe: std::env::current_exe().ok(),
             drive_link: export::DriveLink::Unknown,
             drive_error: None,
             drive_unreadable: false,

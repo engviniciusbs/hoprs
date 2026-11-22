@@ -447,6 +447,27 @@ pub fn agent_access_all_hint_ssh() -> &'static str {
 pub fn agent_access_all_hint_ftp() -> &'static str {
     tr("agent-access-all-hint-ftp")
 }
+pub fn settings_agents_description() -> &'static str {
+    tr("settings-agents-description")
+}
+pub fn agents_allow() -> &'static str {
+    tr("agents-allow")
+}
+pub fn agents_allow_hint() -> &'static str {
+    tr("agents-allow-hint")
+}
+pub fn agents_claude_code() -> &'static str {
+    tr("agents-claude-code")
+}
+pub fn agents_other_clients() -> &'static str {
+    tr("agents-other-clients")
+}
+pub fn agents_levels(read: usize, all: usize) -> String {
+    tr_args(
+        "agents-levels",
+        &[("read", read.into()), ("all", all.into())],
+    )
+}
 pub fn local_dir() -> &'static str {
     tr("local-dir")
 }

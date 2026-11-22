@@ -261,6 +261,7 @@ pub fn run(
         Effect::SetPolicy(policy) => {
             Task::future(async move { backend.set_policy(policy).await }).discard()
         }
+        Effect::SetAgents(on) => Task::future(set_agents(backend, on)).discard(),
         Effect::SetWorkers(workers) => {
             backend.set_workers(workers);
             Task::none()
@@ -649,6 +650,11 @@ pub async fn restore_backup(
     mode: ImportMode,
 ) -> Message {
     Message::BackupRestored(backend.restore_backup(path, password, mode).await)
+}
+
+/// Tells the backend the master switch for agents.
+pub async fn set_agents(backend: Arc<dyn BackendApi>, on: bool) {
+    backend.set_agents_enabled(on).await;
 }
 
 pub async fn save_settings(backend: Arc<dyn BackendApi>, settings: Settings) -> Message {

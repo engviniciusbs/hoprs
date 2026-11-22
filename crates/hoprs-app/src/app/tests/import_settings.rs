@@ -956,3 +956,52 @@ async fn export_title_per_scope() {
         None
     );
 }
+
+/// The master switch: it is stored and saved, and the backend is told once per change.
+#[tokio::test]
+async fn agents_switch_saves_and_reaches_the_backend() {
+    let fake = Arc::new(FakeBackend::new());
+    let backend: Arc<dyn BackendApi> = fake.clone();
+    let mut app = App::new();
+    assert!(!app.settings.agents_enabled);
+
+    let effects = settings(&mut app, SettingsMsg::Agents(true));
+    assert!(app.settings.agents_enabled);
+    assert!(
+        matches!(
+            &effects[..],
+            [Effect::SetAgents(true), Effect::SaveSettings(saved)] if saved.agents_enabled
+        ),
+        "{effects:?}"
+    );
+    // The same value again: nothing.
+    assert!(settings(&mut app, SettingsMsg::Agents(true)).is_empty());
+
+    // The effect's work reaches the fake's switch.
+    effects::set_agents(backend.clone(), true).await;
+    assert_eq!(fake.agent_switches(), [true]);
+    let runs = effects::CompareRuns::default();
+    let _ = effects::run(backend.clone(), &runs, Effect::SetAgents(true));
+
+    let effects = settings(&mut app, SettingsMsg::Agents(false));
+    assert!(!app.settings.agents_enabled);
+    assert!(matches!(effects.first(), Some(Effect::SetAgents(false))));
+}
+
+/// The two Copy buttons put the registration command and the JSON on the clipboard.
+#[test]
+fn copy_buttons_write_the_clipboard() {
+    use crate::ui::settings::{agent_command, agent_json};
+    let mut app = App::new();
+    app.agent_exe = Some(PathBuf::from("/opt/my apps/hoprs"));
+    let effects = settings(&mut app, SettingsMsg::CopyAgentCommand);
+    let [Effect::WriteClipboard(text)] = &effects[..] else {
+        panic!("{effects:?}");
+    };
+    assert_eq!(text.0, agent_command(app.agent_exe.as_deref()));
+    let effects = settings(&mut app, SettingsMsg::CopyAgentJson);
+    let [Effect::WriteClipboard(text)] = &effects[..] else {
+        panic!("{effects:?}");
+    };
+    assert_eq!(text.0, agent_json(app.agent_exe.as_deref()));
+}

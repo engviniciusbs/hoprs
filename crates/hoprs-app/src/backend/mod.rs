@@ -320,6 +320,8 @@ pub trait BackendApi: Send + Sync {
     fn set_workers(&self, workers: usize);
     /// Keepalive (seconds, `10..=300`) of the SSH and FTP connections made from now on.
     fn set_keepalive(&self, secs: u64);
+    /// The master switch of Settings › Agents (MCP): whether agents may connect.
+    async fn set_agents_enabled(&self, on: bool);
 
     /// The latest stable release (the update check). `update-dev-build` in a debug build
     /// without `HOPRS_UPDATE_URL` (see [`http::api_url`]).
@@ -544,6 +546,9 @@ pub struct Backend {
     downloading: Downloading,
     /// The Google Drive connection (its keyring entry in the app secret store).
     drive: Arc<Drive>,
+    /// The master switch for agents, started from `settings.toml`; the agent channel
+    /// follows it.
+    agents: tokio::sync::watch::Sender<bool>,
 }
 
 impl Backend {
@@ -573,6 +578,7 @@ impl Backend {
                 ..EngineConfig::default()
             },
         );
+        let agents = tokio::sync::watch::Sender::new(loaded.settings.agents_enabled);
         config.sessions.workers = loaded.settings.workers_per_site;
         config.sessions.keepalive = std::time::Duration::from_secs(loaded.settings.keepalive_secs);
         let broker = PromptBroker::new(vault.clone());
@@ -596,6 +602,7 @@ impl Backend {
             update: UpdateClient::default(),
             downloading: Downloading::default(),
             drive: Arc::new(Drive::new(Arc::new(MemoryStore::new()))),
+            agents,
         })
     }
 
@@ -1043,6 +1050,10 @@ impl BackendApi for Backend {
         self.engine.set_policy(policy).await;
     }
 
+    async fn set_agents_enabled(&self, on: bool) {
+        self.agents.send_replace(on);
+    }
+
     fn set_workers(&self, workers: usize) {
         self.sessions.set_workers(settings::clamp_workers(workers));
     }
@@ -1189,6 +1200,26 @@ mod tests {
             recovered_dir: dir.join("recovered"),
         };
         Backend::open(config, Arc::new(MemoryStore::new())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn agents_switch_starts_from_the_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = dir.path().join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(
+            profiles.join(settings::FILE_NAME),
+            "agents_enabled = true\n",
+        )
+        .unwrap();
+        let backend = open(dir.path());
+        assert!(*backend.agents.borrow());
+        backend.set_agents_enabled(false).await;
+        assert!(!*backend.agents.borrow());
+
+        // No file: off.
+        let other = tempfile::tempdir().unwrap();
+        assert!(!*open(other.path()).agents.borrow());
     }
 
     /// A debug build without `HOPRS_UPDATE_URL` never reaches the network: both update

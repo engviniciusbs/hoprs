@@ -130,6 +130,8 @@ pub enum BackupCall {
     SetPolicy(ConflictPolicy),
     SetWorkers(usize),
     SetKeepalive(u64),
+    /// `set_agents_enabled`.
+    SetAgents(bool),
 }
 
 /// A recorded backend call, in [`FakeBackend::calls`].
@@ -387,6 +389,17 @@ impl FakeBackend {
     /// The import, backup and settings calls, in order.
     pub fn backup_calls(&self) -> Vec<BackupCall> {
         self.state().backup_calls.clone()
+    }
+
+    /// The values `set_agents_enabled` was called with, in order.
+    pub fn agent_switches(&self) -> Vec<bool> {
+        self.backup_calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                BackupCall::SetAgents(on) => Some(on),
+                _ => None,
+            })
+            .collect()
     }
 
     fn record(&self, call: BackupCall) {
@@ -1499,6 +1512,10 @@ impl BackendApi for FakeBackend {
 
     fn set_workers(&self, workers: usize) {
         self.record(BackupCall::SetWorkers(workers));
+    }
+
+    async fn set_agents_enabled(&self, on: bool) {
+        self.record(BackupCall::SetAgents(on));
     }
 
     fn set_keepalive(&self, secs: u64) {
