@@ -16,14 +16,10 @@ pub const BASE_URL_ENV: &str = "HOPRS_DRIVE_URL";
 /// The only scope hoprs asks for: files this app created.
 pub const SCOPE: &str = "https://www.googleapis.com/auth/drive.file";
 /// The folder the exports go to.
-// TODO(task 9): the upload looks the folder up; remove this allow then.
-#[allow(dead_code)]
 pub const FOLDER: &str = "hoprs";
 
 /// The OAuth client of this build.
 #[derive(Clone, PartialEq, Eq)]
-// TODO(task 9 or 10): the connect flow reads these fields; remove this allow then.
-#[allow(dead_code)]
 pub struct OAuthClient {
     pub id: String,
     pub secret: String,

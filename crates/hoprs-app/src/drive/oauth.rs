@@ -33,8 +33,6 @@ pub(super) fn connect_failed(cause: impl Into<String>) -> Error {
 }
 
 /// `N` random bytes from the TLS library's system generator.
-// TODO(task 9 or 10): the connect flow draws the verifier and the state; remove this allow then.
-#[allow(dead_code)]
 pub fn random<const N: usize>() -> Result<[u8; N], Error> {
     let mut bytes = [0_u8; N];
     rustls::crypto::aws_lc_rs::default_provider()

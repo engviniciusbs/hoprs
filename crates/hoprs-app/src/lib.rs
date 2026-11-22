@@ -20,6 +20,8 @@ mod probe;
 mod renderer;
 mod settings;
 mod terminal;
+#[cfg(test)]
+pub(crate) mod test_https;
 mod ui;
 mod update;
 

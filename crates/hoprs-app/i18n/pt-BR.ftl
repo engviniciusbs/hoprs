@@ -855,6 +855,8 @@ error-drive-connect-cancelled = Conexão com o Google Drive cancelada
 error-drive-connect-timed-out = O navegador não respondeu em 5 minutos
 error-drive-connect-denied = O acesso ao Google Drive não foi concedido
 error-drive-connect-failed = Não foi possível conectar ao Google Drive
+error-drive-not-connected = Não conectado ao Google Drive
+error-drive-upload-failed = Não foi possível enviar para o Google Drive
 
 # The folder compare panel (between the panes and the queue).
 compare-button = Comparar

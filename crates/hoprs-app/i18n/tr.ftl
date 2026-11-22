@@ -811,6 +811,8 @@ error-drive-connect-cancelled = Google Drive bağlantısı iptal edildi
 error-drive-connect-timed-out = Tarayıcı 5 dakika içinde yanıt vermedi
 error-drive-connect-denied = Google Drive erişimi verilmedi
 error-drive-connect-failed = Google Drive'a bağlanılamadı
+error-drive-not-connected = Google Drive'a bağlı değil
+error-drive-upload-failed = Google Drive'a yüklenemedi
 
 # Klasör karşılaştırma paneli (paneller ile kuyruk arasında).
 compare-button = Karşılaştır
