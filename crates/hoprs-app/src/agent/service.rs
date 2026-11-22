@@ -34,10 +34,16 @@
 //! its time limit starts when its command does. The command line is logged (it is the
 //! record the user asked for, made one line like every other), its output never is.
 //!
+//! **Transfers.** `download` and `upload` go through the transfer queue the user sees,
+//! never under a policy that asks, after their local path passed the protected check;
+//! the call waits about a minute for the end (see `transfers`). A call cancelled meanwhile
+//! is logged; its transfer keeps running.
+//!
 //! All the work goes through [`AgentHost`], and no std lock is held across an await (the
 //! command turn is a tokio lock, held for the command's run).
 
 mod files;
+mod transfers;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -49,6 +55,7 @@ use futures_util::future::{BoxFuture, Shared};
 use hoprs_core::{AgentAccess, Error, ErrorKind, PathError, Protocol, RemotePath, Site, SiteId};
 use hoprs_remote::RemoteFs;
 use hoprs_ssh::{ExecEnd, ExecLimits};
+use hoprs_transfer::Direction;
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -56,6 +63,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use super::host::AgentHost;
+use super::paths::engine_path;
 use super::proto::Reply;
 use super::tools::{self, Need, ToolSpec};
 use super::{
@@ -343,6 +351,24 @@ struct RunArgs {
     timeout_seconds: Option<u64>,
 }
 
+/// `download` and `upload`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransferArgs {
+    site: String,
+    remote_path: String,
+    local_path: String,
+    #[serde(default)]
+    overwrite: bool,
+}
+
+/// `transfer_status`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StatusArgs {
+    transfer: u64,
+}
+
 /// A call's arguments, checked against its tool's schema.
 enum Args {
     ListSites,
@@ -355,11 +381,9 @@ enum Args {
     Chmod(ChmodArgs),
     Delete(DeleteArgs),
     Run(RunArgs),
-    /// A tool this version does not run yet (transfers): its access is checked all the
-    /// same.
-    Later {
-        site: Option<String>,
-    },
+    Download(TransferArgs),
+    Upload(TransferArgs),
+    Status(StatusArgs),
 }
 
 impl Args {
@@ -376,16 +400,17 @@ impl Args {
             "set_permissions" => Args::Chmod(typed(spec, map)?),
             "delete" => Args::Delete(typed(spec, map)?),
             "run_command" => Args::Run(typed(spec, map)?),
-            _ => Args::Later {
-                site: map.get("site").and_then(Value::as_str).map(str::to_owned),
-            },
+            "download" => Args::Download(typed(spec, map)?),
+            "upload" => Args::Upload(typed(spec, map)?),
+            "transfer_status" => Args::Status(typed(spec, map)?),
+            other => return Err(format!("Unknown tool: {other}")),
         })
     }
 
     /// The `site` argument, for the tools that take one.
     fn site(&self) -> Option<&str> {
         match self {
-            Args::ListSites => None,
+            Args::ListSites | Args::Status(_) => None,
             Args::List(a) => Some(&a.site),
             Args::Stat(a) | Args::Mkdir(a) => Some(&a.site),
             Args::Read(a) => Some(&a.site),
@@ -394,7 +419,7 @@ impl Args {
             Args::Chmod(a) => Some(&a.site),
             Args::Delete(a) => Some(&a.site),
             Args::Run(a) => Some(&a.site),
-            Args::Later { site } => site.as_deref(),
+            Args::Download(a) | Args::Upload(a) => Some(&a.site),
         }
     }
 }
@@ -439,7 +464,7 @@ enum Job {
         command: String,
         timeout: Duration,
     },
-    Later,
+    Transfer(transfers::TransferJob),
 }
 
 impl Job {
@@ -526,12 +551,15 @@ impl Job {
                     timeout,
                 }
             }
-            Args::ListSites | Args::Later { .. } => Job::Later,
+            Args::Download(a) => Job::Transfer(transfer_job(site, Direction::Download, a)?),
+            Args::Upload(a) => Job::Transfer(transfer_job(site, Direction::Upload, a)?),
+            // Tools without a site never come here.
+            Args::ListSites | Args::Status(_) => return Err(unavailable()),
         })
     }
 
     /// What the call does, for its log line (never content).
-    fn action(&self, spec: &ToolSpec) -> String {
+    fn action(&self) -> String {
         match self {
             Job::List { path, .. } => format!("listed {}", capped(path.as_str())),
             Job::Stat { path } => format!("described {}", capped(path.as_str())),
@@ -553,7 +581,18 @@ impl Job {
             ),
             Job::Delete { path, .. } => format!("deleted {}", capped(path.as_str())),
             Job::Run { command, .. } => format!("ran `{}`", capped(command)),
-            Job::Later => spec.name.to_owned(),
+            Job::Transfer(job) => match job.direction {
+                Direction::Download => format!(
+                    "downloaded {} to {}",
+                    capped(job.remote.as_str()),
+                    capped(&job.given)
+                ),
+                Direction::Upload => format!(
+                    "uploaded {} to {}",
+                    capped(&job.given),
+                    capped(job.remote.as_str())
+                ),
+            },
         }
     }
 }
@@ -725,11 +764,11 @@ impl Service {
         };
         match (site, args) {
             (None, Args::ListSites) => self.list_sites().await,
+            (None, Args::Status(a)) => self.transfer_status(a.transfer).await,
             (Some(site), args) => self.on_site(spec, &site, args).await,
-            (None, _) => (
-                Reply::Err(not_yet(spec)),
-                format!("refused {}: not available in this version", spec.name),
-            ),
+            // A tool with a site whose table entry needs none: refused like a site that
+            // is not open.
+            (None, _) => refused(spec.name, unavailable()),
         }
     }
 
@@ -769,7 +808,7 @@ impl Service {
             Err(refusal) => return refused(spec.name, refusal),
         };
         let mut running = Running::start(self, &site.id);
-        let done = format!("{} on \"{}\"", job.action(spec), site.name);
+        let done = format!("{} on \"{}\"", job.action(), site.name);
         running.pending = Some(done.clone());
         let result = match job {
             Job::List {
@@ -799,7 +838,7 @@ impl Service {
             Job::Chmod { path, mode } => self.set_permissions(site, &path, mode).await,
             Job::Delete { path, recursive } => self.delete(site, &path, recursive).await,
             Job::Run { command, timeout } => self.run_command(site, &command, timeout).await,
-            Job::Later => Err(Failure::new(not_yet(spec), "not available in this version")),
+            Job::Transfer(job) => self.transfer(site, &job).await,
         };
         // It ended: the caller writes its line.
         running.pending = None;
@@ -1077,8 +1116,28 @@ fn refused(tool: &str, refusal: Refusal) -> (Reply, String) {
     )
 }
 
-fn not_yet(spec: &ToolSpec) -> String {
-    format!("{} is not available in this version of hoprs.", spec.name)
+/// A `download` or `upload` with its paths checked: the remote one as every remote path,
+/// the local one by `engine_path` (its sentence is the refusal).
+fn transfer_job(
+    site: &Site,
+    direction: Direction,
+    a: TransferArgs,
+) -> Result<transfers::TransferJob, Refusal> {
+    let remote = remote_path(site, "remote_path", &a.remote_path).map_err(|text| Refusal {
+        text,
+        reason: "bad arguments",
+    })?;
+    let local = engine_path(std::path::Path::new(&a.local_path)).map_err(|text| Refusal {
+        text: text.to_owned(),
+        reason: "bad local path",
+    })?;
+    Ok(transfers::TransferJob {
+        direction,
+        remote,
+        local,
+        given: a.local_path,
+        overwrite: a.overwrite,
+    })
 }
 
 /// The arguments as an object that fits the tool's schema: no unknown argument, every

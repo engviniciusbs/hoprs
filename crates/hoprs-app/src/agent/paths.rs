@@ -87,9 +87,8 @@ impl Protected {
     /// call, so a root created or linked since counts (about a hundred system calls with
     /// ten roots; for many checks in a row, [`prepare`](Self::prepare) once). Touches the
     /// disk: run it on the blocking pool.
-    // The engine's guard checks through `prepare`; the service's own checks come in Task 11.
-    // TODO(Task 11): remove
-    #[allow(dead_code)]
+    // The engine's guard checks through `prepare`; the transfer tools call this once per
+    // call.
     pub fn check(&self, path: &Path, tree: bool) -> Result<(), PathBuf> {
         self.prepare().check(path, tree)
     }
@@ -462,8 +461,6 @@ pub fn fixed_roots(own: &[PathBuf], known_hosts: &Path) -> Vec<PathBuf> {
 /// drive, a network share and a device path are out of reach) and every name one Windows
 /// can hold. The `Err` is the English sentence the tool answers. [`local_os_path`] is
 /// the inverse, for the checks.
-// TODO(Task 11): remove
-#[allow(dead_code)]
 pub fn engine_path(path: &Path) -> Result<RemotePath, &'static str> {
     let mut comps = path.components();
     #[cfg(windows)]

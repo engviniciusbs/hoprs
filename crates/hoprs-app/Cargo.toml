@@ -17,7 +17,7 @@ iced = { workspace = true, features = ["image-without-codecs"] }
 # laid out and drawn without a window.
 iced_runtime = "0.14"
 iced_tiny_skia = "0.14"
-tokio = { workspace = true, features = ["rt", "sync", "macros", "time", "io-util"] }
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time", "io-util", "fs"] }
 tokio-util = { workspace = true }
 futures-util = { workspace = true }
 async-trait = { workspace = true }

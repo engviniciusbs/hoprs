@@ -19,6 +19,11 @@
 //! [`streamed`](FakeHost::streamed) the bytes read from a site's files.
 //! [`fail`](FakeHost::fail) makes one kind of call of a site fail as a real backend
 //! would (an FTP server without `SITE CHMOD`, a connection cut during a write).
+//!
+//! Transfers: [`enqueue`](AgentHost::enqueue) records the spec and policy and, like the
+//! engine, adds a queued root of origin Agent to the queue; nothing runs it.
+//! [`set_state`](FakeHost::set_state) moves an item and sends the engine's event for it,
+//! [`set_transfers`](FakeHost::set_transfers) replaces the whole queue.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -32,7 +37,9 @@ use async_trait::async_trait;
 use hoprs_core::{Error, ErrorKind, Protocol, RemoteEntry, RemotePath, Result, Site, SiteId};
 use hoprs_remote::{BoxAsyncRead, BoxAsyncWrite, MemFs, RemoteFs};
 use hoprs_ssh::{ExecEnd, ExecLimits, ExecOutput};
-use hoprs_transfer::{ConflictPolicy, Event, TransferId, TransferItem, TransferSpec};
+use hoprs_transfer::{
+    ConflictPolicy, Event, EventKind, Origin, TransferId, TransferItem, TransferSpec, TransferState,
+};
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{broadcast, watch};
 
@@ -185,14 +192,14 @@ struct State {
     enqueued: Vec<(TransferSpec, ConflictPolicy)>,
     next_transfer: i64,
     transfers: Vec<TransferItem>,
+    /// The `seq` of the last engine event sent.
+    seq: u64,
     protected: Vec<PathBuf>,
 }
 
 /// The in-memory [`AgentHost`] (see the module docs).
 pub struct FakeHost {
     shared: Arc<Shared>,
-    // TODO(Task 11): remove
-    #[allow(dead_code)]
     events: broadcast::Sender<Event>,
 }
 
@@ -271,6 +278,7 @@ impl FakeHost {
                     enqueued: Vec::new(),
                     next_transfer: 1,
                     transfers: Vec::new(),
+                    seq: 0,
                     protected: Vec::new(),
                 }),
             }),
@@ -450,8 +458,6 @@ impl FakeHost {
     }
 
     /// The transfers enqueued so far, with their policies.
-    // TODO(Task 11): remove
-    #[allow(dead_code)]
     pub fn enqueued(&self) -> Vec<(TransferSpec, ConflictPolicy)> {
         self.state().enqueued.clone()
     }
@@ -461,16 +467,32 @@ impl FakeHost {
         self.state().transfers = items;
     }
 
-    /// Sends an engine event to the receivers of `transfer_events`.
-    // TODO(Task 11): remove
-    #[allow(dead_code)]
-    pub fn send_event(&self, event: Event) {
-        let _ = self.events.send(event);
+    /// Sends an engine event to the receivers of `transfer_events`, numbered after the
+    /// last one.
+    pub fn send_event(&self, kind: EventKind) {
+        let seq = {
+            let mut state = self.state();
+            state.seq += 1;
+            state.seq
+        };
+        let _ = self.events.send(Event { seq, kind });
+    }
+
+    /// Puts the queue's item `id` in `state` and sends the engine's event for it.
+    pub fn set_state(&self, id: TransferId, state: TransferState) {
+        {
+            let mut queue = self.state();
+            let item = queue
+                .transfers
+                .iter_mut()
+                .find(|item| item.id == id)
+                .unwrap_or_else(|| panic!("no transfer {id:?} in the fake's queue"));
+            item.state = state.clone();
+        }
+        self.send_event(EventKind::StateChanged { id, state });
     }
 
     /// The protected roots `protected` answers.
-    // TODO(Task 11): remove
-    #[allow(dead_code)]
     pub fn set_protected(&self, roots: Vec<PathBuf>) {
         self.state().protected = roots;
     }
@@ -632,9 +654,20 @@ impl AgentHost for FakeHost {
 
     async fn enqueue(&self, spec: TransferSpec, policy: ConflictPolicy) -> Result<TransferId> {
         let mut state = self.state();
-        state.enqueued.push((spec, policy));
+        state.enqueued.push((spec.clone(), policy));
         let id = TransferId(state.next_transfer);
         state.next_transfer += 1;
+        state.transfers.push(TransferItem {
+            id,
+            parent: None,
+            spec,
+            is_dir: None,
+            size: None,
+            bytes_done: 0,
+            state: TransferState::Queued,
+            origin: Origin::Agent,
+            tree_policy: Some(policy),
+        });
         Ok(id)
     }
 

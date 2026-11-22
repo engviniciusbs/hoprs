@@ -11,10 +11,12 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use super::*;
+use crate::agent::paths::engine_path;
 use crate::agent::testing::{FakeHost, FsOp};
 use crate::agent::tools::{self, Need};
 use crate::agent::{
-    HOST_KEY_CHANGED, SITE_UNAVAILABLE, TURNED_OFF, WAITING_FOR_USER, read_only, ssh_only,
+    HOST_KEY_CHANGED, NO_SUCH_TRANSFER, SITE_UNAVAILABLE, TURNED_OFF, WAITING_FOR_USER, protected,
+    read_only, ssh_only,
 };
 
 const EPOCH: SystemTime = SystemTime::UNIX_EPOCH;
@@ -210,7 +212,8 @@ fn capture_logs() -> (LogBuf, LogCapture) {
 }
 
 /// The access step of every tool that takes a site, at every level, on SSH and FTP.
-#[tokio::test]
+/// (Paused time: a transfer that passes waits its minute.)
+#[tokio::test(start_paused = true)]
 async fn access_matrix() {
     let fx = fixture();
     for spec in sited_tools() {
@@ -1183,11 +1186,15 @@ async fn admission_follows_the_need_not_the_arguments() {
             .service
             .run_spec(&spec, json!({"remote_path": "/a", "local_path": "/b"}))
             .await;
-        assert_eq!(err(reply), SITE_UNAVAILABLE, "{need:?}");
-        assert_eq!(line, "refused download: site not available");
+        // Every tool's arguments are now typed, and a sited tool's type wants `site`:
+        // the call is refused before any site is looked at, never let through.
+        assert!(matches!(reply, Reply::Err(_)), "{need:?}");
+        assert!(line.starts_with("refused download: "), "{line}");
     }
     assert!(logs.agent_lines().is_empty(), "run_spec does not log");
     assert!(fx.host.agent_sites().is_empty());
+    assert!(fx.host.enqueued().is_empty());
+    assert_eq!(fx.host.connects(&fx.ssh.id), 0);
 }
 
 /// `/proc` files say size 0 over SFTP: they are read for what they hold.
@@ -2278,4 +2285,605 @@ async fn a_long_command_keeps_its_outcome_in_the_log() {
     assert!(line.len() < 1024, "{}", line.len());
     // The host got the whole command.
     assert_eq!(fx.host.execs().last().unwrap().1, command);
+}
+
+// ---- Task 11: transfers ----
+
+/// A tempdir the engine's local side can name: on Windows the temporary folder may be
+/// on another drive than the one `LocalFs::new("/")` reaches.
+fn local_dir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    if engine_path(dir.path()).is_ok() {
+        return dir;
+    }
+    tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap()
+}
+
+/// `rel` (written with `/`) under `dir`, built with `Path::join`.
+fn at(dir: &tempfile::TempDir, rel: &str) -> PathBuf {
+    rel.split('/')
+        .filter(|s| !s.is_empty())
+        .fold(dir.path().to_path_buf(), |path, comp| path.join(comp))
+}
+
+fn text_of(path: &std::path::Path) -> String {
+    path.to_str().expect("a Unicode path").to_owned()
+}
+
+/// `conf/hoprs/sites.toml`, `home/.ssh/known_hosts`, `keys/deploy.pem`,
+/// `keys/other.pem` and `work/n.txt`, with `conf/hoprs`, `home/.ssh` and
+/// `keys/deploy.pem` protected in the fake.
+fn protected_tree(fx: &Fx) -> tempfile::TempDir {
+    let dir = local_dir();
+    for folder in ["conf/hoprs", "home/.ssh", "keys", "work"] {
+        std::fs::create_dir_all(at(&dir, folder)).unwrap();
+    }
+    for file in [
+        "conf/hoprs/sites.toml",
+        "home/.ssh/known_hosts",
+        "keys/deploy.pem",
+        "keys/other.pem",
+        "work/n.txt",
+    ] {
+        std::fs::write(at(&dir, file), b"x").unwrap();
+    }
+    fx.host.set_protected(vec![
+        at(&dir, "conf/hoprs"),
+        at(&dir, "home/.ssh"),
+        at(&dir, "keys/deploy.pem"),
+    ]);
+    dir
+}
+
+fn download_args(site: &Site, remote: &str, local: &std::path::Path) -> Value {
+    on(
+        site,
+        json!({"remote_path": remote, "local_path": text_of(local)}),
+    )
+}
+
+fn upload_args(site: &Site, local: &std::path::Path, remote: &str) -> Value {
+    on(
+        site,
+        json!({"local_path": text_of(local), "remote_path": remote}),
+    )
+}
+
+/// The call, running on its own task.
+fn spawn_call(fx: &Fx, tool: &'static str, args: Value) -> tokio::task::JoinHandle<Reply> {
+    let service = fx.service.clone();
+    tokio::spawn(async move { service.call(tool, args).await })
+}
+
+/// The task's reply, within 30 s (of paused time too): a call that waits longer fails
+/// its test instead of hanging it.
+async fn joined(task: tokio::task::JoinHandle<Reply>) -> Reply {
+    tokio::time::timeout(Duration::from_secs(30), task)
+        .await
+        .expect("the call answers within 30 s")
+        .unwrap()
+}
+
+/// Waits (1 ms steps, at most 10 s) until `n` transfers are enqueued.
+async fn until_enqueued(fx: &Fx, n: usize) {
+    for _ in 0..10_000 {
+        if fx.host.enqueued().len() >= n {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("{n} transfers were never enqueued");
+}
+
+/// The fake's item `id` became a file of `bytes` bytes, done.
+async fn finish_file(fx: &Fx, id: TransferId, bytes: u64) {
+    let mut items = fx.host.transfers().await;
+    let item = items.iter_mut().find(|item| item.id == id).unwrap();
+    item.is_dir = Some(false);
+    item.size = Some(bytes);
+    item.bytes_done = bytes;
+    fx.host.set_transfers(items);
+    fx.host.set_state(id, TransferState::Done);
+}
+
+/// Both tools enqueue one item of origin Agent (the host's `enqueue`) under Skip
+/// without `overwrite` and Overwrite with it, never the user's default; the spec's local
+/// side is `engine_path` of the argument.
+#[tokio::test(start_paused = true)]
+async fn download_and_upload_enqueue_with_their_policy() {
+    let fx = fixture();
+    let dir = local_dir();
+    let landing = at(&dir, "a.txt");
+    let source = at(&dir, "up.txt");
+    std::fs::write(&source, b"up").unwrap();
+    let mut args = Vec::new();
+    for overwrite in [None, Some(false), Some(true)] {
+        let mut down = download_args(&fx.ro, "/var/www/a.txt", &landing);
+        let mut up = upload_args(&fx.ssh, &source, "/var/www/up.txt");
+        if let Some(overwrite) = overwrite {
+            down["overwrite"] = json!(overwrite);
+            up["overwrite"] = json!(overwrite);
+        }
+        args.push(("download", down));
+        args.push(("upload", up));
+    }
+    for (n, (tool, args)) in args.into_iter().enumerate() {
+        let reply = head(fx.call(tool, args).await);
+        assert_eq!(reply["transfer"], json!(n + 1), "{reply}");
+        assert_eq!(reply["state"], "running", "{reply}");
+    }
+    let download = TransferSpec {
+        site: fx.ro.id.clone(),
+        direction: Direction::Download,
+        local: engine_path(&landing).unwrap(),
+        remote: RemotePath::new("/var/www/a.txt").unwrap(),
+    };
+    let upload = TransferSpec {
+        site: fx.ssh.id.clone(),
+        direction: Direction::Upload,
+        local: engine_path(&source).unwrap(),
+        remote: RemotePath::new("/var/www/up.txt").unwrap(),
+    };
+    use hoprs_transfer::ConflictPolicy::{Overwrite, Skip};
+    assert_eq!(
+        fx.host.enqueued(),
+        [
+            (download.clone(), Skip),
+            (upload.clone(), Skip),
+            (download.clone(), Skip),
+            (upload.clone(), Skip),
+            (download, Overwrite),
+            (upload, Overwrite),
+        ]
+    );
+    // The upload connected its site first: an item for a site that is not connected
+    // would stay queued.
+    assert_eq!(fx.host.connects(&fx.ssh.id), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn upload_needs_everything_download_needs_reading() {
+    let fx = fixture();
+    let dir = local_dir();
+    let file = at(&dir, "a.txt");
+    std::fs::write(&file, b"a").unwrap();
+    assert_eq!(
+        err(fx
+            .call("upload", upload_args(&fx.ro, &file, "/var/www/b.txt"))
+            .await),
+        read_only(&fx.ro.name)
+    );
+    for tool in ["download", "upload"] {
+        let args = match tool {
+            "download" => download_args(&fx.closed, "/var/www/a.txt", &file),
+            _ => upload_args(&fx.closed, &file, "/var/www/b.txt"),
+        };
+        assert_eq!(err(fx.call(tool, args).await), SITE_UNAVAILABLE, "{tool}");
+    }
+    assert!(fx.host.enqueued().is_empty());
+    let landing = at(&dir, "b.txt");
+    let reply = head(
+        fx.call(
+            "download",
+            download_args(&fx.ro, "/var/www/a.txt", &landing),
+        )
+        .await,
+    );
+    assert_eq!(reply["state"], "running");
+    assert_eq!(fx.host.enqueued().len(), 1);
+    assert_eq!(fx.host.connects(&fx.closed.id), 0);
+}
+
+/// `protected(path)` for the path as given, and nothing enqueued.
+async fn refused_as_protected(fx: &Fx, tool: &str, args: Value, given: &std::path::Path) {
+    let before = fx.host.enqueued().len();
+    let text = err(fx.call(tool, args).await);
+    assert_eq!(text, protected(&text_of(given)), "{tool} {given:?}");
+    assert_eq!(fx.host.enqueued().len(), before, "{tool} {given:?}");
+}
+
+/// Each protected root, a path inside it and, for a folder, a folder that holds it: one
+/// refusal naming only the path given, before anything is enqueued. A neighbour is
+/// enqueued.
+#[tokio::test(start_paused = true)]
+async fn protected_paths_stop_the_transfer() {
+    let fx = fixture();
+    let dir = protected_tree(&fx);
+    fx.ssh_fs.add_file("/var/www/sub/b.txt", b"b", EPOCH);
+    // Downloads of a file: the root itself, inside a root (existing or not).
+    for rel in [
+        "keys/deploy.pem",
+        "home/.ssh",
+        "home/.ssh/known_hosts",
+        "conf/hoprs/sites.toml",
+        "conf/hoprs/new/deep.txt",
+    ] {
+        let local = at(&dir, rel);
+        let args = download_args(&fx.ssh, "/var/www/a.txt", &local);
+        refused_as_protected(&fx, "download", args, &local).await;
+    }
+    // Downloads of a folder: also a folder that holds a root.
+    for rel in ["home", "conf", "keys", "", "home/.ssh/sub"] {
+        let local = at(&dir, rel);
+        let args = download_args(&fx.ssh, "/var/www", &local);
+        refused_as_protected(&fx, "download", args, &local).await;
+    }
+    // Uploads of a file, of a root folder, of a folder that holds one.
+    for rel in [
+        "keys/deploy.pem",
+        "home/.ssh/known_hosts",
+        "conf/hoprs/sites.toml",
+        "home/.ssh",
+        "home",
+        "conf",
+        "keys",
+        "",
+    ] {
+        let local = at(&dir, rel);
+        let args = upload_args(&fx.ssh, &local, "/var/www/x");
+        refused_as_protected(&fx, "upload", args, &local).await;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        symlink(at(&dir, "home/.ssh"), at(&dir, "work/ssh-link")).unwrap();
+        symlink(at(&dir, "keys/deploy.pem"), at(&dir, "work/key-link")).unwrap();
+        symlink(at(&dir, "conf"), at(&dir, "work/conf-link")).unwrap();
+        for rel in ["work/ssh-link/x.txt", "work/key-link", "work/ssh-link"] {
+            let local = at(&dir, rel);
+            let args = download_args(&fx.ssh, "/var/www/a.txt", &local);
+            refused_as_protected(&fx, "download", args, &local).await;
+        }
+        // A link as an upload's source is judged by where it leads.
+        for rel in ["work/ssh-link", "work/key-link", "work/conf-link"] {
+            let local = at(&dir, rel);
+            let args = upload_args(&fx.ssh, &local, "/var/www/x");
+            refused_as_protected(&fx, "upload", args, &local).await;
+        }
+    }
+    assert!(fx.host.enqueued().is_empty());
+    // Neighbours go through.
+    let neighbours = [
+        (
+            "download",
+            download_args(&fx.ssh, "/var/www/a.txt", &at(&dir, "work/new.txt")),
+        ),
+        (
+            "download",
+            download_args(&fx.ssh, "/var/www", &at(&dir, "work/site")),
+        ),
+        (
+            "download",
+            download_args(&fx.ssh, "/var/www/a.txt", &at(&dir, "keys/deploy.pem.bak")),
+        ),
+        (
+            "upload",
+            upload_args(&fx.ssh, &at(&dir, "keys/other.pem"), "/var/www/o"),
+        ),
+        (
+            "upload",
+            upload_args(&fx.ssh, &at(&dir, "work"), "/var/www/work"),
+        ),
+    ];
+    let count = neighbours.len();
+    for (tool, args) in neighbours {
+        let reply = head(fx.call(tool, args).await);
+        assert_eq!(reply["state"], "running", "{reply}");
+    }
+    assert_eq!(fx.host.enqueued().len(), count);
+}
+
+/// What can be refused before connecting is: an upload from a protected path, a download
+/// into one, never connect the site. A folder download needs the server to tell it is a
+/// folder first, and is still refused before anything is enqueued.
+#[tokio::test]
+async fn protected_is_checked_before_connecting_when_it_can_be() {
+    let fx = fixture();
+    let dir = protected_tree(&fx);
+    let key = at(&dir, "keys/deploy.pem");
+    refused_as_protected(&fx, "upload", upload_args(&fx.ssh, &key, "/k"), &key).await;
+    let inside = at(&dir, "home/.ssh/known_hosts");
+    let args = download_args(&fx.ssh, "/var/www/a.txt", &inside);
+    refused_as_protected(&fx, "download", args, &inside).await;
+    assert_eq!(fx.host.connects(&fx.ssh.id), 0);
+    assert_eq!(fx.host.calls(&fx.ssh.id, FsOp::Stat), 0);
+    let home = at(&dir, "home");
+    refused_as_protected(
+        &fx,
+        "download",
+        download_args(&fx.ssh, "/var/www", &home),
+        &home,
+    )
+    .await;
+    assert_eq!(fx.host.connects(&fx.ssh.id), 1);
+    assert!(fx.host.enqueued().is_empty());
+}
+
+/// The local path's own rules: `engine_path`'s sentence; an upload's source must exist
+/// and be a regular file or a folder, not a link; a download's remote path must not be a
+/// link. Nothing is enqueued, and an upload refused here never connects.
+#[tokio::test]
+async fn local_path_rules() {
+    let fx = fixture();
+    let dir = local_dir();
+    std::fs::write(at(&dir, "n.txt"), b"n").unwrap();
+    let relative = std::path::Path::new("a.txt");
+    let dotted = at(&dir, "work").join("..").join("n.txt");
+    for local in [relative, dotted.as_path()] {
+        let sentence = engine_path(local).unwrap_err();
+        let down = download_args(&fx.ssh, "/var/www/a.txt", local);
+        assert_eq!(err(fx.call("download", down).await), sentence, "{local:?}");
+        let up = upload_args(&fx.ssh, local, "/var/www/b.txt");
+        assert_eq!(err(fx.call("upload", up).await), sentence, "{local:?}");
+    }
+    let missing = at(&dir, "nothing.txt");
+    let text = err(fx
+        .call("upload", upload_args(&fx.ssh, &missing, "/var/www/b.txt"))
+        .await);
+    assert!(text.contains(&text_of(&missing)), "{text}");
+    assert!(text.contains("does not exist"), "{text}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::symlink;
+        symlink(at(&dir, "n.txt"), at(&dir, "link.txt")).unwrap();
+        let link = at(&dir, "link.txt");
+        let text = err(fx
+            .call("upload", upload_args(&fx.ssh, &link, "/var/www/b.txt"))
+            .await);
+        assert!(text.contains("symbolic link"), "{text}");
+        assert!(text.contains(&text_of(&link)), "{text}");
+        // A socket and a device would block or read without end.
+        let socket = at(&dir, "s.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        for odd in [socket.as_path(), std::path::Path::new("/dev/null")] {
+            let text = err(fx
+                .call("upload", upload_args(&fx.ssh, odd, "/var/www/b.txt"))
+                .await);
+            assert!(text.contains("not a regular file or a folder"), "{text}");
+        }
+    }
+    #[cfg(windows)]
+    for name in ["CON", "nul.txt", "COM1"] {
+        let device = at(&dir, name);
+        let text = err(fx
+            .call("upload", upload_args(&fx.ssh, &device, "/var/www/b.txt"))
+            .await);
+        assert!(text.contains("not a regular file or a folder"), "{text}");
+    }
+    assert_eq!(fx.host.connects(&fx.ssh.id), 0);
+    // On the server: a link, and nothing.
+    fx.ssh_fs.add_symlink("/var/www/l", "/var/www/a.txt");
+    let landing = at(&dir, "l.txt");
+    let text = err(fx
+        .call("download", download_args(&fx.ssh, "/var/www/l", &landing))
+        .await);
+    assert!(text.contains("/var/www/l is a symbolic link"), "{text}");
+    let text = err(fx
+        .call(
+            "download",
+            download_args(&fx.ssh, "/var/www/nope", &landing),
+        )
+        .await);
+    assert!(text.starts_with("Could not read /var/www/nope: "), "{text}");
+    assert!(fx.host.enqueued().is_empty());
+}
+
+/// The fake ends the root: the call answers its summary without waiting the minute.
+#[tokio::test(start_paused = true)]
+async fn finished_transfer_answers_its_summary() {
+    let fx = fixture();
+    let dir = local_dir();
+    let started = Instant::now();
+    let task = spawn_call(
+        &fx,
+        "download",
+        download_args(&fx.ssh, "/var/www/a.txt", &at(&dir, "a.txt")),
+    );
+    until_enqueued(&fx, 1).await;
+    finish_file(&fx, TransferId(1), 5).await;
+    let reply = head(joined(task).await);
+    assert_eq!(
+        reply,
+        json!({"transfer": 1, "state": "done", "files_done": 1, "bytes_done": 5,
+            "skipped": 0, "failed_count": 0, "failed": []})
+    );
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test(start_paused = true)]
+async fn skipped_single_file_says_skipped() {
+    let fx = fixture();
+    let dir = local_dir();
+    let task = spawn_call(
+        &fx,
+        "download",
+        download_args(&fx.ssh, "/var/www/a.txt", &at(&dir, "a.txt")),
+    );
+    until_enqueued(&fx, 1).await;
+    fx.host
+        .set_state(TransferId(1), TransferState::Skipped("exists".to_owned()));
+    let reply = head(joined(task).await);
+    assert_eq!(reply["state"], "skipped", "{reply}");
+    assert_eq!(reply["skipped"], 1, "{reply}");
+    assert_eq!(reply["files_done"], 0, "{reply}");
+    assert_eq!(reply["failed_count"], 0, "{reply}");
+}
+
+/// RF4: no end within a minute: the call answers the id and "running" (pending until
+/// then), and `transfer_status` answers the summary later.
+#[tokio::test(start_paused = true)]
+async fn slow_transfer_answers_running() {
+    let fx = fixture();
+    let dir = local_dir();
+    let source = at(&dir, "big.bin");
+    std::fs::write(&source, b"big").unwrap();
+    let task = spawn_call(
+        &fx,
+        "upload",
+        upload_args(&fx.ssh, &source, "/var/www/big.bin"),
+    );
+    until_enqueued(&fx, 1).await;
+    let enqueued = Instant::now();
+    tokio::time::advance(Duration::from_secs(58)).await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert!(!task.is_finished(), "pending before the minute");
+    // While it waits, the call counts as running on its site.
+    assert!(fx.service.activity().running.contains_key(&fx.ssh.id));
+    let reply = head(joined(task).await);
+    assert!(enqueued.elapsed() >= Duration::from_secs(59));
+    assert_eq!(reply["transfer"], 1, "{reply}");
+    assert_eq!(reply["state"], "running", "{reply}");
+    assert!(
+        reply["note"].as_str().unwrap().contains("transfer_status"),
+        "{reply}"
+    );
+    assert!(fx.service.activity().running.is_empty());
+
+    finish_file(&fx, TransferId(1), 3).await;
+    let status = head(fx.call("transfer_status", json!({"transfer": 1})).await);
+    assert_eq!(status["state"], "done", "{status}");
+    assert_eq!(status["files_done"], 1, "{status}");
+    assert_eq!(status["bytes_done"], 3, "{status}");
+}
+
+/// A user's transfer, a child, an unknown id, an id past `i64` and an agent's transfer
+/// on a site no longer open to agents: one text, one log line.
+#[tokio::test]
+async fn transfer_status_is_for_agent_transfers_only() {
+    let (logs, _guard) = capture_logs();
+    let fx = fixture();
+    let item = |id: i64, parent: Option<i64>, site: &Site, origin: Origin| TransferItem {
+        id: TransferId(id),
+        parent: parent.map(TransferId),
+        origin,
+        ..transfer(&site.id, TransferState::Done)
+    };
+    fx.host.set_transfers(vec![
+        item(10, None, &fx.ssh, Origin::User),
+        item(11, None, &fx.ssh, Origin::Agent),
+        item(12, Some(11), &fx.ssh, Origin::Agent),
+        item(13, None, &fx.ro, Origin::Agent),
+        item(14, None, &fx.closed, Origin::Agent),
+    ]);
+    let status = |id: u64| fx.call("transfer_status", json!({"transfer": id}));
+    assert_eq!(head(status(11).await)["state"], "done");
+    assert_eq!(head(status(13).await)["state"], "done");
+    fx.set_level(&fx.ro, AgentAccess::None);
+    let before = logs.agent_lines().len();
+    for id in [10, 12, 13, 14, 99, 1 << 63] {
+        assert_eq!(err(status(id).await), NO_SUCH_TRANSFER, "{id}");
+    }
+    let lines = logs.agent_lines();
+    assert_eq!(lines.len(), before + 6, "{lines:?}");
+    for line in &lines[before..] {
+        assert!(
+            line.ends_with("refused transfer_status: no such agent transfer"),
+            "{line}"
+        );
+    }
+    assert!(
+        lines[0].ends_with("checked transfer 11 on \"Acme\" (done)"),
+        "{lines:?}"
+    );
+}
+
+/// A root waiting on a decision ends the wait: "paused", now.
+#[tokio::test(start_paused = true)]
+async fn agent_never_waits_on_a_question() {
+    let fx = fixture();
+    let dir = local_dir();
+    let task = spawn_call(
+        &fx,
+        "download",
+        download_args(&fx.ssh, "/var/www/a.txt", &at(&dir, "a.txt")),
+    );
+    until_enqueued(&fx, 1).await;
+    let asked = Instant::now();
+    fx.host.set_state(
+        TransferId(1),
+        TransferState::AwaitingDecision(hoprs_transfer::ConflictInfo {
+            src_size: 5,
+            dst_size: 3,
+            src_modified: None,
+            dst_modified: None,
+        }),
+    );
+    let reply = head(joined(task).await);
+    assert!(asked.elapsed() < Duration::from_secs(1));
+    assert_eq!(reply["state"], "paused", "{reply}");
+    assert!(
+        reply["note"].as_str().unwrap().contains("hoprs window"),
+        "{reply}"
+    );
+    let status = head(fx.call("transfer_status", json!({"transfer": 1})).await);
+    assert_eq!(status["state"], "paused", "{status}");
+}
+
+/// One line per transfer call: the action, both paths, the site and the outcome; a
+/// cancelled call is logged and its transfer stays in the queue.
+#[tokio::test(start_paused = true)]
+async fn transfer_calls_are_logged() {
+    let (logs, _guard) = capture_logs();
+    let fx = fixture();
+    let dir = protected_tree(&fx);
+    let landing = at(&dir, "work/a.txt");
+    let task = spawn_call(
+        &fx,
+        "download",
+        download_args(&fx.ssh, "/var/www/a.txt", &landing),
+    );
+    until_enqueued(&fx, 1).await;
+    finish_file(&fx, TransferId(1), 5).await;
+    ok(joined(task).await);
+    let source = at(&dir, "work/n.txt");
+    ok(fx
+        .call("upload", upload_args(&fx.ssh, &source, "/var/www/n.txt"))
+        .await);
+    let key = at(&dir, "keys/deploy.pem");
+    err(fx
+        .call("upload", upload_args(&fx.ssh, &key, "/var/www/k"))
+        .await);
+    let lines = logs.agent_lines();
+    assert_eq!(lines.len(), 3, "{lines:?}");
+    let want = [
+        format!(
+            "downloaded /var/www/a.txt to {} on \"Acme\" (transfer 1: done)",
+            text_of(&landing)
+        ),
+        format!(
+            "uploaded {} to /var/www/n.txt on \"Acme\" (transfer 2: running)",
+            text_of(&source)
+        ),
+        format!(
+            "uploaded {} to /var/www/k on \"Acme\" (failed: protected local path)",
+            text_of(&key)
+        ),
+    ];
+    for (line, want) in lines.iter().zip(want) {
+        assert!(line.ends_with(&want), "{line}\n{want}");
+    }
+
+    let task = spawn_call(
+        &fx,
+        "upload",
+        upload_args(&fx.ssh, &source, "/var/www/m.txt"),
+    );
+    until_enqueued(&fx, 3).await;
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    let lines = logs.agent_lines();
+    assert!(
+        lines[3].ends_with(&format!(
+            "uploaded {} to /var/www/m.txt on \"Acme\" (cancelled)",
+            text_of(&source)
+        )),
+        "{lines:?}"
+    );
+    assert!(fx.service.activity().running.is_empty());
+    // The transfer is the queue's: still there, still queued.
+    let items = fx.host.transfers().await;
+    let item = items.iter().find(|item| item.id == TransferId(3)).unwrap();
+    assert_eq!(item.state, TransferState::Queued);
 }

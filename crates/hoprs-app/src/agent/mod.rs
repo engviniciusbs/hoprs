@@ -80,13 +80,9 @@ pub struct Limits {
     pub exec_stream: usize,
     pub exec_default: Duration,
     pub exec_max: Duration,
-    // TODO(Task 11): remove
-    #[allow(dead_code)]
     pub transfer_wait: Duration,
     pub prompt_wait: Duration,
     pub idle_close: Duration,
-    // TODO(Task 11): remove
-    #[allow(dead_code)]
     pub failed_listed: usize,
 }
 
@@ -139,13 +135,14 @@ pub fn ssh_only(site: &str) -> String {
     )
 }
 /// A protected local path.
-// TODO(Task 11): remove
-#[allow(dead_code)]
 pub fn protected(path: &str) -> String {
     format!(
         "{path} is protected: agents cannot transfer to or from hoprs's own files, ~/.ssh or the key files of saved sites."
     )
 }
+/// `transfer_status` of anything but an agent's transfer on a site the caller may read:
+/// one text for an unknown id, a user's transfer, a cleared one and a closed site.
+pub const NO_SUCH_TRANSFER: &str = "No such agent transfer. Pass the transfer number that download or upload answered; a transfer cleared from the hoprs queue, or on a site no longer open to agents, is not known.";
 /// A connection needs an answer from the user.
 pub const WAITING_FOR_USER: &str = "hoprs is waiting for the user: a question about this connection (host key, certificate, password or passphrase) must be answered in the hoprs window. Ask the user, then call the tool again.";
 /// The server's host key changed.

@@ -419,7 +419,7 @@ impl Service {
 }
 
 /// `<what failed>: <the error's English message>`; the log keeps the message.
-fn failed(what: &str, error: &Error) -> Failure {
+pub(super) fn failed(what: &str, error: &Error) -> Failure {
     Failure::new(format!("{what}: {}", error.message), error.message.clone())
 }
 

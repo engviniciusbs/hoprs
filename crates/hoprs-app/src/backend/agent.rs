@@ -6,7 +6,12 @@
 //! and every saved site's `ssh.key_file`, read from the vault at each check, whatever the
 //! site's agent access (a site an agent cannot reach still has its key protected). No
 //! root reaches a log line, a `Debug` output or an error: a refusal names only the item's
-//! own local path, the one the agent gave.
+//! own local path, which is the path the agent gave or, for an item of a folder, a path
+//! under the folder it gave. The transfer tools refuse a folder that holds a protected
+//! path before it is queued (`agent::service`), so a key file's own path never reaches
+//! the guard by the walk of a folder; what the guard still refuses inside a folder (a hard
+//! link to a key file, a path linked or created during the walk) is named by its path in
+//! that folder.
 //!
 //! **What the guard covers.** The engine calls it for every item of origin Agent before
 //! any filesystem call of that item (first runs, retries, restored items; files and
@@ -53,8 +58,6 @@ pub struct RealHost {
     broker: PromptBroker,
     agents: watch::Receiver<bool>,
     /// The protected roots before the saved sites' key files.
-    // TODO(Task 11): remove
-    #[allow(dead_code)]
     fixed: Arc<Vec<PathBuf>>,
 }
 
@@ -523,6 +526,81 @@ mod tests {
                 .collect();
             assert_eq!(names, ["a.txt", "b.txt"], "nothing else on the server");
         }
+    }
+
+    /// The service over the real host and engine: a folder download under Skip leaves an
+    /// existing local file as it was and reports it skipped (the policy reaches the
+    /// children), Overwrite replaces it; an upload of a folder holding a saved site's key
+    /// file is refused whole, naming only the folder, and nothing reaches the server.
+    #[tokio::test]
+    async fn the_service_transfers_through_the_engine() {
+        use crate::agent::service::Service;
+        use crate::agent::{Limits, proto::Reply};
+
+        let dir = local_dir();
+        let backend = open(dir.path());
+        backend.set_agents_enabled(true).await;
+        let work = dir.path().join("work");
+        let stuff = work.join("stuff");
+        std::fs::create_dir_all(&stuff).unwrap();
+        std::fs::write(stuff.join("notes.txt"), b"notes").unwrap();
+        std::fs::write(stuff.join("id_deploy"), b"KEY").unwrap();
+        let mut site = Site::new("Acme", "acme.example", "deploy", Protocol::Ssh);
+        site.agent_access = hoprs_core::AgentAccess::All;
+        site.ssh.key_file = Some(stuff.join("id_deploy"));
+        backend.save_site(site.clone()).await.unwrap();
+        let remote = MemFs::new();
+        remote.add_file("/site/a.txt", b"server a", SystemTime::UNIX_EPOCH);
+        remote.add_file("/site/b.txt", b"server b", SystemTime::UNIX_EPOCH);
+        backend
+            .sessions
+            .attach(site.id.clone(), up(), Arc::new(remote.clone()))
+            .await
+            .unwrap();
+        let (tx, _events) = tokio::sync::mpsc::unbounded_channel();
+        let service = Service::new(backend.agent_host(), Limits::default(), tx);
+        let text = |path: &Path| path.to_str().unwrap().to_owned();
+        let head = |reply: Reply| match reply {
+            Reply::Ok(blocks) => serde_json::from_str::<serde_json::Value>(&blocks[0]).unwrap(),
+            Reply::Err(text) => panic!("{text}"),
+        };
+
+        let out = work.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        std::fs::write(out.join("a.txt"), b"local a").unwrap();
+        let args = serde_json::json!({"site": site.id.0, "remote_path": "/site",
+            "local_path": text(&out)});
+        let reply = head(service.call("download", args.clone()).await);
+        assert_eq!(reply["state"], "done", "{reply}");
+        assert_eq!(reply["files_done"], 1, "{reply}");
+        assert_eq!(reply["skipped"], 1, "{reply}");
+        assert_eq!(std::fs::read(out.join("a.txt")).unwrap(), b"local a");
+        assert_eq!(std::fs::read(out.join("b.txt")).unwrap(), b"server b");
+        let mut args = args;
+        args["overwrite"] = serde_json::json!(true);
+        let reply = head(service.call("download", args).await);
+        assert_eq!(reply["files_done"], 2, "{reply}");
+        assert_eq!(std::fs::read(out.join("a.txt")).unwrap(), b"server a");
+        let items = host_items(&backend).await;
+        assert!(items.iter().all(|item| item.origin == Origin::Agent));
+
+        let args = serde_json::json!({"site": site.id.0, "local_path": text(&stuff),
+            "remote_path": "/stuff"});
+        let Reply::Err(refusal) = service.call("upload", args).await else {
+            panic!("the folder holds a key file");
+        };
+        assert_eq!(refusal, crate::agent::protected(&text(&stuff)));
+        assert!(!refusal.contains("id_deploy"), "{refusal}");
+        assert!(remote.read_file("/stuff/notes.txt").is_none());
+        assert_eq!(
+            host_items(&backend).await.len(),
+            items.len(),
+            "nothing queued"
+        );
+    }
+
+    async fn host_items(backend: &Backend) -> Vec<TransferItem> {
+        backend.agent_host().transfers().await
     }
 
     /// The host reads the master switch as it is now.

@@ -67,18 +67,12 @@ pub trait AgentHost: Send + Sync + 'static {
     ) -> Result<ExecOutput>;
     /// Enqueues an agent's transfer under `policy` (one that never asks); the engine
     /// checks each of its items' local path against the protected ones.
-    // TODO(Task 11): remove
-    #[allow(dead_code)]
     async fn enqueue(&self, spec: TransferSpec, policy: ConflictPolicy) -> Result<TransferId>;
     /// The transfer queue, every origin.
     async fn transfers(&self) -> Vec<TransferItem>;
     /// A new receiver of the engine's events.
-    // TODO(Task 11): remove
-    #[allow(dead_code)]
     fn transfer_events(&self) -> broadcast::Receiver<Event>;
     /// The local paths an agent may not touch, as they are now.
-    // TODO(Task 11): remove
-    #[allow(dead_code)]
     async fn protected(&self) -> Protected;
 }
 
