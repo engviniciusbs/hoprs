@@ -196,11 +196,24 @@ impl Default for Limits {
 pub const UNREACHABLE: &str = "hoprs is not reachable: it is not running, or agent access is off. Open hoprs and turn on Settings › Agents (MCP), then call the tool again.";
 /// The app closed the channel because the user turned agent access off.
 pub const TURNED_OFF: &str = "Agent access was turned off in hoprs. Turn on Settings › Agents (MCP) in the hoprs window, then call the tool again.";
-/// The running window is another version than the relay.
+/// The running window is another version than the relay. The remedy is the older side's,
+/// compared as the update notice compares versions: an older window is restarted, an
+/// older relay (started before hoprs was updated) is restarted or reconnected in the MCP
+/// client. Versions that do not compare name both.
 pub fn version_mismatch(app: &str, relay: &str) -> String {
-    format!(
-        "hoprs was updated while its window stayed open (window {app}, this program {relay}). Restart hoprs, then call the tool again."
-    )
+    use crate::update::{is_newer, parse_version};
+    let versions = format!("window {app}, this program {relay}");
+    match (parse_version(app), parse_version(relay)) {
+        (Some(window), Some(program)) if is_newer(&program, &window) => format!(
+            "hoprs was updated while its window stayed open ({versions}). Restart hoprs, then call the tool again."
+        ),
+        (Some(window), Some(program)) if is_newer(&window, &program) => format!(
+            "This MCP server is older than the hoprs window ({versions}): it was started before hoprs was updated, and restarting hoprs does not help. Restart or reconnect the hoprs MCP server in the MCP client (for example by restarting the agent session), then call the tool again."
+        ),
+        _ => format!(
+            "The hoprs window and this MCP server are different builds ({versions}). Restart whichever is older: hoprs, or the hoprs MCP server in the MCP client (for example by restarting the agent session), then call the tool again."
+        ),
+    }
 }
 /// An unknown site id, and a site with no access: one text for both.
 pub const SITE_UNAVAILABLE: &str =
@@ -221,6 +234,20 @@ pub fn ssh_only(site: &str) -> String {
 pub fn protected(path: &str) -> String {
     format!(
         "{path} is protected: agents cannot transfer to or from hoprs's own files, ~/.ssh or the key files of saved sites."
+    )
+}
+/// The site's server (protocol, host, port or user) was changed in hoprs while a tab keeps
+/// its session to the previous one: the agent may not use that session. Names no host.
+pub fn site_edited(site: &str) -> String {
+    format!(
+        "The site \"{site}\" was edited in hoprs while its tab stays connected to the previous server, so an agent cannot use that connection. The user has to reconnect the site in hoprs (close its tab, then connect it again) before an agent can use it; then call the tool again."
+    )
+}
+/// The same while a transfer still uses an agent's session to the previous server (the
+/// session is not closed under it). Names no host.
+pub fn site_edited_busy(site: &str) -> String {
+    format!(
+        "The site \"{site}\" was edited in hoprs while a transfer still uses its connection to the previous server. Wait until the site's transfers in the hoprs queue have ended, then call the tool again."
     )
 }
 /// `transfer_status` of anything but an agent's transfer on a site the caller may read:
@@ -324,8 +351,6 @@ mod tests {
     fn texts_tell_what_to_do() {
         assert!(UNREACHABLE.contains("Settings › Agents (MCP)"));
         assert!(TURNED_OFF.contains("Settings › Agents (MCP)"));
-        assert!(version_mismatch("1.6.0", "1.6.1").contains("Restart hoprs"));
-        assert!(version_mismatch("1.6.0", "1.6.1").contains("window 1.6.0"));
         assert!(SITE_UNAVAILABLE.contains("list_sites"));
         assert!(read_only("Acme").contains("\"Acme\" allows reading only"));
         assert!(ssh_only("Acme").contains("\"Acme\""));
@@ -335,5 +360,42 @@ mod tests {
         assert!(HOST_KEY_CHANGED.contains("host key changed"));
         assert!(INSTRUCTIONS.contains("list_sites"));
         assert!(INSTRUCTIONS.contains("log"));
+    }
+
+    /// The mismatch names the older side's remedy: hoprs for an older window, the MCP
+    /// server in the client for an older relay, both when the versions do not compare.
+    #[test]
+    fn version_mismatch_names_the_older_side() {
+        let all = [
+            version_mismatch("1.6.0", "1.6.1"),
+            version_mismatch("1.6.1", "1.6.0"),
+            version_mismatch("1.6.0", "1.6.0"),
+            version_mismatch("1.6.0", "1.7.0-dev"),
+        ];
+        for text in &all {
+            assert!(text.ends_with("then call the tool again."), "{text}");
+            assert!(text.contains("window 1.6"), "{text}");
+            assert!(text.contains("this program 1."), "{text}");
+        }
+        let [window_older, relay_older, same, odd] = all;
+        assert!(window_older.contains("Restart hoprs"), "{window_older}");
+        assert!(!window_older.contains("MCP client"), "{window_older}");
+
+        assert!(
+            relay_older.contains("older than the hoprs window"),
+            "{relay_older}"
+        );
+        assert!(relay_older.contains("MCP client"), "{relay_older}");
+        assert!(
+            relay_older.contains("restarting hoprs does not help"),
+            "{relay_older}"
+        );
+        assert!(!relay_older.contains("Restart hoprs"), "{relay_older}");
+
+        for text in [same, odd] {
+            assert!(text.contains("hoprs"), "{text}");
+            assert!(text.contains("MCP client"), "{text}");
+            assert!(text.contains("whichever is older"), "{text}");
+        }
     }
 }

@@ -44,7 +44,7 @@ use serde_json::{Value, json};
 use tokio::sync::broadcast::error::RecvError;
 
 use super::files::failed;
-use super::{Done, Failure, Refusal, Reply, SITES_UNREADABLE, Service, refused};
+use super::{Done, Failure, Refusal, Reply, SITES_UNREADABLE, Service, ToolSpec, refused};
 use crate::agent::paths::{Protected, local_os_path};
 use crate::agent::{NO_SUCH_TRANSFER, protected};
 
@@ -61,12 +61,17 @@ pub(super) struct TransferJob {
 
 impl Service {
     /// Checks the local side, connects, enqueues and waits (see the module docs).
-    pub(super) async fn transfer(&self, site: &Site, job: &TransferJob) -> Result<Done, Failure> {
+    pub(super) async fn transfer(
+        &self,
+        spec: &ToolSpec,
+        site: &Site,
+        job: &TransferJob,
+    ) -> Result<Done, Failure> {
         let os = local_os_path(&job.local);
         match job.direction {
             Direction::Download => {
                 check(self.host.protected().await, &os, false, &job.given).await?;
-                let remote = self.remote(site).await?;
+                let remote = self.remote(spec, site).await?;
                 let found = remote
                     .stat(&job.remote)
                     .await
@@ -143,7 +148,7 @@ impl Service {
                     return Err(odd());
                 }
                 // An item for a site that is not connected would stay queued.
-                self.remote(site).await?;
+                self.remote(spec, site).await?;
             }
         }
         let spec = TransferSpec {

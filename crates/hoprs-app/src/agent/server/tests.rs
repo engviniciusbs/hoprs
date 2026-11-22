@@ -877,6 +877,12 @@ impl crate::agent::host::AgentHost for PanicHost {
     ) -> std::result::Result<crate::backend::SessionId, crate::agent::host::ConnectFailure> {
         unreachable!()
     }
+    fn session_endpoint(
+        &self,
+        _: &hoprs_core::SiteId,
+    ) -> Option<crate::agent::host::SessionEndpoint> {
+        unreachable!()
+    }
     fn prompt_open(&self, _: &hoprs_core::SiteId) -> bool {
         unreachable!()
     }

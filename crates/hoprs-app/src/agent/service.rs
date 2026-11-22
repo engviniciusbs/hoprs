@@ -8,13 +8,19 @@
 //! answer ([`SITE_UNAVAILABLE`]) and the same log line, and nothing else happens for
 //! either: no connection, no filesystem call, no event, no time recorded. A level the
 //! user changes therefore applies on the next call; a call already past its check
-//! finishes.
+//! finishes. A call that waited for something that can last (its site's command turn, a
+//! connection attempt, which may wait on the user) is checked again, switch and level,
+//! before it does anything, and refused as if it had just arrived.
 //!
 //! **Connections.** A site whose session is not up is connected through the host, for
 //! at most [`Limits::prompt_wait`]: the user may have to answer a dialog, the agent never
-//! does. Calls that need the same site at the same time wait on one attempt. A failed or timed-out attempt closes the session if only an agent used it
-//! (which withdraws its dialogs), and the agent gets a fixed sentence per kind of
-//! failure, never the error's own text (an authentication error can name a key file).
+//! does. Calls that need the same site at the same time wait on one attempt. A failed or
+//! timed-out attempt closes the session if only an agent used it (which withdraws its
+//! dialogs), and the agent gets a fixed sentence per kind of failure, never the error's
+//! own text (an authentication error can name a key file). Before a session is used, the
+//! server it connected to (protocol, host, port, user) is compared with the site as saved
+//! now: after an edit an agent-only session is closed and the site connected anew (unless
+//! a transfer still uses it), and a tab's session is refused, never closed or used.
 //!
 //! **Idle sessions.** [`Service::reap`] closes an agent-only session whose site is no
 //! longer open to agents, or whose last call ended more than [`Limits::idle_close`] ago,
@@ -62,19 +68,23 @@ use serde_json::{Map, Value, json};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use super::host::AgentHost;
+use super::host::{AgentHost, Endpoint};
 use super::paths::engine_path;
 use super::proto::Reply;
 use super::tools::{self, Need, ToolSpec};
 use super::{
     AgentEvent, HOST_KEY_CHANGED, Limits, SITE_UNAVAILABLE, TURNED_OFF, WAITING_FOR_USER,
-    read_only, ssh_only,
+    read_only, site_edited, site_edited_busy, ssh_only,
 };
 use crate::backend::SessionId;
 
 /// The answer when the vault cannot be read: it names no site.
 const SITES_UNREADABLE: &str =
     "hoprs could not read its saved sites. Ask the user to check hoprs, then call the tool again.";
+
+/// The most connection attempts one call makes: a session that came up to a server the
+/// site no longer names is closed and the site connected again, at most this often.
+const CONNECT_TRIES: usize = 3;
 
 /// Answers the agents' tool calls (see the module docs).
 pub struct Service {
@@ -248,10 +258,12 @@ impl Drop for CommandTurn<'_> {
 }
 
 /// A call that failed after its access check: the agent's text, and the outcome the log
-/// line gives (never an error's detail, never content).
+/// line gives (never an error's detail, never content). `refused` when a check after a
+/// wait refused it before it did anything: its text and log line are a refusal's.
 struct Failure {
     text: String,
     reason: String,
+    refused: bool,
 }
 
 impl Failure {
@@ -259,6 +271,17 @@ impl Failure {
         Failure {
             text: text.into(),
             reason: reason.into(),
+            refused: false,
+        }
+    }
+}
+
+impl From<Refusal> for Failure {
+    fn from(refusal: Refusal) -> Failure {
+        Failure {
+            text: refusal.text,
+            reason: refusal.reason.to_owned(),
+            refused: true,
         }
     }
 }
@@ -815,29 +838,32 @@ impl Service {
                 offset,
                 limit,
             } => self
-                .list_directory(site, &path, offset, limit)
+                .list_directory(spec, site, &path, offset, limit)
                 .await
                 .map(Done::from),
-            Job::Stat { path } => self.stat(site, &path).await.map(Done::from),
+            Job::Stat { path } => self.stat(spec, site, &path).await.map(Done::from),
             Job::Read {
                 path,
                 offset,
                 length,
             } => self
-                .read_file(site, &path, offset, length)
+                .read_file(spec, site, &path, offset, length)
                 .await
                 .map(Done::from),
             Job::Write {
                 path,
                 content,
                 overwrite,
-            } => self.write_file(site, &path, &content, overwrite).await,
-            Job::Mkdir { path } => self.make_directory(site, &path).await,
-            Job::Rename { from, to } => self.rename(site, &from, &to).await,
-            Job::Chmod { path, mode } => self.set_permissions(site, &path, mode).await,
-            Job::Delete { path, recursive } => self.delete(site, &path, recursive).await,
-            Job::Run { command, timeout } => self.run_command(site, &command, timeout).await,
-            Job::Transfer(job) => self.transfer(site, &job).await,
+            } => {
+                self.write_file(spec, site, &path, &content, overwrite)
+                    .await
+            }
+            Job::Mkdir { path } => self.make_directory(spec, site, &path).await,
+            Job::Rename { from, to } => self.rename(spec, site, &from, &to).await,
+            Job::Chmod { path, mode } => self.set_permissions(spec, site, &path, mode).await,
+            Job::Delete { path, recursive } => self.delete(spec, site, &path, recursive).await,
+            Job::Run { command, timeout } => self.run_command(spec, site, &command, timeout).await,
+            Job::Transfer(job) => self.transfer(spec, site, &job).await,
         };
         // It ended: the caller writes its line.
         running.pending = None;
@@ -850,11 +876,32 @@ impl Service {
                 };
                 (Reply::Ok(blocks), line)
             }
+            // Refused after a wait, before it did anything: the line of a call refused
+            // at once.
+            Err(failure) if failure.refused => (
+                Reply::Err(failure.text),
+                format!("refused {}: {}", spec.name, failure.reason),
+            ),
             Err(failure) => (
                 Reply::Err(failure.text),
                 format!("{done} (failed: {})", failure.reason),
             ),
         }
+    }
+
+    /// The call admitted again after a wait that can last (the site's command turn, a
+    /// connection attempt that may wait on the user): the master switch and the site's
+    /// level as they are now, refused with the texts and log reasons of a call refused at
+    /// once (`run_spec`, [`admit`](Self::admit)). The site as the vault has it now.
+    async fn readmit(&self, spec: &ToolSpec, site: &SiteId) -> Result<Site, Failure> {
+        if !self.host.enabled() {
+            return Err(Refusal {
+                text: TURNED_OFF.to_owned(),
+                reason: "agent access is off",
+            }
+            .into());
+        }
+        self.admit(spec, &site.0).await.map_err(Failure::from)
     }
 
     /// The sites open to agents, in the vault's order, with the fields of ruling 7 only
@@ -894,8 +941,8 @@ impl Service {
     }
 
     /// The remote filesystem of the site's session, connecting it first if need be.
-    async fn remote(&self, site: &Site) -> Result<Arc<dyn RemoteFs>, Failure> {
-        let session = self.session(site).await?;
+    async fn remote(&self, spec: &ToolSpec, site: &Site) -> Result<Arc<dyn RemoteFs>, Failure> {
+        let session = self.session(spec, site).await?;
         self.host.remote(session).map_err(|_| {
             Failure::new(
                 format!(
@@ -912,13 +959,16 @@ impl Service {
     /// `lost`), then the non-empty streams, decoded lossily; the log adds how it ended.
     async fn run_command(
         &self,
+        spec: &ToolSpec,
         site: &Site,
         command: &str,
         timeout: Duration,
     ) -> Result<Done, Failure> {
         let turn = CommandTurn::take(self, &site.id);
         let _held = turn.lock().await;
-        let session = self.session(site).await?;
+        // The turn lasts as long as the command before it: admitted again.
+        let site = &self.readmit(spec, &site.id).await?;
+        let session = self.session(spec, site).await?;
         let limits = ExecLimits {
             stream_bytes: self.limits.exec_stream,
             timeout,
@@ -979,47 +1029,127 @@ impl Service {
 
     /// The site's session: the one that is up, or the end of the site's connection
     /// attempt (joined if one is under way), which lasts at most `limits.prompt_wait`
-    /// from its start, the time the user may take to answer a dialog.
-    async fn session(&self, site: &Site) -> Result<SessionId, Failure> {
-        if let Some(session) = self.host.connected(&site.id) {
-            return Ok(session);
+    /// from its start, the time the user may take to answer a dialog. Before a session
+    /// is used it is checked against the server the site names now
+    /// ([`same_endpoint`](Self::same_endpoint)); after an attempt the call is admitted
+    /// again ([`readmit`](Self::readmit)), as the user may have lowered the level or
+    /// edited the site meanwhile.
+    async fn session(&self, spec: &ToolSpec, site: &Site) -> Result<SessionId, Failure> {
+        let mut site = site.clone();
+        for tries in 0..=CONNECT_TRIES {
+            if self.same_endpoint(&site).await?
+                && let Some(session) = self.host.connected(&site.id)
+            {
+                return Ok(session);
+            }
+            if tries == CONNECT_TRIES {
+                break;
+            }
+            let end = self.attempt(&site.id).await;
+            site = self.readmit(spec, &site.id).await?;
+            let failure = match end {
+                // Checked against the site as it is now on the next turn.
+                AttemptEnd::Up(_) => continue,
+                AttemptEnd::Failed(error) => connect_failure(&site, &error),
+                AttemptEnd::TimedOut { asked: true } => {
+                    Failure::new(WAITING_FOR_USER, "waiting for the user")
+                }
+                AttemptEnd::TimedOut { asked: false } => Failure::new(
+                    format!(
+                        "Connecting to \"{}\" ({}:{}) took more than {}. Call the tool again later; if it keeps happening, ask the user to check the site in hoprs.",
+                        site.name,
+                        site.host,
+                        site.port,
+                        span(self.limits.prompt_wait)
+                    ),
+                    "the connection timed out",
+                ),
+            };
+            // A tab's session to the server the site named before says so first.
+            self.same_endpoint(&site).await?;
+            return Err(failure);
         }
-        let mut waiter = self.join_attempt(&site.id);
+        Err(Failure::new(
+            format!(
+                "The connection to \"{}\" closed. Call the tool again.",
+                site.name
+            ),
+            "connection closed",
+        ))
+    }
+
+    /// The site's session, if it has one, against the server the site names now
+    /// (protocol, host, port and user name). A tab's session to another server is
+    /// refused, neither closed nor used. An agent-only one is closed, so the call connects
+    /// anew, unless an unfinished transfer still uses it (closing would pause it, and its
+    /// next connect would resume it on the new server), or an attempt under way owns it:
+    /// then `false`, the session is not to be used, and the call joins the attempt and
+    /// checks what comes up. `true`: the site's connected session, if any, may be used.
+    async fn same_endpoint(&self, site: &Site) -> Result<bool, Failure> {
+        let wanted = Endpoint::of(site);
+        let tab = || {
+            Failure::new(
+                site_edited(&site.name),
+                "the site was edited while its tab is connected",
+            )
+        };
+        let Some(found) = self.host.session_endpoint(&site.id) else {
+            return Ok(true);
+        };
+        if found.endpoint == wanted {
+            return Ok(true);
+        }
+        if !found.agent_only {
+            return Err(tab());
+        }
+        if self.connecting().contains_key(&site.id) {
+            return Ok(false);
+        }
+        let busy = self
+            .host
+            .transfers()
+            .await
+            .iter()
+            .any(|t| t.spec.site == site.id && !t.state.is_terminal());
+        if busy {
+            return Err(Failure::new(
+                site_edited_busy(&site.name),
+                "the site was edited while a transfer uses its connection",
+            ));
+        }
+        if self.host.close_agent_session(&site.id).await {
+            return Ok(true);
+        }
+        // Not closed: a tab took it over in between, or it is gone.
+        match self.host.session_endpoint(&site.id) {
+            Some(now) if now.endpoint != wanted => Err(tab()),
+            _ => Ok(true),
+        }
+    }
+
+    /// Waits on the site's connection attempt, joined if one is under way, and retires
+    /// it if this call is the first back.
+    async fn attempt(&self, site: &SiteId) -> AttemptEnd {
+        let mut waiter = self.join_attempt(site);
         let end = waiter.attempt.clone().await;
         waiter.ended = true;
         // The first waiter back retires the attempt: a later call starts anew.
         let first = {
             let mut connecting = self.connecting();
             let ours = connecting
-                .get(&site.id)
+                .get(site)
                 .is_some_and(|pending| pending.id == waiter.id);
             if ours {
-                connecting.remove(&site.id);
+                connecting.remove(site);
             }
             ours
         };
         drop(waiter);
         if let (AttemptEnd::Up(session), true) = (&end, first) {
-            self.send(AgentEvent::Connected(site.id.clone(), *session));
+            self.send(AgentEvent::Connected(site.clone(), *session));
         }
         self.send_sites();
-        match end {
-            AttemptEnd::Up(session) => Ok(session),
-            AttemptEnd::Failed(error) => Err(connect_failure(site, &error)),
-            AttemptEnd::TimedOut { asked: true } => {
-                Err(Failure::new(WAITING_FOR_USER, "waiting for the user"))
-            }
-            AttemptEnd::TimedOut { asked: false } => Err(Failure::new(
-                format!(
-                    "Connecting to \"{}\" ({}:{}) took more than {}. Call the tool again later; if it keeps happening, ask the user to check the site in hoprs.",
-                    site.name,
-                    site.host,
-                    site.port,
-                    span(self.limits.prompt_wait)
-                ),
-                "the connection timed out",
-            )),
-        }
+        end
     }
 
     /// Joins the site's attempt under way, or starts one. The attempt holds the

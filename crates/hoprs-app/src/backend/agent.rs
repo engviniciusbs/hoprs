@@ -2,7 +2,8 @@
 //! transfer engine runs on every agent item's local path ([`guard`]).
 //!
 //! **The protected roots** ([`crate::agent::paths`]): the fixed ones (hoprs's own
-//! directories, `~/.ssh`, the `known_hosts` in use, computed once when the backend opens)
+//! directories, the running program, `~/.ssh`, the `known_hosts` in use, computed once
+//! when the backend opens)
 //! and every saved site's `ssh.key_file`, read from the vault at each check, whatever the
 //! site's agent access (a site an agent cannot reach still has its key protected). No
 //! root reaches a log line, a `Debug` output or an error: a refusal names only the item's
@@ -41,7 +42,7 @@ use tokio::sync::{broadcast, watch};
 use super::broker::PromptBroker;
 use super::sessions::{SessionId, SessionManager};
 use super::vault::VaultHandle;
-use crate::agent::host::{AgentHost, ConnectFailure};
+use crate::agent::host::{AgentHost, ConnectFailure, SessionEndpoint};
 use crate::agent::paths::{Prepared, Protected, local_os_path};
 
 /// How long the guard reuses the roots it resolved, while they stay the same list: a
@@ -203,6 +204,10 @@ impl AgentHost for RealHost {
             })
     }
 
+    fn session_endpoint(&self, site: &SiteId) -> Option<SessionEndpoint> {
+        self.sessions.session_endpoint(site)
+    }
+
     fn prompt_open(&self, site: &SiteId) -> bool {
         self.sessions
             .session_of(site)
@@ -307,6 +312,7 @@ mod tests {
             edit_dir: dir.join("edit"),
             recovered_dir: dir.join("recovered"),
             agent_dir: Some(dir.join("agent")),
+            program: Some(dir.join("bin").join("hoprs")),
         };
         Backend::open(config, Arc::new(MemoryStore::new())).unwrap()
     }
@@ -375,11 +381,17 @@ mod tests {
             dir.path().join("recovered"),
             dir.path().join("agent").join("agent.sock"),
             dir.path().join("known_hosts"),
+            dir.path().join("bin").join("hoprs"),
             keys.join("a.pem"),
         ] {
             assert!(protected.check(&path, false).is_err(), "{path:?}");
         }
         assert!(protected.check(&keys.join("b.pem"), false).is_ok());
+        assert!(
+            protected
+                .check(&dir.path().join("bin").join("hoprs-notes"), false)
+                .is_ok()
+        );
         assert!(protected.check(&dir.path().join("work"), false).is_ok());
         let shown = format!("{protected:?}");
         assert!(
@@ -453,6 +465,48 @@ mod tests {
         let items = finished(&host, id).await;
         assert_eq!(failed_code(&items[0]), Some("agent-protected-path"));
         assert!(!landing.exists());
+
+        // The running program (the config's `program`): neither replaced nor read; a
+        // file beside it is the agent's to use.
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(bin.join("hoprs"), b"PROGRAM").unwrap();
+        std::fs::write(bin.join("readme.txt"), b"beside").unwrap();
+        let id = host
+            .enqueue(
+                TransferSpec {
+                    site: site.clone(),
+                    direction: Direction::Download,
+                    local: engine_local(&bin.join("hoprs")),
+                    remote: RemotePath::new("/new.txt").unwrap(),
+                },
+                ConflictPolicy::Overwrite,
+            )
+            .await
+            .unwrap();
+        let items = finished(&host, id).await;
+        assert_eq!(failed_code(&items[0]), Some("agent-protected-path"));
+        assert_eq!(std::fs::read(bin.join("hoprs")).unwrap(), b"PROGRAM");
+        let id = host
+            .enqueue(
+                upload(&bin.join("hoprs"), "/hoprs"),
+                ConflictPolicy::Overwrite,
+            )
+            .await
+            .unwrap();
+        let items = finished(&host, id).await;
+        assert_eq!(failed_code(&items[0]), Some("agent-protected-path"));
+        assert!(remote.read_file("/hoprs").is_none());
+        let id = host
+            .enqueue(
+                upload(&bin.join("readme.txt"), "/readme.txt"),
+                ConflictPolicy::Overwrite,
+            )
+            .await
+            .unwrap();
+        let items = finished(&host, id).await;
+        assert_eq!(items[0].state, TransferState::Done);
+        assert_eq!(remote.read_file("/readme.txt").unwrap(), b"beside");
 
         // The user's own transfer of the same path is not the guard's business.
         let id = backend
@@ -636,6 +690,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(host.agent_sites(), std::slice::from_ref(&agent_site));
+        let only = |site: &SiteId| host.session_endpoint(site).map(|e| e.agent_only);
+        assert_eq!(only(&agent_site), Some(true));
+        assert_eq!(only(&user_site), Some(false));
+        assert_eq!(only(&SiteId::new()), None);
         assert_eq!(host.connected(&agent_site), Some(agent));
         assert!(host.remote(agent).is_ok());
         assert!(!host.prompt_open(&agent_site));

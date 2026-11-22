@@ -16,7 +16,7 @@ use crate::agent::testing::{FakeHost, FsOp};
 use crate::agent::tools::{self, Need};
 use crate::agent::{
     HOST_KEY_CHANGED, NO_SUCH_TRANSFER, SITE_UNAVAILABLE, TURNED_OFF, WAITING_FOR_USER, protected,
-    read_only, ssh_only,
+    read_only, site_edited, site_edited_busy, ssh_only,
 };
 
 const EPOCH: SystemTime = SystemTime::UNIX_EPOCH;
@@ -2908,4 +2908,272 @@ async fn transfer_calls_are_logged() {
     let items = fx.host.transfers().await;
     let item = items.iter().find(|item| item.id == TransferId(3)).unwrap();
     assert_eq!(item.state, TransferState::Queued);
+}
+
+// ---- Final fix: an edited site, and the checks after a wait ----
+
+/// `site` with its server changed by `edit`.
+fn edited(site: &Site, edit: impl FnOnce(&mut Site)) -> Site {
+    let mut site = site.clone();
+    edit(&mut site);
+    site
+}
+
+/// The fixture's four sites, `which` replaced by `with`.
+fn sites_with(fx: &Fx, with: &Site) -> Vec<Site> {
+    [&fx.ssh, &fx.ftp, &fx.ro, &fx.closed]
+        .map(|s| {
+            if s.id == with.id {
+                with.clone()
+            } else {
+                s.clone()
+            }
+        })
+        .to_vec()
+}
+
+/// An agent-only session whose site now names another server (host, port, user or
+/// protocol) is closed, and the same call connects anew and is answered from the new
+/// session; the agent's text and the log name neither server.
+#[tokio::test]
+async fn an_edited_site_gets_a_new_agent_session() {
+    let (logs, _guard) = capture_logs();
+    let fx = fixture();
+    let args = json!({"site": fx.ssh.id.0, "path": "/var/www"});
+    ok(fx.call("list_directory", args.clone()).await);
+    let edits: [fn(&mut Site); 4] = [
+        |s| s.host = "new.example".into(),
+        |s| s.port = 2222,
+        |s| s.user = "deploy".into(),
+        |s| s.protocol = Protocol::Ftp,
+    ];
+    let mut site = fx.ssh.clone();
+    for (n, edit) in edits.into_iter().enumerate() {
+        let before = fx.host.connected(&fx.ssh.id).unwrap();
+        site = edited(&site, edit);
+        fx.host.set_sites(sites_with(&fx, &site));
+        assert_eq!(names(&list(&fx, args.clone()).await), ["a.txt"], "edit {n}");
+        assert_eq!(
+            fx.host.closed().len(),
+            n + 1,
+            "edit {n}: the old session closed"
+        );
+        assert_eq!(
+            fx.host.connects(&fx.ssh.id),
+            n + 2,
+            "edit {n}: one new connect"
+        );
+        let after = fx.host.connected(&fx.ssh.id).unwrap();
+        assert_ne!(after, before, "edit {n}: answered from a new session");
+        assert_eq!(
+            fx.host.session_endpoint(&fx.ssh.id).unwrap().endpoint,
+            crate::agent::host::Endpoint::of(&site)
+        );
+    }
+    let text = logs.text();
+    for host in ["ssh.example", "new.example"] {
+        assert!(!text.contains(host), "{host} in {text}");
+    }
+}
+
+/// A tab's session to the previous server is neither closed nor used: the call fails
+/// with its own sentence, which names no server, and nothing is connected; connected or
+/// not, the tab's session is the user's to reconnect.
+#[tokio::test]
+async fn an_edited_site_is_refused_on_a_tabs_session() {
+    let (logs, _guard) = capture_logs();
+    let fx = fixture();
+    let tab = fx.host.connect_user(&fx.ssh.id).await;
+    let site = edited(&fx.ssh, |s| s.host = "new.example".into());
+    fx.host.set_sites(sites_with(&fx, &site));
+    let args = json!({"site": fx.ssh.id.0, "path": "/var/www"});
+    let text = err(fx.call("list_directory", args.clone()).await);
+    assert_eq!(text, site_edited(&fx.ssh.name));
+    for host in ["ssh.example", "new.example"] {
+        assert!(!text.contains(host), "{host} in {text}");
+        assert!(!logs.text().contains(host), "{host} in the log");
+    }
+    assert_eq!(fx.host.connected(&fx.ssh.id), Some(tab), "left open");
+    assert!(fx.host.closed().is_empty());
+    assert_eq!(fx.host.connects(&fx.ssh.id), 0);
+    assert_eq!(fx.host.calls(&fx.ssh.id, FsOp::List), 0, "not used");
+    let line = logs.agent_lines().pop().unwrap();
+    assert!(
+        line.ends_with(
+            "listed /var/www on \"Acme\" (failed: the site was edited while its tab is connected)"
+        ),
+        "{line}"
+    );
+
+    // The same for a tab's session that is down.
+    let ftp = edited(&fx.ftp, |s| s.port = 2121);
+    fx.host
+        .disconnect_user(&fx.ftp.id, Error::new(ErrorKind::Network, "gone"))
+        .await;
+    fx.host.set_sites(sites_with(&fx, &ftp));
+    let text = err(fx
+        .call("list_directory", json!({"site": fx.ftp.id.0, "path": "/"}))
+        .await);
+    assert_eq!(text, site_edited(&fx.ftp.name));
+    assert_eq!(fx.host.connects(&fx.ftp.id), 0);
+    assert!(fx.host.closed().is_empty());
+}
+
+/// An edit that does not change the server (name, level, folders) keeps the session.
+#[tokio::test]
+async fn an_unchanged_server_keeps_its_session() {
+    let fx = fixture();
+    let args = json!({"site": fx.ssh.id.0, "path": "/var/www"});
+    ok(fx.call("list_directory", args.clone()).await);
+    let session = fx.host.connected(&fx.ssh.id).unwrap();
+    let site = edited(&fx.ssh, |s| {
+        s.name = "Acme renamed".into();
+        s.remote_dir = Some("/srv".into());
+        s.local_dir = Some(PathBuf::from("/home/me"));
+    });
+    fx.host.set_sites(sites_with(&fx, &site));
+    ok(fx.call("list_directory", args.clone()).await);
+    // A tab's session too.
+    fx.host.connect_user(&fx.ssh.id).await;
+    ok(fx.call("list_directory", args).await);
+    assert_eq!(fx.host.connects(&fx.ssh.id), 1, "no extra connect");
+    assert!(fx.host.closed().is_empty());
+    assert_eq!(fx.host.connected(&fx.ssh.id), Some(session));
+}
+
+/// An agent-only session that an unfinished transfer still uses is not closed under it
+/// when its site is edited: the call is refused until the transfer ends.
+#[tokio::test]
+async fn an_edited_site_leaves_a_running_transfer_alone() {
+    let fx = fixture();
+    let args = json!({"site": fx.ssh.id.0, "path": "/var/www"});
+    ok(fx.call("list_directory", args.clone()).await);
+    let session = fx.host.connected(&fx.ssh.id).unwrap();
+    fx.host
+        .set_transfers(vec![transfer(&fx.ssh.id, TransferState::Active)]);
+    let site = edited(&fx.ssh, |s| s.host = "new.example".into());
+    fx.host.set_sites(sites_with(&fx, &site));
+    let text = err(fx.call("list_directory", args.clone()).await);
+    assert_eq!(text, site_edited_busy(&fx.ssh.name));
+    assert!(!text.contains("example"), "{text}");
+    assert!(fx.host.closed().is_empty());
+    assert_eq!(fx.host.connected(&fx.ssh.id), Some(session));
+    // Once it ended, the next call connects to the new server.
+    fx.host
+        .set_transfers(vec![transfer(&fx.ssh.id, TransferState::Done)]);
+    ok(fx.call("list_directory", args).await);
+    assert_eq!(fx.host.closed(), std::slice::from_ref(&fx.ssh.id));
+    assert_eq!(fx.host.connects(&fx.ssh.id), 2);
+}
+
+/// A site edited while a call waits on its connect: the session that came up points at
+/// the previous server, so it is closed and the call connects again.
+#[tokio::test]
+async fn a_site_edited_during_the_connect_is_connected_again() {
+    let fx = fixture();
+    let hold = fx.host.hold_connect(&fx.ssh.id);
+    let call = tokio::spawn({
+        let service = fx.service.clone();
+        let args = json!({"site": fx.ssh.id.0, "path": "/var/www"});
+        async move { service.call("list_directory", args).await }
+    });
+    hold.entered().await;
+    let site = edited(&fx.ssh, |s| s.host = "new.example".into());
+    fx.host.set_sites(sites_with(&fx, &site));
+    hold.release();
+    assert_eq!(names(&head(call.await.unwrap())), ["a.txt"]);
+    assert_eq!(fx.host.connects(&fx.ssh.id), 2);
+    assert_eq!(fx.host.closed(), std::slice::from_ref(&fx.ssh.id));
+    assert_eq!(
+        fx.host.session_endpoint(&fx.ssh.id).unwrap().endpoint,
+        crate::agent::host::Endpoint::of(&site)
+    );
+}
+
+/// A writing call that waits on a held connect is admitted again when the wait ends: the
+/// level lowered meanwhile to "No access" or "Allow reading", or the switch turned off,
+/// refuses it with the text and the log line of a call refused at once, and nothing is
+/// done.
+#[tokio::test]
+async fn a_call_is_admitted_again_after_its_connect() {
+    let (logs, _guard) = capture_logs();
+    let fx = fixture();
+    type Lower = fn(&Fx);
+    let cases: [(&str, Lower); 3] = [
+        ("site not available", |fx| {
+            fx.set_level(&fx.ssh, AgentAccess::None)
+        }),
+        ("the site allows reading only", |fx| {
+            fx.set_level(&fx.ssh, AgentAccess::Read)
+        }),
+        ("agent access is off", |fx| fx.host.set_enabled(false)),
+    ];
+    for (reason, lower) in cases {
+        let hold = fx.host.hold_connect(&fx.ssh.id);
+        let call = tokio::spawn({
+            let service = fx.service.clone();
+            let args = on(&fx.ssh, json!({"path": "/var/www/new.txt", "content": "x"}));
+            async move { service.call("write_file", args).await }
+        });
+        hold.entered().await;
+        lower(&fx);
+        let want = err(fx
+            .call(
+                "write_file",
+                on(&fx.ssh, json!({"path": "/n", "content": "x"})),
+            )
+            .await);
+        let refused_at_once = logs.agent_lines().pop().unwrap();
+        hold.release();
+        assert_eq!(err(call.await.unwrap()), want, "{reason}");
+        let line = logs.agent_lines().pop().unwrap();
+        assert!(
+            line.ends_with(&format!("refused write_file: {reason}")),
+            "{line}"
+        );
+        assert_eq!(line, refused_at_once);
+        assert_eq!(fx.host.calls(&fx.ssh.id, FsOp::Write), 0, "{reason}");
+        assert_eq!(fx.host.calls(&fx.ssh.id, FsOp::Stat), 0, "{reason}");
+        assert!(fx.ssh_fs.read_file("/var/www/new.txt").is_none());
+        // Back to the start for the next case: no session, everything allowed.
+        fx.host.set_enabled(true);
+        fx.set_level(&fx.ssh, AgentAccess::All);
+        fx.host.close_agent_session(&fx.ssh.id).await;
+    }
+}
+
+/// A `run_command` that waited for its site's turn is admitted again: lowered to
+/// "Allow reading" meanwhile, it is refused and its command never runs, while the
+/// command that held the turn finishes.
+#[tokio::test]
+async fn a_command_is_admitted_again_after_its_turn() {
+    let fx = fixture();
+    let spawn = |command: &str| {
+        let service = fx.service.clone();
+        let args = on(&fx.ssh, json!({ "command": command }));
+        tokio::spawn(async move { service.call("run_command", args).await })
+    };
+    let hold = fx.host.hold_exec();
+    let first = spawn("one");
+    hold.entered().await;
+    let second = spawn("two");
+    until(|| fx.service.activity().running.get(&fx.ssh.id) == Some(&2)).await;
+    fx.set_level(&fx.ssh, AgentAccess::Read);
+    hold.release();
+    ok(first.await.unwrap());
+    assert_eq!(err(second.await.unwrap()), read_only(&fx.ssh.name));
+    let commands: Vec<String> = fx.host.execs().into_iter().map(|e| e.1).collect();
+    assert_eq!(commands, ["one"]);
+    // And lowered to "No access": the same text as an unknown site.
+    fx.set_level(&fx.ssh, AgentAccess::All);
+    let hold = fx.host.hold_exec();
+    let first = spawn("three");
+    hold.entered().await;
+    let second = spawn("four");
+    until(|| fx.service.activity().running.get(&fx.ssh.id) == Some(&2)).await;
+    fx.set_level(&fx.ssh, AgentAccess::None);
+    hold.release();
+    ok(first.await.unwrap());
+    assert_eq!(err(second.await.unwrap()), SITE_UNAVAILABLE);
+    assert_eq!(fx.host.execs().len(), 2);
 }

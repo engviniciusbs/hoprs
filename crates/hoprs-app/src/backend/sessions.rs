@@ -69,6 +69,7 @@ use super::broker::{PromptBroker, SessionPrompter};
 use super::mapping::{SiteSecrets, ftp_config, ssh_config};
 use super::shells::{ShellId, Shells};
 use super::vault::VaultHandle;
+use crate::agent::host::{Endpoint, SessionEndpoint};
 
 /// Identifies one open session. Monotonic: never reused within a run.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -229,6 +230,9 @@ struct Entry {
     watcher: Option<JoinHandle<()>>,
     /// Started by an agent's call and not used by a tab since (see the module docs).
     agent_only: bool,
+    /// Where it connects: the site as read when the session started. A reconnect keeps
+    /// it; the agent service compares it with the site as saved now.
+    endpoint: Endpoint,
 }
 
 /// Connects, registers, watches and closes sessions. Cheap to clone.
@@ -549,6 +553,7 @@ impl SessionManager {
             prompter,
             secrets.keyring_unavailable,
             caller,
+            Endpoint::of(site),
         );
         id
     }
@@ -563,6 +568,7 @@ impl SessionManager {
         prompter: SessionPrompter,
         keyring_unavailable: bool,
         caller: Caller,
+        endpoint: Endpoint,
     ) {
         let activity = Arc::new(Activity::new());
         // Subscribed before the entry exists: the monitor sees every state from the first.
@@ -578,6 +584,7 @@ impl SessionManager {
             remote: None,
             watcher: None,
             agent_only: caller == Caller::Agent,
+            endpoint,
         };
         lock(&self.inner.sessions).insert(id, entry);
     }
@@ -803,6 +810,18 @@ impl SessionManager {
         sites
     }
 
+    /// Where the session of `site` (in any state) connects, and whether only an agent
+    /// uses it.
+    pub fn session_endpoint(&self, site: &SiteId) -> Option<SessionEndpoint> {
+        lock(&self.inner.sessions)
+            .values()
+            .find(|entry| entry.site == *site)
+            .map(|entry| SessionEndpoint {
+                endpoint: entry.endpoint.clone(),
+                agent_only: entry.agent_only,
+            })
+    }
+
     /// The session of `site`, in any state.
     pub(crate) fn session_of(&self, site: &SiteId) -> Option<SessionId> {
         lock(&self.inner.sessions)
@@ -998,7 +1017,18 @@ impl SessionManager {
         let mut test_site = Site::new("test", "test", "u", Protocol::Ftp);
         test_site.id = site;
         test_site.port = 0;
-        self.attach_site_as(&test_site, conn, remote, caller).await
+        // Where a saved site points, as a real session of it would; else the stand-in.
+        let id = test_site.id.clone();
+        let endpoint = self
+            .inner
+            .vault
+            .call(move |v| Ok(v.sites().iter().find(|s| s.id == id).map(Endpoint::of)))
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| Endpoint::of(&test_site));
+        self.attach_site_as(&test_site, endpoint, conn, remote, caller)
+            .await
     }
 
     /// [`attach`](Self::attach) for a given saved site (what the connection log names).
@@ -1009,13 +1039,15 @@ impl SessionManager {
         conn: Arc<dyn Connection>,
         remote: Arc<dyn RemoteFs>,
     ) -> Result<SessionId> {
-        self.attach_site_as(site, conn, remote, Caller::User).await
+        self.attach_site_as(site, Endpoint::of(site), conn, remote, Caller::User)
+            .await
     }
 
     #[cfg(test)]
     async fn attach_site_as(
         &self,
         site: &Site,
+        endpoint: Endpoint,
         conn: Arc<dyn Connection>,
         remote: Arc<dyn RemoteFs>,
         caller: Caller,
@@ -1034,7 +1066,16 @@ impl SessionManager {
         };
         let attempts = self.inner.config.reconnect.clone().unwrap_or_default();
         let label = SessionLabel::of(site, attempts.max_attempts);
-        self.insert(id, site.id.clone(), link, label, prompter, false, caller);
+        self.insert(
+            id,
+            site.id.clone(),
+            link,
+            label,
+            prompter,
+            false,
+            caller,
+            endpoint,
+        );
         lock(&self.inner.test_remotes).insert(id, remote);
         let site_lock = self.site_lock(&site.id);
         let _turn = site_lock.lock().await;
@@ -1842,6 +1883,18 @@ mod tests {
             .unwrap_err();
         let id = err.session.expect("the session is kept");
         assert_eq!(f.manager.agent_sites(), std::slice::from_ref(&site.id));
+        // It records where the site pointed when it started; an edit of the site since
+        // does not move it (the agent service compares the two).
+        let started = Some(SessionEndpoint {
+            endpoint: Endpoint::of(&site),
+            agent_only: true,
+        });
+        assert_eq!(f.manager.session_endpoint(&site.id), started);
+        let mut moved = site.clone();
+        moved.host = "localhost".into();
+        f.vault.upsert_site(moved).await.unwrap();
+        assert_eq!(f.manager.session_endpoint(&site.id), started);
+        assert_eq!(f.manager.session_endpoint(&SiteId::new()), None);
         // Its own connection's dialog (the password) is flagged...
         let seen = flags.lock().unwrap().clone();
         assert!(!seen.is_empty() && seen.iter().all(|b| *b), "{seen:?}");

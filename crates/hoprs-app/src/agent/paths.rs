@@ -1,10 +1,10 @@
 //! Local paths an agent names, and the protected ones.
 //!
 //! An agent's `download` and `upload` name a path on this computer. Everything is open
-//! except the [`Protected`] roots: hoprs's own directories ([`fixed_roots`]), the user's
-//! `~/.ssh`, the `known_hosts` in use and every key file a saved site names. Without
-//! them a download could overwrite `known_hosts` or `sites.toml`, and an upload could
-//! hand a private key to the agent.
+//! except the [`Protected`] roots: hoprs's own directories and the running program
+//! ([`fixed_roots`]), the user's `~/.ssh`, the `known_hosts` in use and every key file a
+//! saved site names. Without them a download could overwrite `known_hosts`, `sites.toml`
+//! or hoprs itself, and an upload could hand a private key to the agent.
 //!
 //! The check compares whole components of two forms of each path: [`resolved`] (links
 //! followed, through the nearest existing ancestor for a path that does not exist yet)
@@ -434,9 +434,10 @@ mod identity {
 
 /// The roots every check protects, before the saved sites' key files (ruling 16):
 /// `<base>/hoprs` for each standard base this system has (configuration, data, cache,
-/// runtime, temporary), `<home>/.ssh`, `known_hosts` and `own` (the backend's own
-/// directories).
-pub fn fixed_roots(own: &[PathBuf], known_hosts: &Path) -> Vec<PathBuf> {
+/// runtime, temporary), `<home>/.ssh`, `known_hosts`, `own` (the backend's own
+/// directories) and the running `program` ([`program_roots`]; `None` when
+/// `current_exe` failed: then no root for it).
+pub fn fixed_roots(own: &[PathBuf], known_hosts: &Path, program: Option<&Path>) -> Vec<PathBuf> {
     let bases = [
         dirs::config_dir(),
         dirs::data_dir(),
@@ -452,7 +453,39 @@ pub fn fixed_roots(own: &[PathBuf], known_hosts: &Path) -> Vec<PathBuf> {
     roots.extend(dirs::home_dir().map(|home| home.join(".ssh")));
     roots.push(known_hosts.to_path_buf());
     roots.extend(own.iter().cloned());
+    roots.extend(program.map(program_roots).unwrap_or_default());
     roots
+}
+
+/// The running program's own files: the executable `exe` (canonical when it resolves)
+/// and, on macOS, the `.app` bundle it sits in, so a download cannot replace hoprs
+/// itself where the user owns it (a dragged-in `hoprs.app`, the portable zip).
+pub fn program_roots(exe: &Path) -> Vec<PathBuf> {
+    let exe = fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
+    let bundle = if cfg!(target_os = "macos") {
+        app_bundle(&exe)
+    } else {
+        None
+    };
+    let mut roots = vec![exe];
+    roots.extend(bundle);
+    roots
+}
+
+/// The bundle of a macOS executable, `…/X.app` for `…/X.app/Contents/MacOS/<exe>`;
+/// `None` elsewhere. Names compare without letter case (the default on macOS).
+fn app_bundle(exe: &Path) -> Option<PathBuf> {
+    let macos = exe.parent()?;
+    let contents = macos.parent()?;
+    let bundle = contents.parent()?;
+    let named = |path: &Path, name: &str| {
+        path.file_name()
+            .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(name))
+    };
+    let app = bundle
+        .extension()
+        .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("app"));
+    (named(macos, "MacOS") && named(contents, "Contents") && app).then(|| bundle.to_path_buf())
 }
 
 /// An agent's local path as the transfer engine's local side names it (ruling 15): the
@@ -858,11 +891,80 @@ mod tests {
         assert!(prepared.check(Path::new(""), false).is_err());
     }
 
+    /// The running program is hoprs's own file: the executable is refused (by its own path
+    /// and through a link to it), a file beside it is not; without an executable nothing
+    /// is added.
+    #[test]
+    fn the_program_is_protected() {
+        let t = Tree::new();
+        fs::create_dir_all(t.at("opt/bin")).unwrap();
+        fs::write(t.at("opt/bin/hoprs"), b"program").unwrap();
+        fs::write(t.at("opt/bin/other"), b"x").unwrap();
+        let roots = fixed_roots(&[], &t.at("kh"), Some(&t.at("opt/bin/hoprs")));
+        let protected = Protected::new(roots);
+        assert!(protected.check(&t.at("opt/bin/hoprs"), false).is_err());
+        assert!(protected.check(&t.at("opt/bin"), true).is_err());
+        assert!(protected.check(&t.at("opt/bin/other"), false).is_ok());
+        assert!(protected.check(&t.at("opt/bin/hoprs-notes"), false).is_ok());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(t.at("opt/bin/hoprs"), t.at("work/a/prog")).unwrap();
+            assert!(protected.check(&t.at("work/a/prog"), false).is_err());
+        }
+        assert_eq!(
+            fixed_roots(&[], &t.at("kh"), None).len() + 1,
+            fixed_roots(&[], &t.at("kh"), Some(&t.at("opt/bin/hoprs"))).len()
+        );
+    }
+
+    /// Inside a macOS bundle the whole `.app` is the program's; elsewhere only the file.
+    #[test]
+    fn a_program_inside_an_app_bundle_protects_the_bundle() {
+        let bundle = Path::new("/Applications").join("hoprs.app");
+        let exe = bundle.join("Contents").join("MacOS").join("hoprs");
+        assert_eq!(app_bundle(&exe), Some(bundle.clone()));
+        let renamed = Path::new("/Users")
+            .join("me")
+            .join("Downloads")
+            .join("Hoprs 2.APP");
+        assert_eq!(
+            app_bundle(&renamed.join("Contents").join("MacOS").join("hoprs")),
+            Some(renamed)
+        );
+        for outside in [
+            Path::new("/usr").join("bin").join("hoprs"),
+            bundle.join("Contents").join("Resources").join("hoprs"),
+            Path::new("/x").join("Contents").join("MacOS").join("hoprs"),
+            Path::new("hoprs").to_path_buf(),
+        ] {
+            assert_eq!(app_bundle(&outside), None, "{outside:?}");
+        }
+        // On macOS the bundle joins the roots; a file inside it is refused, a sibling
+        // of the bundle is not.
+        let t = Tree::new();
+        let app = t.at("Apps/hoprs.app");
+        fs::create_dir_all(app.join("Contents").join("MacOS")).unwrap();
+        fs::write(app.join("Contents").join("MacOS").join("hoprs"), b"p").unwrap();
+        let roots = program_roots(&app.join("Contents").join("MacOS").join("hoprs"));
+        let protected = Protected::new(roots);
+        let inside = app.join("Contents").join("Info.plist");
+        assert_eq!(
+            protected.check(&inside, false).is_err(),
+            cfg!(target_os = "macos")
+        );
+        assert!(protected.check(&t.at("Apps/notes.txt"), false).is_ok());
+        assert!(
+            protected
+                .check(&app.join("Contents").join("MacOS").join("hoprs"), false)
+                .is_err()
+        );
+    }
+
     #[test]
     fn fixed_roots_cover_every_hoprs_directory() {
         let own = vec![PathBuf::from("/own/profile"), PathBuf::from("/own/queue")];
         let known_hosts = PathBuf::from("/elsewhere/known_hosts");
-        let roots = fixed_roots(&own, &known_hosts);
+        let roots = fixed_roots(&own, &known_hosts, None);
         assert!(roots.contains(&known_hosts));
         assert!(own.iter().all(|dir| roots.contains(dir)));
         let home = dirs::home_dir().expect("a home directory");

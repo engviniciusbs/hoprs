@@ -17,7 +17,8 @@ iced = { workspace = true, features = ["image-without-codecs"] }
 # laid out and drawn without a window.
 iced_runtime = "0.14"
 iced_tiny_skia = "0.14"
-# `net`: the agent channel (a Unix domain socket, or a named pipe on Windows).
+# `net`: the agent channel (a Unix domain socket, or a named pipe on Windows). `fs`: the
+# agent's `upload` looks at its local path without blocking (`agent/service/transfers.rs`).
 tokio = { workspace = true, features = ["rt", "sync", "macros", "time", "io-util", "fs", "net"] }
 tokio-util = { workspace = true }
 futures-util = { workspace = true }

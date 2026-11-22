@@ -11,7 +11,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use hoprs_core::{Error, Result, Site, SiteId};
+use hoprs_core::{Error, Protocol, Result, Site, SiteId};
 use hoprs_remote::RemoteFs;
 use hoprs_ssh::{ExecLimits, ExecOutput};
 use hoprs_transfer::{ConflictPolicy, Event, TransferId, TransferItem, TransferSpec};
@@ -38,6 +38,37 @@ impl fmt::Debug for ConnectFailure {
     }
 }
 
+/// Where a session connects: the site's protocol, host, port and user name as they were
+/// when the session started. A site edited since may name another server; the service
+/// compares the two before it uses a session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Endpoint {
+    pub protocol: Protocol,
+    pub host: String,
+    pub port: u16,
+    pub user: String,
+}
+
+impl Endpoint {
+    pub fn of(site: &Site) -> Endpoint {
+        Endpoint {
+            protocol: site.protocol,
+            host: site.host.clone(),
+            port: site.port,
+            user: site.user.clone(),
+        }
+    }
+}
+
+/// The site's session as the agent service checks it before use.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionEndpoint {
+    /// Where the session connects.
+    pub endpoint: Endpoint,
+    /// Only an agent uses it (no tab).
+    pub agent_only: bool,
+}
+
 /// The operations the agent service needs (see the module docs).
 #[async_trait]
 pub trait AgentHost: Send + Sync + 'static {
@@ -50,6 +81,9 @@ pub trait AgentHost: Send + Sync + 'static {
     /// Connects the site for an agent: a new session is the agent's and its dialogs say an
     /// agent asked; a session the site already has is reused as it is.
     async fn connect(&self, site: &SiteId) -> std::result::Result<SessionId, ConnectFailure>;
+    /// Where the site's session (in any state) connects, and whether only an agent uses
+    /// it; `None` without a session.
+    fn session_endpoint(&self, site: &SiteId) -> Option<SessionEndpoint>;
     /// Whether the site's session is waiting on the user (a dialog is open).
     fn prompt_open(&self, site: &SiteId) -> bool;
     /// Closes the site's session if only an agent uses it; whether it did.

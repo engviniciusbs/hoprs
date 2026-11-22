@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use tokio::io::AsyncReadExt;
 use tokio::sync::mpsc;
 
-use super::{Done, Failure, Service, count};
+use super::{Done, Failure, Service, ToolSpec, count};
 use crate::backend::edit::{self, UploadMode};
 use crate::backend::ops::{self, DeleteTarget};
 
@@ -31,12 +31,13 @@ impl Service {
     /// The folder's entries sorted by name, the page `offset .. offset + limit` of them.
     pub(super) async fn list_directory(
         &self,
+        spec: &ToolSpec,
         site: &Site,
         path: &RemotePath,
         offset: u64,
         limit: Option<u64>,
     ) -> Result<Vec<String>, Failure> {
-        let remote = self.remote(site).await?;
+        let remote = self.remote(spec, site).await?;
         let mut entries = remote
             .list(path)
             .await
@@ -64,10 +65,11 @@ impl Service {
     /// One path's entry, with its `path`.
     pub(super) async fn stat(
         &self,
+        spec: &ToolSpec,
         site: &Site,
         path: &RemotePath,
     ) -> Result<Vec<String>, Failure> {
-        let remote = self.remote(site).await?;
+        let remote = self.remote(spec, site).await?;
         let found = remote
             .stat(path)
             .await
@@ -90,12 +92,13 @@ impl Service {
     /// the middle of the path is the server's to follow.
     pub(super) async fn read_file(
         &self,
+        spec: &ToolSpec,
         site: &Site,
         path: &RemotePath,
         offset: u64,
         length: Option<u64>,
     ) -> Result<Vec<String>, Failure> {
-        let remote = self.remote(site).await?;
+        let remote = self.remote(spec, site).await?;
         let found = remote
             .stat(path)
             .await
@@ -196,12 +199,13 @@ impl Service {
     /// on FTP.
     pub(super) async fn write_file(
         &self,
+        spec: &ToolSpec,
         site: &Site,
         path: &RemotePath,
         content: &str,
         overwrite: bool,
     ) -> Result<Done, Failure> {
-        let remote = self.remote(site).await?;
+        let remote = self.remote(spec, site).await?;
         let what = format!("Could not write {path}");
         match remote.stat(path).await {
             Ok(found) => match found.kind {
@@ -255,10 +259,11 @@ impl Service {
     /// (every backend's `mkdir` answers so).
     pub(super) async fn make_directory(
         &self,
+        spec: &ToolSpec,
         site: &Site,
         path: &RemotePath,
     ) -> Result<Done, Failure> {
-        let remote = self.remote(site).await?;
+        let remote = self.remote(spec, site).await?;
         if let Err(e) = remote.mkdir(path).await {
             let mut failure = failed(&format!("Could not create the folder {path}"), &e);
             if e.kind == ErrorKind::NotFound {
@@ -274,11 +279,12 @@ impl Service {
     /// Renames or moves, never over something that is at `to`.
     pub(super) async fn rename(
         &self,
+        spec: &ToolSpec,
         site: &Site,
         from: &RemotePath,
         to: &RemotePath,
     ) -> Result<Done, Failure> {
-        let remote = self.remote(site).await?;
+        let remote = self.remote(spec, site).await?;
         match ops::rename_no_replace(remote.as_ref(), from, to).await {
             Ok(()) => {
                 let result = json!({"ok": true, "from": from.as_str(), "to": to.as_str()});
@@ -297,11 +303,12 @@ impl Service {
     /// Sets the permission bits. Over FTP it is `SITE CHMOD`, which many servers lack.
     pub(super) async fn set_permissions(
         &self,
+        spec: &ToolSpec,
         site: &Site,
         path: &RemotePath,
         mode: u32,
     ) -> Result<Done, Failure> {
-        let remote = self.remote(site).await?;
+        let remote = self.remote(spec, site).await?;
         let what = format!("Could not change the permissions of {path}");
         // Over SFTP a chmod follows a link and changes its target: refused, as the server
         // reports the path.
@@ -340,11 +347,12 @@ impl Service {
     /// it; answers how many items went. A failure half way says how many went before it.
     pub(super) async fn delete(
         &self,
+        spec: &ToolSpec,
         site: &Site,
         path: &RemotePath,
         recursive: bool,
     ) -> Result<Done, Failure> {
-        let remote = self.remote(site).await?;
+        let remote = self.remote(spec, site).await?;
         let what = format!("Could not delete {path}");
         let found = remote.stat(path).await.map_err(|e| failed(&what, &e))?;
         if found.kind == EntryKind::Dir && !recursive {

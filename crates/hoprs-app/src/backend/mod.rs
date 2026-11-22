@@ -524,6 +524,9 @@ pub struct BackendConfig {
     /// The directory of the agent channel, protected from agents' transfers like the
     /// others; `None` until the run knows it.
     pub agent_dir: Option<PathBuf>,
+    /// The running executable, protected from agents' transfers too (see
+    /// [`crate::agent::paths::program_roots`]); `None` when it is not known.
+    pub program: Option<PathBuf>,
 }
 
 impl BackendConfig {
@@ -538,6 +541,7 @@ impl BackendConfig {
             edit_dir: edit::default_edit_dir(),
             recovered_dir: edit::default_recovered_dir(),
             agent_dir: None,
+            program: std::env::current_exe().ok(),
         })
     }
 
@@ -615,6 +619,7 @@ impl Backend {
         let fixed = crate::agent::paths::fixed_roots(
             &config.own_dirs(),
             &config.sessions.known_hosts_path(),
+            config.program.as_deref(),
         );
         let (engine, queue_error) = start_engine(
             config.queue_path.as_deref(),
@@ -1302,6 +1307,7 @@ mod tests {
             edit_dir: dir.join("edit"),
             recovered_dir: dir.join("recovered"),
             agent_dir,
+            program: None,
         };
         Backend::open(config, Arc::new(MemoryStore::new())).unwrap()
     }
@@ -1859,6 +1865,7 @@ mod tests {
             edit_dir: dir.path().join("edit"),
             recovered_dir: dir.path().join("recovered"),
             agent_dir: None,
+            program: None,
         };
         let backend = Backend::open(config, Arc::new(MemoryStore::new())).unwrap();
         let key = "AAAAC3NzaC1lZDI1NTE5AAAAIGrhflDkrs18RwIFvHFCsoXLdUL+0cVr81616Tzk8aBj";
@@ -2019,6 +2026,7 @@ mod tests {
             edit_dir: dir.path().join("edit"),
             recovered_dir: dir.path().join("recovered"),
             agent_dir: None,
+            program: None,
         };
         let backend = Backend::open(config, Arc::new(MemoryStore::new())).unwrap();
         assert!(backend.engine.snapshot().await.is_empty());
@@ -2528,6 +2536,7 @@ mod tests {
             edit_dir: dir.path().join("edit"),
             recovered_dir: dir.path().join("recovered"),
             agent_dir: None,
+            program: None,
         };
         let backend = Arc::new(Backend::open(config, Arc::new(MemoryStore::new())).unwrap());
         let mut prompts = backend.prompt_events().unwrap();

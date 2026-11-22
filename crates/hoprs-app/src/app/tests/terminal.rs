@@ -1073,6 +1073,7 @@ async fn terminal_tab_end_to_end() {
         edit_dir: dir.path().join("edit"),
         recovered_dir: dir.path().join("recovered"),
         agent_dir: None,
+        program: None,
     };
     let backend = Backend::open(config, Arc::new(hoprs_vault::MemoryStore::new())).unwrap();
     let backend: Arc<dyn BackendApi> = Arc::new(backend);

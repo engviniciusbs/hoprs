@@ -127,8 +127,10 @@ pub fn run() -> iced::Result {
 pub fn run_mcp() -> i32 {
     use tracing_subscriber::util::SubscriberInitExt;
     let filter = log_filter(std::env::var("RUST_LOG").ok().as_deref());
-    // The panel's buffer is never shown here; the subscriber wants one.
-    log_subscriber(&filter, logbuf::LogBuffer::new(), io::stderr).init();
+    // The panel's buffer is never shown here; the subscriber wants one. No colour codes
+    // into a pipe or a file (an MCP client keeps the relay's stderr as text).
+    let ansi = io::IsTerminal::is_terminal(&io::stderr());
+    log_subscriber(&filter, logbuf::LogBuffer::new(), io::stderr, ansi).init();
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -585,23 +587,27 @@ where
 
 /// What `main` logs to: the terminal output (`writer`) and the log panel's
 /// `buffer`, each behind the same filter ([`subscriber_filter`]), so the panel
-/// never shows what the terminal wouldn't.
+/// never shows what the terminal wouldn't. Without `ansi` the terminal output has no
+/// colour codes; with it, the fmt layer's default (colours unless `NO_COLOR`).
 fn log_subscriber<W>(
     filter: &LogFilter,
     buffer: logbuf::LogBuffer,
     writer: W,
+    ansi: bool,
 ) -> impl tracing::Subscriber + Send + Sync + 'static
 where
     W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
 {
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
+    let output = tracing_subscriber::fmt::layer().with_writer(writer);
+    let output = if ansi {
+        output
+    } else {
+        output.with_ansi(false)
+    };
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(writer)
-                .with_filter(subscriber_filter(filter)),
-        )
+        .with(output.with_filter(subscriber_filter(filter)))
         .with(buffer.with_filter(subscriber_filter(filter)))
 }
 
@@ -609,7 +615,7 @@ fn init_logging(filter: &LogFilter, buffer: logbuf::LogBuffer) {
     use tracing_subscriber::util::SubscriberInitExt;
     // `init` also installs the `log` bridge, through which vte and
     // alacritty_terminal log.
-    log_subscriber(filter, buffer, io::stdout).init();
+    log_subscriber(filter, buffer, io::stdout, true).init();
     if filter.capped {
         tracing::warn!(
             "RUST_LOG would log suppaftp at trace, where it logs passwords; lowered to debug"
@@ -638,7 +644,7 @@ fn subscriber_test_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 fn capture_log(filter: &LogFilter) -> (logbuf::LogBuffer, LogCapture) {
     let buffer = logbuf::LogBuffer::new();
-    let dispatch = tracing::Dispatch::new(log_subscriber(filter, buffer.clone(), io::sink));
+    let dispatch = tracing::Dispatch::new(log_subscriber(filter, buffer.clone(), io::sink, true));
     let capture = LogCapture {
         _default: tracing::dispatcher::set_default(&dispatch),
         dispatch,
@@ -957,7 +963,7 @@ mod tests {
     /// enables a debug event from `target`, optionally inside a span `span`.
     fn debug_enabled(rust_log: Option<&str>, target: &str, in_span: bool) -> bool {
         let filter = log_filter(rust_log);
-        let subscriber = log_subscriber(&filter, logbuf::LogBuffer::new(), io::sink);
+        let subscriber = log_subscriber(&filter, logbuf::LogBuffer::new(), io::sink, true);
         tracing::subscriber::with_default(subscriber, || {
             let span = in_span.then(|| tracing::info_span!("connect").entered());
             let enabled = match target {
@@ -1018,6 +1024,45 @@ mod tests {
             let _span = tracing::info_span!("connect").entered();
             assert!(tracing::enabled!(target: "vte", tracing::Level::DEBUG));
         });
+    }
+
+    /// The relay's log off a terminal (`ansi` false) carries no colour codes: an MCP client
+    /// keeps its stderr as text. With `ansi` the same line is coloured.
+    #[test]
+    fn relay_log_has_no_colour_codes_off_a_terminal() {
+        #[derive(Clone, Default)]
+        struct Out(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl io::Write for Out {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let _lock = subscriber_test_lock();
+        let written = |ansi: bool| {
+            let out = Out::default();
+            let writer = out.clone();
+            let subscriber = log_subscriber(
+                &log_filter(None),
+                logbuf::LogBuffer::new(),
+                move || writer.clone(),
+                ansi,
+            );
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::warn!(app = "1.6.0", "hoprs runs another version");
+            });
+            let bytes = out.0.lock().unwrap().clone();
+            String::from_utf8(bytes).unwrap()
+        };
+        let plain = written(false);
+        assert!(plain.contains("hoprs runs another version"), "{plain}");
+        assert!(!plain.contains('\x1b'), "{plain:?}");
+        if std::env::var_os("NO_COLOR").is_none() {
+            assert!(written(true).contains('\x1b'), "not vacuous");
+        }
     }
 
     /// The MCP SDK logs requests and unparsable input lines verbatim at debug: never

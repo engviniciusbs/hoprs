@@ -9,7 +9,11 @@
 //! hangs included), and `connect_user` takes the same lock. A connect can be
 //! made to fail ([`fail_connect`](FakeHost::fail_connect)) or never end
 //! ([`hang_connect`](FakeHost::hang_connect)); both leave an agent-only session that is
-//! not connected, like a real attempt that failed or waits on a dialog.
+//! not connected, like a real attempt that failed or waits on a dialog. Each session
+//! keeps the endpoint of its site as saved when it started
+//! ([`session_endpoint`](AgentHost::session_endpoint)): a connect reads the site when it
+//! starts, before its turn and its hold, so a site edited while it waits gives a session
+//! to the old endpoint, as with the real host.
 //!
 //! Holds: [`hold`](FakeHost::hold) stops one kind of filesystem call of a site, and
 //! [`hold_exec`](FakeHost::hold_exec) every command, [`hold_connect`](FakeHost::hold_connect)
@@ -43,7 +47,7 @@ use hoprs_transfer::{
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::{broadcast, watch};
 
-use super::host::{AgentHost, ConnectFailure};
+use super::host::{AgentHost, ConnectFailure, Endpoint, SessionEndpoint};
 use super::paths::Protected;
 use crate::backend::SessionId;
 
@@ -184,6 +188,8 @@ struct State {
     sites: Vec<Site>,
     files: HashMap<SiteId, MemFs>,
     sessions: HashMap<SiteId, FakeSession>,
+    /// Where each session connects: the site as saved when the session started.
+    endpoints: HashMap<SessionId, Endpoint>,
     next_session: u64,
     connects: HashMap<SiteId, usize>,
     plans: HashMap<SiteId, ConnectPlan>,
@@ -211,6 +217,15 @@ struct State {
     /// The `seq` of the last engine event sent.
     seq: u64,
     protected: Vec<PathBuf>,
+}
+
+impl State {
+    /// The new session `id` of `site` connects where the site, as saved now, points.
+    fn record_endpoint(&mut self, site: &SiteId, id: SessionId) {
+        if let Some(endpoint) = self.sites.iter().find(|s| s.id == *site).map(Endpoint::of) {
+            self.endpoints.insert(id, endpoint);
+        }
+    }
 }
 
 /// The in-memory [`AgentHost`] (see the module docs).
@@ -269,6 +284,7 @@ impl FakeHost {
                     sites: Vec::new(),
                     files: HashMap::new(),
                     sessions: HashMap::new(),
+                    endpoints: HashMap::new(),
                     next_session: 1,
                     connects: HashMap::new(),
                     plans: HashMap::new(),
@@ -371,6 +387,7 @@ impl FakeHost {
         session.agent_only = true;
         if session.id == id {
             state.next_session += 1;
+            state.record_endpoint(site, id);
         }
     }
 
@@ -395,6 +412,7 @@ impl FakeHost {
         let id_now = session.id;
         if id_now == id {
             state.next_session += 1;
+            state.record_endpoint(site, id);
         }
         state.tab_errors.remove(site);
         id_now
@@ -541,10 +559,14 @@ impl AgentHost for FakeHost {
     }
 
     async fn connect(&self, site: &SiteId) -> std::result::Result<SessionId, ConnectFailure> {
-        let hold = {
+        // The site is read when the connect starts, as the real host reads it (with its
+        // secrets) before it waits for the site's turn: a site edited while this connect
+        // waits gives a session to the endpoint read here.
+        let (hold, read) = {
             let mut state = self.state();
             *state.connects.entry(site.clone()).or_default() += 1;
-            state.connect_holds.get(site).cloned()
+            let read = state.sites.iter().find(|s| s.id == *site).map(Endpoint::of);
+            (state.connect_holds.get(site).cloned(), read)
         };
         // Held until this connect ends or is dropped.
         let _turn = self.turn(site).lock_owned().await;
@@ -585,6 +607,9 @@ impl AgentHost for FakeHost {
             let session = *session;
             if session.id == id {
                 state.next_session += 1;
+                if let Some(read) = read {
+                    state.endpoints.insert(id, read);
+                }
             }
             match plan {
                 None => return Ok(session.id),
@@ -595,6 +620,15 @@ impl AgentHost for FakeHost {
             ConnectPlan::Fail(error) => Err(ConnectFailure { error }),
             ConnectPlan::Hang => std::future::pending().await,
         }
+    }
+
+    fn session_endpoint(&self, site: &SiteId) -> Option<SessionEndpoint> {
+        let state = self.state();
+        let session = state.sessions.get(site)?;
+        Some(SessionEndpoint {
+            endpoint: state.endpoints.get(&session.id)?.clone(),
+            agent_only: session.agent_only,
+        })
     }
 
     /// Only a session can wait on a dialog: `false` without one, whatever was set.
@@ -608,7 +642,9 @@ impl AgentHost for FakeHost {
         if !state.sessions.get(site).is_some_and(|s| s.agent_only) {
             return false;
         }
-        state.sessions.remove(site);
+        if let Some(session) = state.sessions.remove(site) {
+            state.endpoints.remove(&session.id);
+        }
         state.closed.push(site.clone());
         true
     }

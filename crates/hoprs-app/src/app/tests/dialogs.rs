@@ -1222,6 +1222,23 @@ fn agent_prompt_is_shown_without_a_tab() {
     assert!(matches!(reply, PromptAnswer::Cancel), "{reply:?}");
 }
 
+/// The keys on an agent's host-key dialog: Enter and Escape both answer Cancel (the
+/// window's keys, not a message sent straight to the dialog).
+#[test]
+fn agent_host_key_dialog_keys_cancel() {
+    for key in [FileKey::Enter, FileKey::Escape] {
+        let mut app = App::new();
+        let mut asked = request(1, 5, "h:22", host_key(&[]));
+        asked.by_agent = true;
+        show(&mut app, asked);
+        let effects = app.dialog_key(key, false);
+        let (id, reply) = answer(&effects);
+        assert_eq!(id, PromptId(1), "{key:?}");
+        assert!(matches!(reply, PromptAnswer::Cancel), "{key:?}: {reply:?}");
+        assert_eq!(shown(&app), None, "{key:?}");
+    }
+}
+
 /// A site whose last tab closed while it connected is abandoned: the user's dialogs for
 /// it are dropped with their session. An agent's request is a different session (an
 /// agent's call started it): it is shown, its session kept, and closing a tab later does
