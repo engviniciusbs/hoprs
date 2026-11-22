@@ -3,6 +3,7 @@
 mod auth;
 pub mod channels;
 pub mod config;
+mod exec;
 pub mod known_hosts;
 pub mod net;
 pub mod prompt;
@@ -15,6 +16,7 @@ mod watchdog;
 pub use auth::{AuthMethod, WINDOWS_AGENT_PIPE, key_type};
 pub use channels::{ChannelSlot, is_channel_limit, sftp_stream_channels};
 pub use config::{AuthConfig, KeySource, SshConfig};
+pub use exec::{ExecEnd, ExecLimits, ExecOutput};
 pub use hoprs_core::ReconnectPolicy;
 pub use prompt::{AcceptedSecret, KbdPrompt, Prompter};
 #[cfg(feature = "testing")]

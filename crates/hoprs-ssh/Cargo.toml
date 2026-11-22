@@ -37,3 +37,7 @@ required-features = ["testing"]
 [[test]]
 name = "shell"
 required-features = ["testing"]
+
+[[test]]
+name = "exec"
+required-features = ["testing"]
