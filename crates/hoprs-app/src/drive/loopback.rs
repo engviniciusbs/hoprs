@@ -10,6 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use hoprs_core::{Error, ErrorKind};
+use secrecy::SecretString;
 
 use super::oauth::{Callback, connect_failed, parse_callback};
 
@@ -22,6 +23,20 @@ const POLL: Duration = Duration::from_millis(50);
 const READ_LIMIT: usize = 8 * 1024;
 const READ_TIME: Duration = Duration::from_secs(2);
 const DENIED_DETAIL_MAX: usize = 100;
+
+/// Whether an `accept` error leaves the listener usable. A connection that fell over
+/// before it was taken (reset, aborted, protocol errors) says nothing about the next one,
+/// and any local process can cause it, so only errors of a broken listener are fatal.
+fn retryable(kind: IoKind) -> bool {
+    !matches!(
+        kind,
+        IoKind::InvalidInput
+            | IoKind::NotConnected
+            | IoKind::PermissionDenied
+            | IoKind::Unsupported
+            | IoKind::OutOfMemory
+    )
+}
 
 /// The texts of the two pages the browser sees (plain text; the module wraps them).
 // TODO(task 9 or 10): the connect flow builds these from the catalog; remove this allow then.
@@ -101,7 +116,11 @@ fn read_head(stream: &mut TcpStream) -> Option<Vec<u8>> {
 }
 
 #[allow(dead_code)] // TODO(task 9 or 10): reached from `wait` once the connect flow calls it.
-fn handle(mut stream: TcpStream, state: &str, pages: &Pages) -> Option<Result<String, Error>> {
+fn handle(
+    mut stream: TcpStream,
+    state: &str,
+    pages: &Pages,
+) -> Option<Result<SecretString, Error>> {
     // Accepted sockets may inherit the listener's non-blocking mode.
     stream.set_nonblocking(false).ok()?;
     let Some(head) = read_head(&mut stream) else {
@@ -111,7 +130,7 @@ fn handle(mut stream: TcpStream, state: &str, pages: &Pages) -> Option<Result<St
     match parse_callback(&head, state) {
         Callback::Code(code) => {
             respond(&mut stream, "200 OK", &page(&pages.connected));
-            Some(Ok(code))
+            Some(Ok(SecretString::from(code)))
         }
         Callback::Denied(reason) => {
             respond(&mut stream, "200 OK", &page(&pages.failed));
@@ -157,7 +176,7 @@ impl Listener {
         cancel: &AtomicBool,
         timeout: Duration,
         pages: &Pages,
-    ) -> Result<String, Error> {
+    ) -> Result<SecretString, Error> {
         let deadline = Instant::now() + timeout;
         loop {
             if cancel.load(Ordering::Relaxed) {
@@ -183,8 +202,7 @@ impl Listener {
                 Err(e) if matches!(e.kind(), IoKind::WouldBlock | IoKind::Interrupted) => {
                     std::thread::sleep(POLL);
                 }
-                // A connection that fell over before we took it: the next one may be fine.
-                Err(e) if e.kind() == IoKind::ConnectionAborted => {}
+                Err(e) if retryable(e.kind()) => std::thread::sleep(POLL),
                 Err(e) => return Err(connect_failed(format!("accept failed: {e}"))),
             }
         }
@@ -194,6 +212,7 @@ impl Listener {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::ExposeSecret;
     use std::sync::Arc;
 
     fn pages() -> Pages {
@@ -229,7 +248,7 @@ mod tests {
         listener: Listener,
         state: &'static str,
         timeout: Duration,
-    ) -> std::thread::JoinHandle<Result<String, Error>> {
+    ) -> std::thread::JoinHandle<Result<SecretString, Error>> {
         std::thread::spawn(move || listener.wait(state, &AtomicBool::new(false), timeout, &pages()))
     }
 
@@ -240,7 +259,7 @@ mod tests {
         let port = port_of(&listener);
         let waiting = run(listener, "S", Duration::from_secs(20));
         let answer = send(port, b"GET /?code=abc&state=S HTTP/1.1\r\n\r\n");
-        assert_eq!(waiting.join().unwrap().unwrap(), "abc");
+        assert_eq!(waiting.join().unwrap().unwrap().expose_secret(), "abc");
         assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
         assert!(answer.contains("Content-Type: text/html; charset=utf-8"));
         assert!(answer.contains("Cache-Control: no-store"));
@@ -281,7 +300,7 @@ mod tests {
         let answer = send(port, b"GET /?code=abc&state=S HTTP/1.1\r\n\r\n");
         assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
         drop(silent);
-        assert_eq!(waiting.join().unwrap().unwrap(), "abc");
+        assert_eq!(waiting.join().unwrap().unwrap().expose_secret(), "abc");
     }
 
     #[test]
@@ -313,6 +332,56 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, Some("drive-connect-timed-out"));
         TcpListener::bind(("127.0.0.1", port)).unwrap();
+    }
+
+    #[test]
+    fn connections_that_fall_over_do_not_end_the_wait() {
+        // std cannot set SO_LINGER on stable, so a hard reset cannot be forced here;
+        // the closest reliable cases are a connect-and-close and a half-sent request.
+        let listener = Listener::bind().unwrap();
+        let port = port_of(&listener);
+        let waiting = run(listener, "S", Duration::from_secs(30));
+        drop(TcpStream::connect(("127.0.0.1", port)).unwrap());
+        let mut half = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        half.write_all(b"GET /?code=abc&sta").unwrap();
+        drop(half);
+        let answer = send(port, b"GET /?code=abc&state=S HTTP/1.1\r\n\r\n");
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert_eq!(waiting.join().unwrap().unwrap().expose_secret(), "abc");
+    }
+
+    #[test]
+    fn only_a_broken_listener_ends_the_wait() {
+        for kind in [
+            IoKind::ConnectionReset,
+            IoKind::ConnectionAborted,
+            IoKind::WouldBlock,
+            IoKind::Interrupted,
+            IoKind::TimedOut,
+            IoKind::Other,
+            IoKind::HostUnreachable,
+            IoKind::NetworkDown,
+        ] {
+            assert!(retryable(kind), "{kind:?}");
+        }
+        for kind in [
+            IoKind::InvalidInput,
+            IoKind::NotConnected,
+            IoKind::PermissionDenied,
+        ] {
+            assert!(!retryable(kind), "{kind:?}");
+        }
+    }
+
+    #[test]
+    fn the_returned_code_is_not_in_debug_output() {
+        let listener = Listener::bind().unwrap();
+        let port = port_of(&listener);
+        let waiting = run(listener, "S", Duration::from_secs(20));
+        send(port, b"GET /?code=abc123secret&state=S HTTP/1.1\r\n\r\n");
+        let result = waiting.join().unwrap();
+        assert!(!format!("{result:?}").contains("abc123secret"));
+        assert_eq!(result.unwrap().expose_secret(), "abc123secret");
     }
 
     #[test]

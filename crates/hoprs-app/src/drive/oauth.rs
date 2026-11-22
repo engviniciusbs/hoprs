@@ -98,7 +98,7 @@ pub fn auth_url(
 }
 
 /// What a request to the loopback listener means.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 // TODO(task 9 or 10): the connect flow; remove this allow then.
 #[allow(dead_code)]
 pub enum Callback {
@@ -108,6 +108,17 @@ pub enum Callback {
     Denied(String),
     /// Anything else: a stray request.
     Other,
+}
+
+/// Never shows the authorisation code.
+impl std::fmt::Debug for Callback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Code(_) => f.write_str("Code(..)"),
+            Self::Denied(reason) => f.debug_tuple("Denied").field(reason).finish(),
+            Self::Other => f.write_str("Other"),
+        }
+    }
 }
 
 /// Equal bytes, compared without stopping at the first difference (lengths may leak).
@@ -238,6 +249,16 @@ mod tests {
             );
         }
         assert!(!query.contains(' ') && !query.contains("&x=1"));
+    }
+
+    #[test]
+    fn callback_debug_hides_the_code() {
+        let shown = format!("{:?}", Callback::Code("abc123secret".into()));
+        assert_eq!(shown, "Code(..)");
+        assert_eq!(
+            format!("{:?}", Callback::Denied("access_denied".into())),
+            "Denied(\"access_denied\")"
+        );
     }
 
     #[test]
