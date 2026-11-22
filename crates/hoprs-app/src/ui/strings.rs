@@ -1535,6 +1535,60 @@ pub fn drive_page_connected() -> &'static str {
 pub fn drive_page_failed() -> &'static str {
     tr("drive-page-failed")
 }
+pub fn export_destination() -> &'static str {
+    tr("export-destination")
+}
+pub fn export_destination_file() -> &'static str {
+    tr("export-destination-file")
+}
+pub fn export_destination_drive() -> &'static str {
+    tr("export-destination-drive")
+}
+pub fn drive_connect() -> &'static str {
+    tr("drive-connect")
+}
+pub fn drive_account() -> &'static str {
+    tr("drive-account")
+}
+pub fn drive_connected() -> &'static str {
+    tr("drive-connected")
+}
+pub fn drive_disconnect() -> &'static str {
+    tr("drive-disconnect")
+}
+pub fn drive_file_name() -> &'static str {
+    tr("drive-file-name")
+}
+pub fn drive_waiting() -> &'static str {
+    tr("drive-waiting")
+}
+pub fn drive_copy_link() -> &'static str {
+    tr("drive-copy-link")
+}
+pub fn drive_browser_hint() -> &'static str {
+    tr("drive-browser-hint")
+}
+pub fn drive_session_only() -> &'static str {
+    tr("drive-session-only")
+}
+pub fn drive_uploading() -> &'static str {
+    tr("drive-uploading")
+}
+pub fn drive_uploaded(path: &str) -> String {
+    tr_args("drive-uploaded", &[("path", path.into())])
+}
+pub fn drive_open() -> &'static str {
+    tr("drive-open")
+}
+pub fn drive_save_local() -> &'static str {
+    tr("drive-save-local")
+}
+pub fn drive_saved_local(path: &str) -> String {
+    tr_args("drive-saved-local", &[("path", path.into())])
+}
+pub fn drive_settings_line() -> &'static str {
+    tr("drive-settings-line")
+}
 pub fn export() -> &'static str {
     tr("export")
 }

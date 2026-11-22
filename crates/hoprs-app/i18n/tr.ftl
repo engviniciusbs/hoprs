@@ -569,6 +569,24 @@ drive-name-required = Dosya için bir ad girin
 # The pages the browser shows after connecting to Google Drive.
 drive-page-connected = hoprs bağlandı. Bu sekmeyi kapatabilirsiniz.
 drive-page-failed = hoprs bağlanamadı. hoprs'a dönüp yeniden deneyin.
+export-destination = Hedef
+export-destination-file = Bu bilgisayarda bir dosya
+export-destination-drive = Google Drive
+drive-connect = Google Drive'a bağlan…
+drive-account = Hesap
+drive-connected = Bağlı
+drive-disconnect = Bağlantıyı kes
+drive-file-name = Ad
+drive-waiting = Tarayıcı bekleniyor…
+drive-copy-link = Bağlantıyı kopyala
+drive-browser-hint = Tarayıcı açılmadıysa bağlantıyı kopyalayıp kendiniz açın.
+drive-session-only = Sistem anahtarlığı kullanılamıyor: bu bağlantı hoprs kapanana kadar geçerli.
+drive-uploading = Google Drive'a yükleniyor…
+drive-uploaded = Google Drive'a yüklendi: { $path }
+drive-open = Drive'da aç
+drive-save-local = Bu bilgisayara kaydet…
+drive-saved-local = { $path } konumuna kaydedildi
+drive-settings-line = Google Drive: bağlı
 workspace-count =
     { $count ->
     [one] { $count } çalışma alanı

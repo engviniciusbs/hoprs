@@ -505,6 +505,7 @@ mod tests {
         // Product names, symbols and shortcut labels.
         "brand",
         "compare-ellipsis",
+        "export-destination-drive",
         "go-to-anything-key",
         "key-settings",
         "key-settings-macos",

@@ -591,6 +591,24 @@ drive-name-required = Informe um nome para o arquivo
 # The pages the browser shows after connecting to Google Drive.
 drive-page-connected = O hoprs está conectado. Você pode fechar esta aba.
 drive-page-failed = O hoprs não conseguiu conectar. Volte ao hoprs e tente de novo.
+export-destination = Destino
+export-destination-file = Um arquivo neste computador
+export-destination-drive = Google Drive
+drive-connect = Conectar ao Google Drive…
+drive-account = Conta
+drive-connected = Conectado
+drive-disconnect = Desconectar
+drive-file-name = Nome
+drive-waiting = Aguardando o navegador…
+drive-copy-link = Copiar o link
+drive-browser-hint = Se o navegador não abriu, copie o link e abra você mesmo.
+drive-session-only = O chaveiro do sistema não está disponível: esta conexão vale até o hoprs fechar.
+drive-uploading = Enviando para o Google Drive…
+drive-uploaded = Enviado para o Google Drive: { $path }
+drive-open = Abrir no Drive
+drive-save-local = Salvar neste computador…
+drive-saved-local = Salvo em { $path }
+drive-settings-line = Google Drive: conectado
 workspace-count =
     { $count ->
     [0] { $count } workspaces

@@ -147,21 +147,15 @@ pub enum DriveExport {
     Idle,
     Sealing,
     Uploading,
-    // TODO(task 12): the view shows the report and the file; remove this allow then.
-    #[allow(dead_code)]
     Uploaded {
         report: ExportReport,
         file: DriveFile,
     },
     /// Sealing, the upload or the local save failed; after an upload or a save the bytes
     /// are still in [`ExportFlow::sealed`].
-    // TODO(task 12): the view shows the error; remove this allow then.
-    #[allow(dead_code)]
     Failed(Error),
     /// "Save to this computer…" writes the sealed bytes.
     Saving,
-    // TODO(task 12): the view shows the report and the path; remove this allow then.
-    #[allow(dead_code)]
     Saved {
         report: ExportReport,
         path: PathBuf,
@@ -244,7 +238,7 @@ impl ExportFlow {
     /// The sealed bytes can be uploaded again or saved: only on the Google Drive
     /// destination, while nothing runs (one export job at a time). Switching to File
     /// keeps them for a switch back; a new export, on either destination, drops them.
-    fn has_bytes(&self) -> bool {
+    pub fn has_bytes(&self) -> bool {
         !self.running()
             && self.destination == Destination::Drive
             && matches!(self.drive, DriveExport::Failed(_))

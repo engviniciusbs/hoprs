@@ -565,6 +565,12 @@ pub fn view<'a>(app: &'a App, tab: &SettingsTab) -> Element<'a, Message> {
     .into()
 }
 
+/// The Backup line for a Google Drive connection: from the marker in `settings.toml`
+/// (no keyring read), only in a build that offers Google Drive.
+pub fn drive_line(app: &App) -> Option<&'static str> {
+    (app.drive_available && app.settings.google_drive).then(strings::drive_settings_line)
+}
+
 fn backup_view(app: &App) -> Element<'_, Message> {
     let backup = &app.backup;
     // One at a time: an export and a restore both lock the vault.
@@ -581,6 +587,22 @@ fn backup_view(app: &App) -> Element<'_, Message> {
     ]
     .spacing(theme::SPACE_XS);
     let mut col = column![muted(strings::backup_hint()), buttons].spacing(theme::SPACE_SM);
+    if let Some(line) = drive_line(app) {
+        col = col.push(
+            row![
+                text(line).size(theme::TEXT_SM),
+                plain(
+                    strings::drive_disconnect(),
+                    (!running).then_some(Message::Export(ExportMsg::Disconnect)),
+                ),
+            ]
+            .spacing(theme::SPACE_XS)
+            .align_y(Alignment::Center),
+        );
+        if let Some(error) = &app.drive_error {
+            col = col.push(failure(Some(error)));
+        }
+    }
 
     // The running restore and its outcome, above the panel (in view without scrolling).
     if backup.restore.running() {
@@ -846,5 +868,21 @@ mod tests {
     #[test]
     fn general_shows_the_version() {
         assert!(version_line().contains(env!("CARGO_PKG_VERSION")));
+    }
+
+    #[test]
+    fn drive_line_follows_the_marker_and_the_build() {
+        set_language(Language::En);
+        let mut app = App::new();
+        for (available, marker, line) in [
+            (false, false, None),
+            (false, true, None),
+            (true, false, None),
+            (true, true, Some("Google Drive: connected")),
+        ] {
+            app.drive_available = available;
+            app.settings.google_drive = marker;
+            assert_eq!(drive_line(&app), line, "{available} {marker}");
+        }
     }
 }

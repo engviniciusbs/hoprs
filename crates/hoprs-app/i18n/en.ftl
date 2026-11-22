@@ -639,6 +639,24 @@ drive-name-required = Enter a name for the file
 # The pages the browser shows after connecting to Google Drive.
 drive-page-connected = hoprs is connected. You can close this tab.
 drive-page-failed = hoprs could not connect. Go back to hoprs and try again.
+export-destination = Destination
+export-destination-file = A file on this computer
+export-destination-drive = Google Drive
+drive-connect = Connect to Google Drive…
+drive-account = Account
+drive-connected = Connected
+drive-disconnect = Disconnect
+drive-file-name = Name
+drive-waiting = Waiting for the browser…
+drive-copy-link = Copy the link
+drive-browser-hint = If the browser did not open, copy the link and open it yourself.
+drive-session-only = The system keyring is unavailable: this connection lasts until hoprs closes.
+drive-uploading = Uploading to Google Drive…
+drive-uploaded = Uploaded to Google Drive: { $path }
+drive-open = Open in Drive
+drive-save-local = Save to this computer…
+drive-saved-local = Saved to { $path }
+drive-settings-line = Google Drive: connected
 workspace-count =
     { $count ->
     [one] { $count } workspace
