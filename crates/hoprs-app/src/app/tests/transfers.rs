@@ -7,7 +7,7 @@ use super::*;
 
 use hoprs_core::Error;
 use hoprs_transfer::{
-    ConflictInfo, ConflictPolicy, Direction, Event, EventKind, ProgressUpdate, Resolution,
+    ConflictInfo, ConflictPolicy, Direction, Event, EventKind, Origin, ProgressUpdate, Resolution,
     ResolveAction, TransferId, TransferItem, TransferSpec, TransferState,
 };
 
@@ -41,6 +41,8 @@ pub(super) fn item(id: i64, site: &SiteId, state: TransferState) -> TransferItem
         size: Some(1000),
         bytes_done: 0,
         state,
+        origin: Origin::User,
+        tree_policy: None,
     }
 }
 
@@ -1720,6 +1722,8 @@ fn moving(id: i64, site: &SiteId, direction: Direction, local: &str, remote: &st
         size: Some(1),
         bytes_done: 0,
         state: TransferState::Queued,
+        origin: Origin::User,
+        tree_policy: None,
     }
 }
 

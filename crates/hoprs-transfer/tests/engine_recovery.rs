@@ -9,8 +9,8 @@ use common::*;
 use hoprs_core::{ErrorKind, SiteId};
 use hoprs_remote::{FaultFs, MemFs, Op};
 use hoprs_transfer::{
-    Direction, EngineConfig, Event, EventKind, QueueStore, SiteEndpoints, TransferEngine,
-    TransferId, TransferItem, TransferSpec, TransferState,
+    ConflictPolicy, Direction, EngineConfig, EnqueueOptions, Event, EventKind, Origin, QueueStore,
+    SiteEndpoints, TransferEngine, TransferId, TransferItem, TransferSpec, TransferState,
 };
 use tokio::sync::broadcast::Receiver;
 use tokio::sync::broadcast::error::RecvError;
@@ -1105,4 +1105,102 @@ fn endpoints_fault(local: FaultFs<MemFs>, remote: FaultFs<MemFs>, workers: usize
         remote: Arc::new(remote),
         workers,
     }
+}
+
+/// RF5: a folder's inherited policy and origin are stored with its children.
+#[tokio::test(flavor = "multi_thread")]
+async fn inherited_policy_and_origin_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("queue.db");
+    let local = MemFs::new();
+    let remote = MemFs::new();
+    local.add_file("/w/d/a.txt", b"new a", mtime());
+    local.add_file("/w/d/b.txt", b"new b", mtime());
+    local.add_file("/w/d/c.txt", b"new c", mtime());
+    remote.add_file("/srv/d/a.txt", b"old a", mtime());
+    remote.add_file("/srv/d/b.txt", b"old b", mtime());
+
+    // Slow enough that no child gets past its first call before the shutdown.
+    let slow = FaultFs::new(local.clone());
+    slow.set_latency(Duration::from_millis(300));
+    let (engine, mut rx) = engine_on_file(
+        &db,
+        Arc::new(slow),
+        remote.clone(),
+        4,
+        EngineConfig::default(),
+    )
+    .await;
+    let root = engine
+        .enqueue_with(
+            spec(Direction::Upload, "/w/d", "/srv/d"),
+            EnqueueOptions {
+                policy: Some(ConflictPolicy::Skip),
+                origin: Origin::Agent,
+            },
+        )
+        .await
+        .unwrap();
+    let mut children = 0;
+    while children < 3 {
+        wait_for(
+            &mut rx,
+            |e| matches!(e, EventKind::Added(i) if i.parent == Some(root)),
+        )
+        .await;
+        children += 1;
+    }
+    engine.shutdown().await;
+
+    let (engine, mut rx) = engine_on_file(
+        &db,
+        Arc::new(FaultFs::new(local.clone())),
+        remote.clone(),
+        4,
+        EngineConfig::default(),
+    )
+    .await;
+    let snap = engine.snapshot().await;
+    assert_eq!(snap.len(), 4, "the folder and its three children");
+    for i in &snap {
+        assert_eq!(i.origin, Origin::Agent, "{i:?}");
+        assert_eq!(i.tree_policy, Some(ConflictPolicy::Skip), "{i:?}");
+        assert_eq!(i.state, TransferState::Paused, "{i:?}");
+    }
+
+    engine.resume(root).await.unwrap();
+    let mut seen = Vec::new();
+    wait_for(&mut rx, |e| {
+        seen.push(e.clone());
+        matches!(e, EventKind::StateChanged { id, state } if *id == root && state.is_terminal())
+    })
+    .await;
+    assert!(
+        !seen.iter().any(|e| matches!(
+            e,
+            EventKind::StateChanged {
+                state: TransferState::AwaitingDecision(_),
+                ..
+            }
+        )),
+        "{seen:?}"
+    );
+    let snap = engine.snapshot().await;
+    let state_of = |p: &str| {
+        snap.iter()
+            .find(|i| i.spec.local.as_str() == p)
+            .map(|i| i.state.clone())
+            .unwrap()
+    };
+    assert_eq!(state_of("/w/d"), TransferState::Done);
+    for skipped in ["/w/d/a.txt", "/w/d/b.txt"] {
+        assert_eq!(
+            state_of(skipped),
+            TransferState::Skipped("exists".to_string()),
+            "{skipped}"
+        );
+    }
+    assert_eq!(state_of("/w/d/c.txt"), TransferState::Done);
+    assert_eq!(remote.read_file("/srv/d/a.txt").unwrap(), b"old a");
+    assert_eq!(remote.read_file("/srv/d/c.txt").unwrap(), b"new c");
 }

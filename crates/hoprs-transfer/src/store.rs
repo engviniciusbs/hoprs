@@ -7,7 +7,8 @@ use hoprs_core::{Error, ErrorKind, RemotePath, Result, SiteId};
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use crate::model::{
-    ConflictInfo, ConflictPolicy, Direction, TransferId, TransferItem, TransferSpec, TransferState,
+    ConflictInfo, ConflictPolicy, Direction, Origin, TransferId, TransferItem, TransferSpec,
+    TransferState,
 };
 
 const MIGRATION_V1: &str = "
@@ -45,12 +46,20 @@ ALTER TABLE transfers ADD COLUMN error_code TEXT;
 ALTER TABLE transfers ADD COLUMN error_args TEXT;
 ";
 
+/// Adds the conflict policy an item's tree was enqueued with and who enqueued
+/// it (`'agent'`; `NULL` is the user). Older rows are the user's, with no tree
+/// policy. hoprs 1.5.0 (schema 3) refuses a file at this version.
+const MIGRATION_V4: &str = "
+ALTER TABLE transfers ADD COLUMN tree_policy TEXT;
+ALTER TABLE transfers ADD COLUMN origin TEXT;
+";
+
 /// The schema version this code reads and writes (`PRAGMA user_version`).
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SELECT: &str = "SELECT id, parent_id, site, direction, local_path, remote_path, is_dir, size, \
     bytes_done, state, state_detail, error_kind, error_message, error_detail, conflict_json, \
-    error_code, error_args FROM transfers";
+    error_code, error_args, tree_policy, origin FROM transfers";
 
 /// The state a `Paused` item was paused from, so `resume` can treat it correctly.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -100,6 +109,22 @@ fn parse_policy(s: &str) -> Option<ConflictPolicy> {
     }
 }
 
+/// The stored form of an origin: `NULL` for the user.
+fn origin_name(origin: Origin) -> Option<&'static str> {
+    match origin {
+        Origin::User => None,
+        Origin::Agent => Some("agent"),
+    }
+}
+
+fn parse_origin(s: Option<&str>) -> Option<Origin> {
+    match s {
+        None => Some(Origin::User),
+        Some("agent") => Some(Origin::Agent),
+        Some(_) => None,
+    }
+}
+
 /// The pause origin recorded in `state_detail` of a `paused` row.
 fn paused_origin(state: &str, detail: Option<&str>) -> Option<PausedFrom> {
     match (state, detail) {
@@ -116,6 +141,10 @@ pub struct NewChild {
     pub size: Option<u64>,
     /// Initial state, normally `Queued`.
     pub state: TransferState,
+    /// The policy of the child's tree (its folder's `tree_policy`).
+    pub tree_policy: Option<ConflictPolicy>,
+    /// The origin of the child's tree.
+    pub origin: Origin,
 }
 
 /// SQLite-backed persistent transfer queue. Synchronous: operations are short.
@@ -328,6 +357,12 @@ fn item_from_row(row: &Row<'_>) -> Result<TransferItem> {
         "cancelled" => TransferState::Cancelled,
         _ => return Err(corrupt("state")),
     };
+    let tree_policy = match row.get::<_, Option<String>>(17).db()? {
+        None => None,
+        Some(name) => Some(parse_policy(&name).ok_or_else(|| corrupt("tree_policy"))?),
+    };
+    let origin = parse_origin(row.get::<_, Option<String>>(18).db()?.as_deref())
+        .ok_or_else(|| corrupt("origin"))?;
     Ok(TransferItem {
         id: TransferId(row.get(0).db()?),
         parent: row.get::<_, Option<i64>>(1).db()?.map(TransferId),
@@ -341,6 +376,8 @@ fn item_from_row(row: &Row<'_>) -> Result<TransferItem> {
         size: row.get::<_, Option<i64>>(7).db()?.map(|s| s as u64),
         bytes_done: row.get::<_, i64>(8).db()? as u64,
         state,
+        origin,
+        tree_policy,
     })
 }
 
@@ -348,21 +385,25 @@ fn insert_row(
     conn: &Connection,
     parent: Option<TransferId>,
     spec: &TransferSpec,
+    tree_policy: Option<ConflictPolicy>,
+    origin: Origin,
 ) -> Result<TransferId> {
     let direction = match spec.direction {
         Direction::Upload => "upload",
         Direction::Download => "download",
     };
     conn.execute(
-        "INSERT INTO transfers (parent_id, site, direction, local_path, remote_path, state, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6)",
+        "INSERT INTO transfers (parent_id, site, direction, local_path, remote_path, state, created_at, \
+         tree_policy, origin) VALUES (?1, ?2, ?3, ?4, ?5, 'queued', ?6, ?7, ?8)",
         params![
             parent.map(|p| p.0),
             spec.site.0,
             direction,
             spec.local.as_str(),
             spec.remote.as_str(),
-            now_secs()
+            now_secs(),
+            tree_policy.map(policy_name),
+            origin_name(origin)
         ],
     ).db()?;
     Ok(TransferId(conn.last_insert_rowid()))
@@ -499,7 +540,12 @@ impl QueueStore {
                 "queue schema version {version}, this version understands up to {SCHEMA_VERSION}"
             )));
         }
-        for (target, migration) in [(1, MIGRATION_V1), (2, MIGRATION_V2), (3, MIGRATION_V3)] {
+        for (target, migration) in [
+            (1, MIGRATION_V1),
+            (2, MIGRATION_V2),
+            (3, MIGRATION_V3),
+            (4, MIGRATION_V4),
+        ] {
             if version < target {
                 let tx = conn.unchecked_transaction().db()?;
                 tx.execute_batch(migration).db()?;
@@ -510,13 +556,25 @@ impl QueueStore {
         Ok(QueueStore { conn })
     }
 
-    /// Inserts a new `Queued` item and returns its id.
+    /// Inserts a new `Queued` item of the user, with no tree policy, and
+    /// returns its id.
     pub fn insert(
         &mut self,
         parent: Option<TransferId>,
         spec: &TransferSpec,
     ) -> Result<TransferId> {
-        insert_row(&self.conn, parent, spec)
+        insert_row(&self.conn, parent, spec, None, Origin::User)
+    }
+
+    /// Like [`insert`](Self::insert), with the item's tree policy and origin.
+    pub fn insert_with(
+        &mut self,
+        parent: Option<TransferId>,
+        spec: &TransferSpec,
+        tree_policy: Option<ConflictPolicy>,
+        origin: Origin,
+    ) -> Result<TransferId> {
+        insert_row(&self.conn, parent, spec, tree_policy, origin)
     }
 
     /// Inserts the children of `parent` (with their metadata and initial
@@ -529,7 +587,13 @@ impl QueueStore {
         let tx = self.conn.transaction().db()?;
         let mut ids = Vec::with_capacity(children.len());
         for child in children {
-            let id = insert_row(&tx, Some(parent), &child.spec)?;
+            let id = insert_row(
+                &tx,
+                Some(parent),
+                &child.spec,
+                child.tree_policy,
+                child.origin,
+            )?;
             tx.execute(
                 "UPDATE transfers SET is_dir = ?2, size = ?3 WHERE id = ?1",
                 params![id.0, child.is_dir, child.size.map(|s| s as i64)],
@@ -873,18 +937,24 @@ mod tests {
                 is_dir: false,
                 size: Some(42),
                 state: TransferState::Queued,
+                tree_policy: None,
+                origin: Origin::User,
             },
             NewChild {
                 spec: spec("/a/d", "/b/d"),
                 is_dir: true,
                 size: None,
                 state: TransferState::Queued,
+                tree_policy: None,
+                origin: Origin::User,
             },
             NewChild {
                 spec: spec("/a/l", "/b/l"),
                 is_dir: false,
                 size: None,
                 state: TransferState::Skipped("symlinks are not followed".to_string()),
+                tree_policy: None,
+                origin: Origin::User,
             },
         ];
         let ids = s.insert_children(parent, &children).unwrap();
@@ -913,6 +983,8 @@ mod tests {
             is_dir: false,
             size: None,
             state: TransferState::Queued,
+            tree_policy: None,
+            origin: Origin::User,
         };
         // The parent does not exist: the foreign key rejects the batch.
         assert_eq!(
@@ -1128,7 +1200,7 @@ mod tests {
                 .conn
                 .pragma_query_value(None, "user_version", |r| r.get(0))
                 .unwrap();
-            assert_eq!(version, 3);
+            assert_eq!(version, SCHEMA_VERSION);
             let items = s.list_all().unwrap();
             assert_eq!(items.len(), expected.len());
             for (item, (policy, origin)) in items.iter().zip(expected) {
@@ -1164,7 +1236,7 @@ mod tests {
                 .conn
                 .pragma_query_value(None, "user_version", |r| r.get(0))
                 .unwrap();
-            assert_eq!(version, 3);
+            assert_eq!(version, SCHEMA_VERSION);
             let items = s.list_all().unwrap();
             let TransferState::Failed(e) = &items[0].state else {
                 panic!("{items:?}");
@@ -1174,6 +1246,96 @@ mod tests {
             assert_eq!(e.detail.as_deref(), Some("EACCES"));
             assert_eq!((e.code, e.args.len()), (None, 0));
         }
+    }
+
+    /// A schema-v3 queue file (hoprs 1.5.0) with a folder and its child.
+    fn write_v3(path: &Path) {
+        let conn = Connection::open(path).unwrap();
+        for migration in [MIGRATION_V1, MIGRATION_V2, MIGRATION_V3] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 3).unwrap();
+        conn.execute_batch(
+            "INSERT INTO transfers (id, site, direction, local_path, remote_path, is_dir, state, \
+             next_policy, created_at) VALUES (1, 'site', 'upload', '/a', '/b', 1, 'active', \
+             'overwrite', 0);
+             INSERT INTO transfers (id, parent_id, site, direction, local_path, remote_path, \
+             is_dir, state, created_at) VALUES (2, 1, 'site', 'upload', '/a/x', '/b/x', 0, \
+             'queued', 0);",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn v3_queue_opens_as_v4() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.db");
+        write_v3(&path);
+        for _ in 0..2 {
+            let s = QueueStore::open(&path).unwrap();
+            let version: i64 = s
+                .conn
+                .pragma_query_value(None, "user_version", |r| r.get(0))
+                .unwrap();
+            assert_eq!(version, 4);
+            let items = s.list_all().unwrap();
+            assert_eq!(items.len(), 2);
+            for item in &items {
+                assert_eq!(item.origin, Origin::User, "{item:?}");
+                assert_eq!(item.tree_policy, None, "{item:?}");
+            }
+            assert_eq!(items[1].parent, Some(items[0].id));
+            assert_eq!(
+                s.next_policy(items[0].id).unwrap(),
+                Some(ConflictPolicy::Overwrite)
+            );
+        }
+    }
+
+    #[test]
+    fn tree_policy_and_origin_round_trip() {
+        let mut s = QueueStore::open_in_memory().unwrap();
+        let root = s
+            .insert_with(
+                None,
+                &spec("/a", "/b"),
+                Some(ConflictPolicy::Skip),
+                Origin::Agent,
+            )
+            .unwrap();
+        let ids = s
+            .insert_children(
+                root,
+                &[NewChild {
+                    spec: spec("/a/f", "/b/f"),
+                    is_dir: false,
+                    size: Some(1),
+                    state: TransferState::Queued,
+                    tree_policy: Some(ConflictPolicy::Skip),
+                    origin: Origin::Agent,
+                }],
+            )
+            .unwrap();
+        let plain = new_item(&mut s);
+        for id in [root, ids[0]] {
+            let item = s.get(id).unwrap().unwrap();
+            assert_eq!(
+                (item.tree_policy, item.origin),
+                (Some(ConflictPolicy::Skip), Origin::Agent)
+            );
+        }
+        let item = s.get(plain).unwrap().unwrap();
+        assert_eq!((item.tree_policy, item.origin), (None, Origin::User));
+        // A user's row stores nothing in the new columns.
+        let nulls: i64 = s
+            .conn
+            .query_row(
+                "SELECT tree_policy IS NULL AND origin IS NULL FROM transfers WHERE id = ?1",
+                [plain.0],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(nulls, 1);
     }
 
     #[test]

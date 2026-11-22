@@ -9,8 +9,8 @@ use common::*;
 use hoprs_core::{ErrorKind, RemoteEntry, RemotePath, Result};
 use hoprs_remote::{BoxAsyncRead, BoxAsyncWrite, FaultFs, MemFs, RemoteFs};
 use hoprs_transfer::{
-    ConflictInfo, ConflictPolicy, Direction, EngineConfig, Event, EventKind, QueueStore,
-    SiteEndpoints, TransferEngine, TransferId, TransferState,
+    ConflictInfo, ConflictPolicy, Direction, EngineConfig, EnqueueOptions, Event, EventKind,
+    LocalGuard, Origin, QueueStore, SiteEndpoints, TransferEngine, TransferId, TransferState,
 };
 use tokio::sync::broadcast::Receiver;
 
@@ -771,4 +771,94 @@ async fn enqueue_with_overwrite_after_earlier_transfer_to_same_destination() {
         }
     )));
     assert_eq!(remote.read_file("/srv/a.bin").unwrap(), new);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_guard_runs_for_every_agent_item() {
+    let checked: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let recorder = Arc::clone(&checked);
+    let guard = LocalGuard::new(move |path: RemotePath| {
+        let recorder = Arc::clone(&recorder);
+        Box::pin(async move {
+            recorder.lock().unwrap().push(path.as_str().to_owned());
+            if path.as_str() == "/w/site/sub/secret.txt" {
+                return Err(hoprs_core::Error::new(
+                    ErrorKind::Permission,
+                    format!("Protected path: {path}"),
+                ));
+            }
+            Ok(())
+        })
+    });
+    let config = EngineConfig {
+        agent_guard: Some(guard),
+        ..EngineConfig::default()
+    };
+    let local = MemFs::new();
+    let remote = MemFs::new();
+    local.add_file("/w/site/a.txt", b"a", mtime());
+    local.add_file("/w/site/sub/b.txt", b"b", mtime());
+    local.add_file("/w/site/sub/secret.txt", b"secret", mtime());
+    remote.add_dir("/srv");
+    let (engine, mut rx) = engine_with(Arc::new(local), Arc::new(remote.clone()), 2, config).await;
+
+    let agent = engine
+        .enqueue_with(
+            spec(Direction::Upload, "/w/site", "/srv/agent"),
+            EnqueueOptions {
+                policy: Some(ConflictPolicy::Skip),
+                origin: Origin::Agent,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        wait_terminal(&mut rx, agent).await,
+        TransferState::Failed(_)
+    ));
+    let snap = engine.snapshot().await;
+    for i in &snap {
+        if i.spec.local.as_str() == "/w/site/sub/secret.txt" {
+            match &i.state {
+                TransferState::Failed(e) => assert_eq!(
+                    (e.kind, e.message.as_str()),
+                    (
+                        ErrorKind::Permission,
+                        "Protected path: /w/site/sub/secret.txt"
+                    )
+                ),
+                other => panic!("secret.txt ended {other:?}"),
+            }
+        } else if i.is_dir == Some(false) {
+            assert_eq!(i.state, TransferState::Done, "{i:?}");
+        }
+    }
+    assert_eq!(remote.read_file("/srv/agent/a.txt").unwrap(), b"a");
+    assert_eq!(remote.read_file("/srv/agent/sub/b.txt").unwrap(), b"b");
+    assert!(remote.read_file("/srv/agent/sub/secret.txt").is_none());
+    let mut seen = checked.lock().unwrap().clone();
+    seen.sort();
+    assert_eq!(
+        seen,
+        [
+            "/w/site",
+            "/w/site/a.txt",
+            "/w/site/sub",
+            "/w/site/sub/b.txt",
+            "/w/site/sub/secret.txt",
+        ]
+    );
+
+    // The user's own transfer of the same tree never meets the guard.
+    checked.lock().unwrap().clear();
+    let user = engine
+        .enqueue(spec(Direction::Upload, "/w/site", "/srv/user"))
+        .await
+        .unwrap();
+    assert_eq!(wait_terminal(&mut rx, user).await, TransferState::Done);
+    assert!(checked.lock().unwrap().is_empty());
+    assert_eq!(
+        remote.read_file("/srv/user/sub/secret.txt").unwrap(),
+        b"secret"
+    );
 }

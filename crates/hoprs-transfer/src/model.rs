@@ -23,6 +23,15 @@ pub enum ConflictPolicy {
     Resume,
 }
 
+/// Who asked for a transfer: the person using hoprs, or an agent through
+/// the MCP server. Every item of a tree has its root's origin.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub enum Origin {
+    #[default]
+    User,
+    Agent,
+}
+
 /// User request to transfer one path. The engine discovers whether it is a file or a folder via `stat` on the source.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TransferSpec {
@@ -77,6 +86,11 @@ pub struct TransferItem {
     pub size: Option<u64>,
     pub bytes_done: u64,
     pub state: TransferState,
+    pub origin: Origin,
+    /// The conflict policy the item's tree was enqueued with (see
+    /// `TransferEngine::enqueue_with`): what the item runs under when it has
+    /// no continuation of its own, instead of the global policy.
+    pub tree_policy: Option<ConflictPolicy>,
 }
 
 #[cfg(test)]
