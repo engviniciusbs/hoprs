@@ -15,7 +15,7 @@
 
 use std::ffi::c_void;
 use std::io::{Error, ErrorKind, Result};
-use std::os::windows::io::AsRawHandle;
+use std::os::windows::io::{AsHandle, AsRawHandle, OwnedHandle};
 use std::path::Path;
 use std::pin::Pin;
 use std::ptr;
@@ -39,6 +39,7 @@ use windows_sys::Win32::Security::{
     EqualSid, GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
+use windows_sys::Win32::System::Pipes::DisconnectNamedPipe;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 /// Every hoprs pipe name starts so.
@@ -321,6 +322,28 @@ pub(super) async fn connect(name: &str) -> Result<Stream> {
     Ok(Stream::Client(client))
 }
 
+/// A second handle of the server's pipe instance, to disconnect it (see
+/// `channel::Cut`); `None` for a client, or if the handle could not be duplicated.
+pub(super) struct Cut(Option<OwnedHandle>);
+
+pub(super) fn cutter(stream: &Stream) -> Cut {
+    match stream {
+        Stream::Server(pipe) => Cut(pipe.as_handle().try_clone_to_owned().ok()),
+        Stream::Client(_) => Cut(None),
+    }
+}
+
+/// Disconnects the pipe instance: the client's end is closed, unread data is
+/// discarded, and a write of ours still pending fails, which lets mio release the
+/// instance.
+pub(super) fn cut(cut: &Cut) {
+    if let Some(handle) = &cut.0 {
+        // SAFETY: the handle is our own duplicate of a server pipe handle, open as long
+        // as `cut`; DisconnectNamedPipe takes nothing else.
+        unsafe { DisconnectNamedPipe(handle.as_raw_handle()) };
+    }
+}
+
 /// Either end of a pipe connection.
 pub(super) enum Stream {
     Server(NamedPipeServer),
@@ -372,8 +395,8 @@ mod tests {
     };
 
     use super::*;
+    use crate::agent::testing::step;
 
-    const WAIT: Duration = Duration::from_secs(10);
     /// `ACCESS_ALLOWED_ACE_TYPE` (in `Win32_System_SystemServices`, a feature this crate
     /// does not need otherwise).
     const ALLOW: u8 = 0;
@@ -462,23 +485,25 @@ mod tests {
         let (_dir, name) = temp_name();
         let mut listener = Listener::bind(&name).unwrap();
         let (client, server) = tokio::join!(
-            tokio::time::timeout(WAIT, connect(&name)),
-            tokio::time::timeout(WAIT, listener.accept())
+            step("the client's connect", connect(&name)),
+            step("the server's accept", listener.accept())
         );
-        let (client, server) = (client.unwrap().unwrap(), server.unwrap().unwrap());
+        let (client, server) = (client.unwrap(), server.unwrap());
         let (mut client, mut server) = (BufReader::new(client), BufReader::new(server));
-        client.get_mut().write_all(b"ping\n").await.unwrap();
-        let mut line = String::new();
-        tokio::time::timeout(WAIT, server.read_line(&mut line))
+        step("the client's ping", client.get_mut().write_all(b"ping\n"))
             .await
-            .unwrap()
+            .unwrap();
+        let mut line = String::new();
+        step("the server reading the ping", server.read_line(&mut line))
+            .await
             .unwrap();
         assert_eq!(line, "ping\n");
-        server.get_mut().write_all(b"pong\n").await.unwrap();
-        line.clear();
-        tokio::time::timeout(WAIT, client.read_line(&mut line))
+        step("the server's pong", server.get_mut().write_all(b"pong\n"))
             .await
-            .unwrap()
+            .unwrap();
+        line.clear();
+        step("the client reading the pong", client.read_line(&mut line))
+            .await
             .unwrap();
         assert_eq!(line, "pong\n");
     }
@@ -495,10 +520,10 @@ mod tests {
         let (_dir, name) = temp_name();
         let mut listener = Listener::bind(&name).unwrap();
         let (client, server) = tokio::join!(
-            tokio::time::timeout(WAIT, connect(&name)),
-            tokio::time::timeout(WAIT, listener.accept())
+            step("the client's connect", connect(&name)),
+            step("the server's accept", listener.accept())
         );
-        let (client, _server) = (client.unwrap().unwrap(), server.unwrap().unwrap());
+        let (client, _server) = (client.unwrap(), server.unwrap());
         let Stream::Client(client) = &client else {
             panic!("connect gives a client");
         };

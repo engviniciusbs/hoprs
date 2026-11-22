@@ -1338,9 +1338,10 @@ mod tests {
         /// Connects (waiting for the channel: `Backend::open` returns before it exists)
         /// and says its hello.
         async fn connect(endpoint: &crate::agent::channel::Endpoint) -> Relay {
-            let start = tokio::time::Instant::now();
+            let start = std::time::Instant::now();
             let stream = loop {
-                match crate::agent::channel::connect(endpoint).await {
+                let connecting = crate::agent::channel::connect(endpoint);
+                match crate::agent::testing::step("backend relay: connecting", connecting).await {
                     Ok(stream) => break stream,
                     Err(err) => {
                         assert!(start.elapsed() < LINE_WAIT, "no channel: {err}");
@@ -1366,17 +1367,20 @@ mod tests {
 
         async fn send(&mut self, line: &str) {
             use tokio::io::AsyncWriteExt;
-            self.writer
-                .write_all(format!("{line}\n").as_bytes())
-                .await
-                .unwrap();
+            let bytes = format!("{line}\n");
+            crate::agent::testing::step(
+                format!("backend relay: writing {line}"),
+                self.writer.write_all(bytes.as_bytes()),
+            )
+            .await
+            .unwrap();
         }
 
         /// The next line; `None` at the end.
         async fn line(&mut self) -> Option<String> {
-            tokio::time::timeout(LINE_WAIT, crate::agent::proto::read_line(&mut self.reader))
+            let reading = crate::agent::proto::read_line(&mut self.reader);
+            crate::agent::testing::step("backend relay: reading a line", reading)
                 .await
-                .expect("a line in time")
                 .ok()
                 .flatten()
         }

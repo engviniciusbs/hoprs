@@ -11,10 +11,11 @@ use tokio::sync::{mpsc, watch};
 
 use super::*;
 use crate::agent::channel::{self, Endpoint};
-use crate::agent::testing::{FakeHost, FsOp};
+use crate::agent::testing::{FakeHost, FsOp, STEP, step};
 use crate::agent::{AgentEvent, HELLO_WAIT, Limits, MAX_RELAYS, REAP_EVERY};
 
-/// The longest any step of a test waits: a regression fails instead of hanging.
+/// How long a test waits for something to happen (a channel to open, an event, a
+/// condition); one I/O step has [`crate::agent::testing::STEP`].
 const WAIT: Duration = Duration::from_secs(10);
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const FILE: &str = "/var/www/a.txt";
@@ -56,27 +57,45 @@ fn fixture_at(dir: tempfile::TempDir, endpoint: Option<Endpoint>, on: bool) -> F
     }
 }
 
-/// One relay's end of the channel.
+/// One relay's end of the channel. Every write and read is a [`step`] named after the
+/// client and the line's number, so a stall says where it stopped.
 struct Client {
+    name: String,
+    sent: u64,
+    received: u64,
     reader: BufReader<ReadHalf<channel::Stream>>,
     writer: WriteHalf<channel::Stream>,
 }
 
+/// Numbers the clients of the tests, for their names.
+static CLIENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
 impl Client {
     /// Connects, waiting for the server to open the channel.
     async fn connect(endpoint: &Endpoint) -> Client {
-        let start = tokio::time::Instant::now();
+        let n = CLIENTS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Client::named(endpoint, &format!("client {n}")).await
+    }
+
+    async fn named(endpoint: &Endpoint, name: &str) -> Client {
+        let start = std::time::Instant::now();
         let stream = loop {
-            match channel::connect(endpoint).await {
+            match step(format!("{name}: connecting"), channel::connect(endpoint)).await {
                 Ok(stream) => break stream,
                 Err(err) => {
-                    assert!(start.elapsed() < WAIT, "the channel never opened: {err}");
+                    assert!(
+                        start.elapsed() < WAIT,
+                        "{name}: the channel never opened: {err}"
+                    );
                     tokio::time::sleep(Duration::from_millis(10)).await;
                 }
             }
         };
         let (read, writer) = tokio::io::split(stream);
         Client {
+            name: name.to_owned(),
+            sent: 0,
+            received: 0,
             reader: BufReader::new(read),
             writer,
         }
@@ -85,29 +104,38 @@ impl Client {
     /// Connects and says a hello that the server takes.
     async fn greeted(endpoint: &Endpoint) -> Client {
         let mut client = Client::connect(endpoint).await;
+        client.hello().await;
         client
-            .send(json!({"hoprs_agent": 1, "version": VERSION}))
+    }
+
+    async fn hello(&mut self) {
+        self.send(json!({"hoprs_agent": 1, "version": VERSION}))
             .await;
+        let answer = self.recv().await;
         assert_eq!(
-            client.recv().await,
-            Some(json!({"hello": "ok", "version": VERSION}))
+            answer,
+            Some(json!({"hello": "ok", "version": VERSION})),
+            "{}: the hello's answer",
+            self.name
         );
-        client
     }
 
     async fn send(&mut self, message: Value) {
         self.send_raw(format!("{message}\n").as_bytes()).await;
     }
 
+    /// Writes `bytes`; a write error (the server closed) is fine, a stall is not.
     async fn send_raw(&mut self, bytes: &[u8]) {
-        let _ = tokio::time::timeout(WAIT, self.writer.write_all(bytes)).await;
+        self.sent += 1;
+        let what = format!("{}: writing line {}", self.name, self.sent);
+        let _ = step(what, self.writer.write_all(bytes)).await;
     }
 
     /// The next line as JSON; `None` at the end (or an error: the server closed).
     async fn recv(&mut self) -> Option<Value> {
-        let line = tokio::time::timeout(WAIT, proto::read_line(&mut self.reader))
-            .await
-            .expect("a line or the end in time");
+        self.received += 1;
+        let what = format!("{}: reading line {}", self.name, self.received);
+        let line = step(what, proto::read_line(&mut self.reader)).await;
         line.ok()
             .flatten()
             .map(|line| serde_json::from_str(&line).unwrap())
@@ -115,7 +143,8 @@ impl Client {
 
     /// The connection ends without another line.
     async fn assert_closed(&mut self) {
-        assert_eq!(self.recv().await, None);
+        let last = self.recv().await;
+        assert_eq!(last, None, "{}: expected the end", self.name);
     }
 
     async fn call(&mut self, id: u64, tool: &str, args: Value) {
@@ -125,15 +154,24 @@ impl Client {
 }
 
 impl Fx {
-    /// Waits for an event that `want` accepts; panics after [`WAIT`].
-    async fn event(&mut self, want: impl Fn(&AgentEvent) -> bool) -> AgentEvent {
-        let start = tokio::time::Instant::now();
-        loop {
-            let left = WAIT.saturating_sub(start.elapsed());
-            match tokio::time::timeout(left, self.events.recv()).await {
-                Ok(Some(event)) if want(&event) => return event,
-                Ok(Some(_)) => {}
-                other => panic!("no such event in time: {other:?}"),
+    /// Waits for an event that `want` accepts; panics after [`WAIT`], naming the caller's
+    /// line and the events seen meanwhile.
+    #[track_caller]
+    fn event<'a>(
+        &'a mut self,
+        want: impl Fn(&AgentEvent) -> bool + 'a,
+    ) -> impl std::future::Future<Output = AgentEvent> + 'a {
+        let at = std::panic::Location::caller();
+        async move {
+            let start = std::time::Instant::now();
+            let mut seen = Vec::new();
+            loop {
+                let left = WAIT.saturating_sub(start.elapsed());
+                match tokio::time::timeout(left, self.events.recv()).await {
+                    Ok(Some(event)) if want(&event) => return event,
+                    Ok(Some(event)) => seen.push(event),
+                    _ => panic!("no matching agent event in time (waited at {at}); saw {seen:?}"),
+                }
             }
         }
     }
@@ -162,7 +200,7 @@ fn first_block(reply: &Value) -> Value {
 
 /// Waits until `done` holds; panics after [`WAIT`].
 async fn until(what: &str, done: impl Fn() -> bool) {
-    let start = tokio::time::Instant::now();
+    let start = std::time::Instant::now();
     while !done() {
         assert!(start.elapsed() < WAIT, "{what} never happened");
         tokio::time::sleep(Duration::from_millis(5)).await;
@@ -188,7 +226,7 @@ async fn calls_overlap_and_match_their_ids() {
     let hold = fx.host.hold(&fx.site.id, FsOp::Read);
     let mut client = Client::greeted(&fx.endpoint).await;
     client.call(1, "read_file", fx.read_args()).await;
-    hold.entered().await;
+    step("a held call reaching the host", hold.entered()).await;
     client.call(2, "list_sites", json!({})).await;
     let quick = client.recv().await.unwrap();
     assert_eq!(reply_id(&quick), 2, "the quick call is answered first");
@@ -205,7 +243,7 @@ async fn cancel_stops_a_call_and_sends_nothing() {
     let hold = fx.host.hold(&fx.site.id, FsOp::Read);
     let mut client = Client::greeted(&fx.endpoint).await;
     client.call(1, "read_file", fx.read_args()).await;
-    hold.entered().await;
+    step("a held call reaching the host", hold.entered()).await;
     client.send(json!({"cancel": 1})).await;
     until("the held call was dropped", || hold.dropped()).await;
     hold.release();
@@ -285,20 +323,50 @@ async fn a_seventeenth_call_is_refused_and_cancels_are_still_read() {
 async fn a_relay_that_floods_without_reading_is_closed() {
     let fx = fixture(true);
     let _hold = fx.host.hold(&fx.site.id, FsOp::Read);
-    let mut client = Client::greeted(&fx.endpoint).await;
-    // Sixteen calls held, then refusals the relay never reads: far more than the
-    // socket's buffers hold, so the refusals pile up unwritten and the relay is cut.
+    let mut client = Client::named(&fx.endpoint, "flood").await;
+    client.hello().await;
+    let Client {
+        mut reader,
+        mut writer,
+        ..
+    } = client;
+    // Sixteen calls held, then refusals it never reads: far more than any socket or
+    // pipe buffer holds, so they pile up unwritten and the relay is cut. It writes as a
+    // real relay would, from its own task, and a failed write is the expected end.
     const CALLS: u64 = 20_000;
-    for id in 1..=CALLS {
-        client.call(id, "read_file", fx.read_args()).await;
-    }
+    let args = fx.read_args();
+    let writing = tokio::spawn(async move {
+        for id in 1..=CALLS {
+            let line = format!(
+                "{}\n",
+                json!({"call": id, "tool": "read_file", "args": args})
+            );
+            match tokio::time::timeout(STEP, writer.write_all(line.as_bytes())).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Ok(id - 1),
+                Err(_) => return Err(format!("flood: stalled writing call {id} of {CALLS}")),
+            }
+        }
+        Ok(CALLS)
+    });
+    let written = step("flood: the writer's end", writing)
+        .await
+        .unwrap()
+        .unwrap_or_else(|stalled| panic!("{stalled}"));
+    // Whatever it can still read, then the end.
     let mut answers = 0u64;
-    while client.recv().await.is_some() {
-        answers += 1;
+    loop {
+        let what = format!("flood: reading answers after {answers} (wrote {written} calls)");
+        match step(what, proto::read_line(&mut reader)).await {
+            Ok(Some(_)) => answers += 1,
+            Ok(None) | Err(_) => break,
+        }
+        assert!(answers <= CALLS, "more answers than calls");
     }
     assert!(answers < CALLS - 16, "cut before every refusal: {answers}");
     // The server keeps serving others.
-    let mut other = Client::greeted(&fx.endpoint).await;
+    let mut other = Client::named(&fx.endpoint, "another relay").await;
+    other.hello().await;
     other.call(1, "list_sites", json!({})).await;
     assert_eq!(reply_id(&other.recv().await.unwrap()), 1);
 }
@@ -381,7 +449,7 @@ async fn a_call_whose_task_panics_is_answered() {
         assert_eq!(reply["ok"], false, "{reply}");
         assert_eq!(reply["error"], FAILED, "{reply}");
     }
-    tokio::time::timeout(WAIT, server.shutdown()).await.unwrap();
+    step("server stop", server.shutdown()).await;
 }
 
 #[tokio::test]
@@ -416,7 +484,7 @@ async fn hellos_in_progress_are_capped() {
     assert!(start.elapsed() < HELLO_WAIT / 2, "{:?}", start.elapsed());
     // Once they are gone, a relay is greeted again.
     drop(silent);
-    let start = tokio::time::Instant::now();
+    let start = std::time::Instant::now();
     loop {
         let mut client = Client::connect(&fx.endpoint).await;
         client
@@ -501,30 +569,14 @@ async fn junk_and_oversized_lines_close_the_connection() {
     for line in junk {
         // As the hello: closed without an answer.
         let mut client = Client::connect(&fx.endpoint).await;
-        let Client { reader, mut writer } = client;
-        let send = line.to_vec();
-        let sending = tokio::spawn(async move {
-            let _ = writer.write_all(&send).await;
-            writer
-        });
-        client = Client {
-            reader,
-            writer: sending.await.unwrap(),
-        };
+        client.name = format!("{}, junk as its hello", client.name);
+        client.send_raw(line).await;
         client.assert_closed().await;
 
         // After the hello: closed too, no answer.
         let mut client = Client::greeted(&fx.endpoint).await;
-        let Client { reader, mut writer } = client;
-        let send = line.to_vec();
-        let sending = tokio::spawn(async move {
-            let _ = writer.write_all(&send).await;
-            writer
-        });
-        client = Client {
-            reader,
-            writer: sending.await.unwrap(),
-        };
+        client.name = format!("{}, junk after its hello", client.name);
+        client.send_raw(line).await;
         client.assert_closed().await;
     }
     // The server still serves a new relay.
@@ -545,7 +597,7 @@ async fn duplicate_ids_close_and_unknown_cancels_are_ignored() {
     // A second call under an id still running closes the connection; the held call
     // goes with it.
     client.call(2, "read_file", fx.read_args()).await;
-    hold.entered().await;
+    step("a held call reaching the host", hold.entered()).await;
     client.call(2, "list_sites", json!({})).await;
     client.assert_closed().await;
     until("the held call was dropped", || hold.dropped()).await;
@@ -558,7 +610,7 @@ async fn calls_end_with_their_relay() {
     let mut client = Client::greeted(&fx.endpoint).await;
     fx.event(|e| *e == AgentEvent::Relays(1)).await;
     client.call(1, "read_file", fx.read_args()).await;
-    hold.entered().await;
+    step("a held call reaching the host", hold.entered()).await;
     drop(client);
     until("the held call was dropped", || hold.dropped()).await;
     fx.event(|e| *e == AgentEvent::Relays(0)).await;
@@ -593,7 +645,7 @@ async fn switch_off_drops_relays_and_removes_the_socket() {
     let mut idle = Client::greeted(&fx.endpoint).await;
     fx.event(|e| *e == AgentEvent::Relays(2)).await;
     client.call(1, "read_file", fx.read_args()).await;
-    hold.entered().await;
+    step("a held call reaching the host", hold.entered()).await;
 
     // An agent-only session, used a moment ago: it goes with the switch.
     fx.host.mark_agent_only(&fx.site.id);
@@ -616,7 +668,14 @@ async fn switch_off_drops_relays_and_removes_the_socket() {
             "the socket file is gone"
         );
     }
-    assert!(channel::connect(&fx.endpoint).await.is_err());
+    assert!(
+        step(
+            "connecting to a closed channel",
+            channel::connect(&fx.endpoint)
+        )
+        .await
+        .is_err()
+    );
 
     fx.switch.send_replace(true);
     let mut again = Client::greeted(&fx.endpoint).await;
@@ -637,7 +696,15 @@ async fn switch_follows_its_latest_value() {
     }
     fx.event(|e| *e == AgentEvent::Relays(0)).await;
     tokio::time::sleep(Duration::from_millis(100)).await;
-    assert!(channel::connect(&fx.endpoint).await.is_err(), "off at last");
+    assert!(
+        step(
+            "connecting to a closed channel",
+            channel::connect(&fx.endpoint)
+        )
+        .await
+        .is_err(),
+        "off at last"
+    );
 }
 
 #[tokio::test]
@@ -645,9 +712,7 @@ async fn shutdown_says_quit() {
     let mut fx = fixture(true);
     let mut client = Client::greeted(&fx.endpoint).await;
     fx.event(|e| *e == AgentEvent::Relays(1)).await;
-    tokio::time::timeout(WAIT, fx.server.shutdown())
-        .await
-        .expect("shutdown in time");
+    step("server stop", fx.server.shutdown()).await;
     assert_eq!(client.recv().await, Some(json!({"bye": "quit"})));
     client.assert_closed().await;
     #[cfg(unix)]
@@ -659,9 +724,7 @@ async fn shutdown_says_quit() {
         );
     }
     // A second shutdown is nothing.
-    tokio::time::timeout(WAIT, fx.server.shutdown())
-        .await
-        .unwrap();
+    step("server stop", fx.server.shutdown()).await;
 }
 
 #[tokio::test]
@@ -680,9 +743,7 @@ async fn a_relay_that_does_not_read_holds_up_nobody() {
     other.call(1, "list_sites", json!({})).await;
     assert_eq!(reply_id(&other.recv().await.unwrap()), 1);
     // And the goodbye does not wait for the stuck one.
-    tokio::time::timeout(WAIT, fx.server.shutdown())
-        .await
-        .expect("shutdown in time");
+    step("server stop", fx.server.shutdown()).await;
     drop(stuck);
 }
 
@@ -755,10 +816,15 @@ async fn no_endpoint_never_listens() {
     assert_eq!(warned.len(), 1, "{text}");
     assert!(warned[0].contains("WARN"), "{text}");
     // Nothing was made where a channel of this run's directory would be.
-    assert!(channel::connect(&fx.endpoint).await.is_err());
-    tokio::time::timeout(WAIT, fx.server.shutdown())
+    assert!(
+        step(
+            "connecting to a closed channel",
+            channel::connect(&fx.endpoint)
+        )
         .await
-        .unwrap();
+        .is_err()
+    );
+    step("server stop", fx.server.shutdown()).await;
 }
 
 #[tokio::test(start_paused = true)]

@@ -51,7 +51,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior, timeout};
 
-use super::channel::{Endpoint, Listener, Stream};
+use super::channel::{Cut, Endpoint, Listener, Stream};
 use super::proto::{self, ByeReason, HelloReply, Reply, ToApp, ToRelay};
 use super::service::Service;
 use super::{AgentEvent, HELLO_WAIT, MAX_IN_FLIGHT, MAX_RELAYS, REAP_EVERY};
@@ -349,6 +349,8 @@ async fn relay(
     handshake: Handshake,
     mut stop: watch::Receiver<Option<ByeReason>>,
 ) {
+    // Taken before the split: every way out that gives up on the relay cuts it.
+    let cut = stream.cutter();
     let (read, mut write) = tokio::io::split(stream);
     let mut reader = BufReader::new(read);
     let hello = tokio::select! {
@@ -361,11 +363,14 @@ async fn relay(
     };
     let answer = proto::hello_reply(&hello);
     if matches!(answer, HelloReply::Mismatch { .. }) {
-        let _ = timeout(BYE_WAIT, async {
+        let said = timeout(BYE_WAIT, async {
             proto::write_line(&mut write, &answer).await?;
             write.shutdown().await
         })
         .await;
+        if said.is_err() {
+            cut.cut();
+        }
         return;
     }
     // One relay too many: closed at its hello.
@@ -375,10 +380,11 @@ async fn relay(
     drop(handshake);
     let greeted = timeout(HELLO_WAIT, proto::write_line(&mut write, &answer)).await;
     if !matches!(greeted, Ok(Ok(()))) {
+        cut.cut();
         return;
     }
     Connection::new(shared.service.clone(), write)
-        .serve(reader, stop)
+        .serve(reader, stop, cut)
         .await;
 }
 
@@ -447,6 +453,7 @@ impl Connection {
         mut self,
         reader: BufReader<ReadHalf<Stream>>,
         mut stop: watch::Receiver<Option<ByeReason>>,
+        cut: Cut,
     ) {
         let (to_us, mut incoming) = mpsc::channel(1);
         let reading = tokio::spawn(read_lines(reader, to_us));
@@ -502,11 +509,17 @@ impl Connection {
         match end {
             End::Stop(reason) => {
                 let _ = self.out.send(Outgoing::Bye(reason));
+                // A relay that reads gets its goodbye, then the end of the stream; one
+                // that does not is cut.
                 if timeout(BYE_WAIT, &mut self.writer).await.is_err() {
                     self.writer.abort();
+                    cut.cut();
                 }
             }
-            End::Gone => self.writer.abort(),
+            End::Gone => {
+                self.writer.abort();
+                cut.cut();
+            }
         }
     }
 

@@ -47,6 +47,22 @@ use super::host::{AgentHost, ConnectFailure};
 use super::paths::Protected;
 use crate::backend::SessionId;
 
+/// The longest one step of a test's I/O over the agent channel may take.
+pub const STEP: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Awaits `work`, one step of a test's I/O (a connect, a line written or read, a stop),
+/// for at most [`STEP`]; a stall panics with `what`, so the failure says where it
+/// stopped. Real time: tests that do real socket or pipe I/O never pause tokio's clock.
+pub async fn step<T>(
+    what: impl std::fmt::Display,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    match tokio::time::timeout(STEP, work).await {
+        Ok(done) => done,
+        Err(_) => panic!("stalled for {STEP:?}: {what}"),
+    }
+}
+
 /// A kind of filesystem call [`FakeHost::hold`] can stop and [`FakeHost::calls`] counts.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum FsOp {
@@ -1006,5 +1022,12 @@ mod tests {
         let e = host.exec(session, "ls".into(), limits).await.unwrap_err();
         assert_eq!(e.kind, ErrorKind::Protocol);
         assert_eq!(host.execs().len(), 1);
+    }
+
+    /// A stalled step names itself (no I/O here, so the clock may be paused).
+    #[tokio::test(start_paused = true)]
+    #[should_panic(expected = "stalled for 30s: reading line 7 of the flood")]
+    async fn a_stalled_step_says_which() {
+        step("reading line 7 of the flood", std::future::pending::<()>()).await;
     }
 }

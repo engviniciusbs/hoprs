@@ -134,6 +134,30 @@ pub async fn connect(endpoint: &Endpoint) -> io::Result<Stream> {
 /// One connection of the channel, either end.
 pub struct Stream(sys::Stream);
 
+impl Stream {
+    /// What cuts this connection later, even once it is split and its halves are owned
+    /// elsewhere (see [`Cut`]).
+    pub fn cutter(&self) -> Cut {
+        Cut(sys::cutter(&self.0))
+    }
+}
+
+/// Cuts a connection at once: the other end sees it closed (what it has not read yet is
+/// discarded), and nothing of ours waits for it any more.
+///
+/// On Unix closing the socket already does that, so this is nothing. On Windows it is
+/// needed: a pipe closed while a write of ours is still pending is kept open until the
+/// other end reads that write (tokio's pipes are mio's, and mio never cancels a pending
+/// write), so a relay that does not read would never see the close and would keep the
+/// pipe instance and the unwritten answer.
+pub struct Cut(sys::Cut);
+
+impl Cut {
+    pub fn cut(&self) {
+        sys::cut(&self.0);
+    }
+}
+
 impl AsyncRead for Stream {
     fn poll_read(
         mut self: Pin<&mut Self>,

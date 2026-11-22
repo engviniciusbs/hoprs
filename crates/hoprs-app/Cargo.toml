@@ -98,6 +98,8 @@ windows-sys = { version = "0.61", features = [
     "Win32_Security_Authorization",
     # The agent channel's pipe: the process token, for the user's SID.
     "Win32_System_Threading",
+    # The agent channel's pipe: DisconnectNamedPipe, to cut a relay that does not read.
+    "Win32_System_Pipes",
 ] }
 
 # Windows: the icon and version info embedded into hoprs.exe (build.rs).

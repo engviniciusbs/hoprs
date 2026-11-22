@@ -27,6 +27,15 @@ use tokio::net::{UnixListener, UnixStream};
 
 pub(super) type Stream = UnixStream;
 
+/// Nothing to keep: closing a socket ends it at once (see `channel::Cut`).
+pub(super) struct Cut;
+
+pub(super) fn cutter(_: &Stream) -> Cut {
+    Cut
+}
+
+pub(super) fn cut(_: &Cut) {}
+
 /// This process's effective user id.
 fn me() -> u32 {
     // SAFETY: geteuid has no preconditions and cannot fail.
@@ -184,28 +193,26 @@ pub(super) async fn connect(path: &Path) -> Result<Stream> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
-
-    const WAIT: Duration = Duration::from_secs(10);
+    use crate::agent::testing::step;
 
     fn mode(path: &Path) -> u32 {
         fs::symlink_metadata(path).unwrap().mode() & 0o777
     }
 
     async fn talk(listener: &mut Listener, path: &Path) {
-        let client = tokio::time::timeout(WAIT, connect(path));
-        let server = tokio::time::timeout(WAIT, listener.accept());
+        let client = step("the client's connect", connect(path));
+        let server = step("the server's accept", listener.accept());
         let (client, server) = tokio::join!(client, server);
-        let (mut client, mut server) = (client.unwrap().unwrap(), server.unwrap().unwrap());
-        client.write_all(b"ping\n").await.unwrap();
-        let mut got = [0u8; 5];
-        tokio::time::timeout(WAIT, server.read_exact(&mut got))
+        let (mut client, mut server) = (client.unwrap(), server.unwrap());
+        step("the client's ping", client.write_all(b"ping\n"))
             .await
-            .unwrap()
+            .unwrap();
+        let mut got = [0u8; 5];
+        step("the server reading the ping", server.read_exact(&mut got))
+            .await
             .unwrap();
         assert_eq!(&got, b"ping\n");
     }
@@ -267,7 +274,12 @@ mod tests {
         );
         // The relay refuses it too, even with a socket behind it.
         let _listener = Listener::bind(&real.join("agent.sock")).unwrap();
-        let err = connect(&link.join("agent.sock")).await.unwrap_err();
+        let err = step(
+            "a connect that must fail",
+            connect(&link.join("agent.sock")),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::PermissionDenied, "{err}");
     }
 
@@ -279,7 +291,11 @@ mod tests {
         let path = dir.join("agent.sock");
         assert!(Listener::bind(&path).is_err());
         assert!(fs::symlink_metadata(&path).is_err(), "no socket left");
-        assert!(connect(&path).await.is_err());
+        assert!(
+            step("a connect that must fail", connect(&path))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -337,7 +353,9 @@ mod tests {
         let path = Path::new("/").join("agent.sock");
         let err = Listener::bind(&path).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::PermissionDenied, "{err}");
-        let err = connect(&path).await.unwrap_err();
+        let err = step("a connect that must fail", connect(&path))
+            .await
+            .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::PermissionDenied, "{err}");
     }
 
@@ -365,15 +383,28 @@ mod tests {
     #[tokio::test]
     async fn connect_refuses_a_missing_socket() {
         let dir = tempfile::tempdir().unwrap();
-        let err = connect(&dir.path().join("agent.sock")).await.unwrap_err();
+        let err = step(
+            "a connect that must fail",
+            connect(&dir.path().join("agent.sock")),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
-        let err = connect(&dir.path().join("missing").join("agent.sock"))
+        let missing = dir.path().join("missing").join("agent.sock");
+        let err = step("a connect that must fail", connect(&missing))
             .await
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
         // A file in its place is not a socket.
         fs::write(dir.path().join("agent.sock"), b"").unwrap();
-        assert!(connect(&dir.path().join("agent.sock")).await.is_err());
+        assert!(
+            step(
+                "a connect that must fail",
+                connect(&dir.path().join("agent.sock"))
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
@@ -382,10 +413,10 @@ mod tests {
         let path = dir.path().join("agent.sock");
         let mut listener = Listener::bind(&path).unwrap();
         let (client, server) = tokio::join!(
-            tokio::time::timeout(WAIT, connect(&path)),
-            tokio::time::timeout(WAIT, listener.accept())
+            step("the client's connect", connect(&path)),
+            step("the server's accept", listener.accept())
         );
-        let (_client, server) = (client.unwrap().unwrap(), server.unwrap().unwrap());
+        let (_client, server) = (client.unwrap(), server.unwrap());
         assert_eq!(server.peer_cred().unwrap().uid(), me());
     }
 }
