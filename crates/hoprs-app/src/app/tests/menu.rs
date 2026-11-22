@@ -5,9 +5,11 @@
 use iced::{Point, Size};
 
 use super::*;
+use crate::app::ExportMsg;
 use crate::app::menu::{MenuMsg, MenuTarget};
 use crate::backend::broker::{PromptKind, PromptRequest};
 use crate::backend::{BrokerEvent, PromptId};
+use hoprs_vault::ExportScope;
 
 fn open() -> Message {
     Message::Menu(MenuMsg::Open(MenuTarget::SidebarOptions))
@@ -1170,7 +1172,11 @@ async fn site_and_workspace_menus() {
     let items = open_items(&app);
     assert_eq!(
         actions(&items),
-        [MenuAction::OpenSite, MenuAction::EditSite]
+        [
+            MenuAction::OpenSite,
+            MenuAction::EditSite,
+            MenuAction::Export
+        ]
     );
     assert!(items.iter().all(|i| i.enabled && !i.destructive));
     assert_eq!(
@@ -1178,8 +1184,15 @@ async fn site_and_workspace_menus() {
         format!("{:?}", Message::ConnectSite(a.id.clone()))
     );
     assert_eq!(
-        chosen(&mut app, target, MenuAction::EditSite),
+        chosen(&mut app, target.clone(), MenuAction::EditSite),
         format!("{:?}", Message::EditSite(a.id.clone()))
+    );
+    assert_eq!(
+        chosen(&mut app, target, MenuAction::Export),
+        format!(
+            "{:?}",
+            Message::Export(ExportMsg::Open(ExportScope::Site(a.id.clone())))
+        )
     );
     // A workspace: Open all and Edit (Close all too, only for the open one).
     let target = MenuTarget::Workspace(ws.id.clone());
@@ -1187,7 +1200,11 @@ async fn site_and_workspace_menus() {
     let items = open_items(&app);
     assert_eq!(
         actions(&items),
-        [MenuAction::OpenAll, MenuAction::EditWorkspace]
+        [
+            MenuAction::OpenAll,
+            MenuAction::EditWorkspace,
+            MenuAction::Export
+        ]
     );
     assert!(items.iter().all(|i| i.enabled && !i.destructive));
     assert_eq!(
@@ -1201,7 +1218,8 @@ async fn site_and_workspace_menus() {
         [
             MenuAction::OpenAll,
             MenuAction::CloseAll,
-            MenuAction::EditWorkspace
+            MenuAction::EditWorkspace,
+            MenuAction::Export
         ]
     );
     assert_eq!(
@@ -1209,8 +1227,15 @@ async fn site_and_workspace_menus() {
         format!("{:?}", Message::CloseWorkspace(ws.id.clone()))
     );
     assert_eq!(
-        chosen(&mut app, target, MenuAction::EditWorkspace),
+        chosen(&mut app, target.clone(), MenuAction::EditWorkspace),
         format!("{:?}", Message::EditWorkspace(ws.id.clone()))
+    );
+    assert_eq!(
+        chosen(&mut app, target, MenuAction::Export),
+        format!(
+            "{:?}",
+            Message::Export(ExportMsg::Open(ExportScope::Workspace(ws.id.clone())))
+        )
     );
     // Gone since: no items, so no menu; a choice does nothing.
     let gone = MenuTarget::Site(SiteId::new());
@@ -1218,6 +1243,45 @@ async fn site_and_workspace_menus() {
     app.update(Message::Menu(MenuMsg::Open(gone)));
     assert!(app.menu.is_none());
     assert!(app.update(Message::Menu(MenuMsg::Choose(0))).is_empty());
+}
+
+#[test]
+fn sidebar_options_offer_export_everything() {
+    let mut app = App::new();
+    let target = MenuTarget::SidebarOptions;
+    app.update(Message::Menu(MenuMsg::Open(target)));
+    let items = open_items(&app);
+    assert_eq!(
+        actions(&items),
+        [
+            MenuAction::ShowWorkspaces,
+            MenuAction::ShowSites,
+            MenuAction::ExportAll
+        ]
+    );
+    let last = &items[2];
+    assert!(last.rule_before && last.enabled);
+    assert_eq!(last.checked, None);
+    app.update(Message::Menu(MenuMsg::Choose(2)));
+    assert!(app.menu.is_none());
+    assert!(matches!(app.form, Some(Form::Export)));
+    let flow = app.export.as_ref().expect("the export flow");
+    assert!(matches!(
+        flow.title,
+        crate::app::export::ExportTitle::All { .. }
+    ));
+}
+
+#[test]
+fn export_labels_and_icon() {
+    use crate::ui::icons::Icon;
+    use crate::ui::menu::{icon, label, shortcut};
+    assert_eq!(label(MenuAction::Export), "Export…");
+    assert_eq!(label(MenuAction::ExportAll), "Export everything…");
+    for action in [MenuAction::Export, MenuAction::ExportAll] {
+        assert_eq!(icon(action), Icon::ShieldCheck);
+        assert_eq!(shortcut(action), None);
+    }
 }
 
 #[tokio::test]

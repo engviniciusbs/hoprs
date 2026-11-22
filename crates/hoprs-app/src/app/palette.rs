@@ -28,9 +28,11 @@
 //! does not open under one, and closes when one arrives.
 
 use hoprs_core::{SiteId, TabKind, WorkspaceId};
+use hoprs_vault::ExportScope;
 
 use super::{
-    App, CompareMsg, Effect, FailureAction, FileKey, LogMsg, Message, Tab, TabId, TabState,
+    App, CompareMsg, Effect, ExportMsg, FailureAction, FileKey, LogMsg, Message, Tab, TabId,
+    TabState,
 };
 use crate::app::terminal::TerminalMsg;
 use crate::backend::Side;
@@ -216,6 +218,8 @@ pub enum PaletteItem {
     Workspace(WorkspaceId),
     NewSite,
     ImportFilezilla,
+    /// "Export everything…": the export screen for the whole vault.
+    ExportAll,
     Settings,
     ToggleQueue,
     ToggleLog,
@@ -410,6 +414,7 @@ impl App {
                 (PaletteItem::ToggleQueue, strings::palette_toggle_queue()),
                 (PaletteItem::ToggleLog, strings::palette_toggle_log()),
                 (PaletteItem::ImportFilezilla, strings::import_filezilla()),
+                (PaletteItem::ExportAll, strings::export_everything()),
             ] {
                 out.push(Entry::action(item, label, None));
             }
@@ -624,6 +629,7 @@ impl App {
             PaletteItem::Workspace(id) => Message::OpenWorkspace(id.clone()),
             PaletteItem::NewSite => Message::NewSite,
             PaletteItem::ImportFilezilla => Message::OpenImport,
+            PaletteItem::ExportAll => Message::Export(ExportMsg::Open(ExportScope::All)),
             PaletteItem::Settings => Message::OpenSettings,
             PaletteItem::SettingsTab => Message::SelectSettings,
             PaletteItem::CloseSettings => Message::CloseSettings,

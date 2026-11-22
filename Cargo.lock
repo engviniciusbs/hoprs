@@ -2196,6 +2196,7 @@ version = "1.5.0"
 dependencies = [
  "alacritty_terminal",
  "async-trait",
+ "base64 0.22.1",
  "chrono",
  "criterion",
  "dirs",
@@ -2214,6 +2215,7 @@ dependencies = [
  "iced_tiny_skia",
  "libc",
  "notify",
+ "percent-encoding",
  "png",
  "rcgen",
  "rfd",

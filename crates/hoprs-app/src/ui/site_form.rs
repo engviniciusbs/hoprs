@@ -55,6 +55,7 @@ pub enum SiteFormMsg {
     LocalDir(String),
     Save,
     Cancel,
+    Export,
     Delete,
     ConfirmDelete,
     CancelDelete,
@@ -69,6 +70,8 @@ pub enum SiteFormOutcome {
         site: Box<Site>,
         password: PasswordChange,
     },
+    /// The export screen for the site as saved.
+    Export(SiteId),
     Delete(SiteId),
 }
 
@@ -235,6 +238,11 @@ impl SiteForm {
             SiteFormMsg::LocalDir(v) => self.local_dir = v,
             SiteFormMsg::Save => return self.save(),
             SiteFormMsg::Cancel => return SiteFormOutcome::Close,
+            SiteFormMsg::Export => {
+                if self.editing && !self.busy {
+                    return SiteFormOutcome::Export(self.base.id.clone());
+                }
+            }
             SiteFormMsg::Delete => self.confirm_delete = self.editing,
             SiteFormMsg::CancelDelete => self.confirm_delete = false,
             SiteFormMsg::ConfirmDelete => {
@@ -577,6 +585,12 @@ fn actions(form: &SiteForm, delete_note: Option<String>) -> Element<'_, Message>
     .align_y(Alignment::Center)
     .spacing(theme::SPACE_XS);
     if form.editing {
+        buttons = buttons.push(
+            button(text(strings::export_ellipsis()))
+                .padding(Padding::from([theme::SPACE_2XS, theme::SPACE_XS]))
+                .style(theme::button_text)
+                .on_press_maybe((!form.busy).then(|| msg(SiteFormMsg::Export))),
+        );
         buttons = buttons.push(
             button(text(strings::delete()))
                 .padding(Padding::from([theme::SPACE_2XS, theme::SPACE_XS]))

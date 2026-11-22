@@ -3,6 +3,10 @@
 # absolute path on stdout; everything else goes to stderr.
 # Usage: scripts/package-macos.sh   (on macOS, with Xcode's command line tools)
 #
+# HOPRS_GOOGLE_CLIENT_ID and HOPRS_GOOGLE_CLIENT_SECRET, when set in the environment, are
+# inherited by the build (the compiler bakes them in); without them the Google Drive
+# destination is hidden.
+#
 # 1. installs cargo-packager (pinned) if missing, and the two Apple targets for the
 #    toolchain rust-toolchain.toml pins;
 # 2. `cargo build --release --locked -p hoprs-app` for aarch64-apple-darwin and

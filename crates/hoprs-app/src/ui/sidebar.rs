@@ -374,7 +374,8 @@ fn site_row<'a>(app: &'a App, site: &'a Site, edit: bool, chrome: f32) -> Elemen
     } else {
         open.into()
     };
-    // A right press: Open files, Edit (mouse only; both have their click and the palette).
+    // A right press: Open files, Edit, Export… (mouse only; the first two have their click and the palette,
+    // Export… its button in the site's form).
     mouse_area(open)
         .on_right_press(Message::Menu(MenuMsg::Open(MenuTarget::Site(
             site.id.clone(),
@@ -495,7 +496,8 @@ fn workspace<'a>(app: &'a App, ws: &'a Workspace) -> Element<'a, Message> {
     })
     .on_press(Message::ToggleWorkspace(ws.id.clone()));
     let head = hover_edit(head.into(), Message::EditWorkspace(ws.id.clone()));
-    // A right press: Open all, Close all, Edit (mouse only, like the site's).
+    // A right press: Open all, Close all, Edit, Export… (mouse only, like the site's; Export… has its
+    // button in the workspace's form).
     let head = mouse_area(head).on_right_press(Message::Menu(MenuMsg::Open(
         MenuTarget::Workspace(ws.id.clone()),
     )));

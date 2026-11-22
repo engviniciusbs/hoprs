@@ -576,11 +576,39 @@ backup-missing-secrets = Salvos sem a senha (ausente do keyring)
 backup-skipped-unreadable = Não exportadas (entradas ilegíveis)
 backup-skipped-sites = Sites que já existem (mantidos)
 backup-skipped-workspaces = Workspaces que já existem (mantidos)
-backup-file-name = hoprs-backup.hoprs
+export-ellipsis = Exportar…
+export-everything = Exportar tudo…
+export-title-site = Exportar "{ $name }" (site)
+export-title-workspace = Exportar "{ $name }" (workspace, { $sites })
+export-title-all = Exportar tudo ({ $sites }, { $workspaces })
+export-password-hint = Guarde esta senha: sem ela o arquivo não pode ser aberto.
+export-partial-note = Este arquivo terá só uma parte dos seus sites. Restaure com Mesclar; o hoprs 1.5.0 e anteriores não conseguem abri-lo.
 pick-export = Salvar o backup do hoprs
 pick-restore = Escolher um backup do hoprs
 # "Exported 12 sites, 3 workspaces and 9 passwords."
 export-done = Exportados { $sites }, { $workspaces } e { $secrets }.
+drive-name-required = Informe um nome para o arquivo
+# The pages the browser shows after connecting to Google Drive.
+drive-page-connected = O hoprs está conectado. Você pode fechar esta aba.
+drive-page-failed = O hoprs não conseguiu conectar. Volte ao hoprs e tente de novo.
+export-destination = Destino
+export-destination-file = Um arquivo neste computador
+export-destination-drive = Google Drive
+drive-connect = Conectar ao Google Drive…
+drive-account = Conta
+drive-connected = Conectado
+drive-disconnect = Desconectar
+drive-file-name = Nome
+drive-waiting = Aguardando o navegador…
+drive-copy-link = Copiar o link
+drive-browser-hint = Se o navegador não abriu, copie o link e abra você mesmo.
+drive-session-only = O keyring do sistema não está disponível: esta conexão vale até o hoprs fechar.
+drive-uploading = Enviando para o Google Drive…
+drive-uploaded = Enviado para o Google Drive: { $path }
+drive-open = Abrir no Drive
+drive-save-local = Salvar neste computador…
+drive-saved-local = Salvo em { $path }
+drive-settings-line = Google Drive: conectado
 workspace-count =
     { $count ->
     [0] { $count } workspaces
@@ -773,6 +801,7 @@ error-backup-cannot-build = Não foi possível montar o backup
 error-backup-invalid-content = Conteúdo do backup inválido
 error-backup-password-empty = A senha do backup está vazia
 error-backup-cannot-read-secret = Não foi possível ler um segredo para o backup
+error-backup-partial-no-replace = Este arquivo tem só uma parte de um backup. Restaure com Mesclar.
 error-vault-keyring-error = Erro no keyring do sistema
 error-vault-keyring-unavailable = Keyring do sistema indisponível
 error-vault-unknown-site = Site desconhecido
@@ -844,6 +873,13 @@ error-edit-unmatched-quote = O comando do editor tem aspas sem fechar
 error-edit-no-editor = Nenhum comando de editor definido
 error-edit-cannot-start-editor = Não foi possível iniciar o editor
 error-edit-path-refused = Este caminho remoto não pode ser editado localmente
+error-drive-connect-cancelled = Conexão com o Google Drive cancelada
+error-drive-connect-timed-out = O navegador não respondeu em 5 minutos
+error-drive-connect-denied = O acesso ao Google Drive não foi concedido
+error-drive-connect-failed = Não foi possível conectar ao Google Drive
+error-drive-not-connected = Não conectado ao Google Drive
+error-drive-upload-failed = Não foi possível enviar para o Google Drive
+error-drive-not-configured = O Google Drive não está disponível neste build
 
 # The folder compare panel (between the panes and the queue).
 compare-button = Comparar

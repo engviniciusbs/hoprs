@@ -10,6 +10,7 @@ mod backend;
 #[doc(hidden)]
 pub mod bench;
 pub mod cli;
+mod drive;
 mod effects;
 mod i18n;
 mod icon;
@@ -19,6 +20,8 @@ mod probe;
 mod renderer;
 mod settings;
 mod terminal;
+#[cfg(test)]
+pub(crate) mod test_https;
 mod ui;
 mod update;
 
@@ -175,7 +178,8 @@ fn open_backend() -> hoprs_core::Result<Backend> {
             "No configuration directory",
         )
     })?;
-    Backend::open(config, Arc::new(LazyKeyringStore::new()))
+    let keyring = Arc::new(LazyKeyringStore::new());
+    Ok(Backend::open(config, keyring.clone())?.with_app_secrets(keyring))
 }
 
 /// Thin wrapper: the pure update decides, `effects::run` performs.

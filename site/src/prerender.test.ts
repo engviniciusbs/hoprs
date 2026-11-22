@@ -2,7 +2,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { facts } from "./facts";
-import { dicts, pagePath } from "./i18n";
+import { dicts, pagePath, pagePaths } from "./i18n";
 import type { Lang } from "./i18n";
 import { downloadUrls, pageUrl } from "./seo";
 
@@ -94,4 +94,41 @@ it.skipIf(!built)("robots.txt points to the sitemap; llms.txt names the download
   expect(llms).toMatch(/^> .+/m);
   for (const url of downloadUrls) expect(llms).toContain(url);
   expect(llms).toContain("https://hoprs.online/pt-br/");
+});
+
+// The privacy pages: same checks for their own head tags and content.
+describe.skipIf(!built).each([
+  { lang: "en" as Lang, file: "privacy/index.html" },
+  { lang: "pt-BR" as Lang, file: "pt-br/privacy/index.html" },
+])("dist/$file (skipped when dist/ is missing: run npm run build first)", ({ lang, file }) => {
+  const t = dicts[lang].privacy;
+  const esc = (s: string) => s.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+
+  it("has the language, page marker, title, canonical and hreflang links", () => {
+    const html = read(file);
+    expect(html).toContain(`<html lang="${lang}" data-page="privacy">`);
+    expect(html).toContain(`<title>${esc(t.metaTitle)}</title>`);
+    expect(html).toContain(`<link rel="canonical" href="${facts.siteUrl}${pagePaths.privacy[lang]}" />`);
+    expect(html).toContain(`<link rel="alternate" hreflang="en" href="https://hoprs.online/privacy/" />`);
+    expect(html).toContain(`<link rel="alternate" hreflang="pt-BR" href="https://hoprs.online/pt-br/privacy/" />`);
+    expect(html).toContain(`<link rel="alternate" hreflang="x-default" href="https://hoprs.online/privacy/" />`);
+    expect(html).not.toContain("app-head");
+    expect(html.match(/<title>/g)?.length).toBe(1);
+    expect(html.match(/<meta name="description"/g)?.length).toBe(1);
+  });
+
+  it("has the content in the HTML", () => {
+    const html = read(file);
+    expect(html).toContain(`<h1>${esc(t.title)}</h1>`);
+    expect(html).toContain("mailto:privacy@hoprs.online");
+    expect(html).toContain("drive.file");
+  });
+
+  it("has JSON-LD of a WebSite and a WebPage only", () => {
+    const graph = ldGraph(read(file));
+    expect(graph.map((n) => n["@type"]).sort()).toEqual(["WebPage", "WebSite"]);
+    const page = graph.find((n) => n["@type"] === "WebPage")!;
+    expect(page.url).toBe(pageUrl(lang, "privacy"));
+    expect(page.inLanguage).toBe(lang);
+  });
 });

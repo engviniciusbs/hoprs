@@ -171,10 +171,13 @@ pub struct Settings {
     pub update_check: bool,
     /// The newest version an update card was shown for; `None` until one was.
     pub update_seen: Option<semver::Version>,
+    /// Whether the Google Drive destination was connected on this computer (the token
+    /// itself is in the keyring); written only when `true`.
+    pub google_drive: bool,
 }
 
 /// Keys [`file_of`] leaves out when they hold their default.
-const OPTIONAL_KEYS: [&str; 2] = ["compare_height", "update_seen"];
+const OPTIONAL_KEYS: [&str; 3] = ["compare_height", "update_seen", "google_drive"];
 
 /// The largest height a saved panel size may have.
 const PANEL_HEIGHT_MAX: f32 = 10_000.0;
@@ -236,6 +239,7 @@ impl Default for Settings {
             queue_height: QUEUE_MAX_HEIGHT,
             update_check: true,
             update_seen: None,
+            google_drive: false,
         }
     }
 }
@@ -320,6 +324,8 @@ struct File {
     update_check: Option<toml::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     update_seen: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    google_drive: Option<toml::Value>,
 }
 
 /// A bool key; anything else (or missing) is `false`.
@@ -447,6 +453,7 @@ pub fn parse(content: &str) -> Result<Settings> {
         update_seen: file
             .update_seen
             .and_then(|value| value.as_str().and_then(|text| text.parse().ok())),
+        google_drive: flag(file.google_drive),
     })
 }
 
@@ -491,6 +498,7 @@ fn file_of(settings: &Settings) -> File {
             .update_seen
             .as_ref()
             .map(|version| toml::Value::String(version.to_string())),
+        google_drive: settings.google_drive.then_some(toml::Value::Boolean(true)),
     }
 }
 
@@ -1062,5 +1070,40 @@ mod tests {
         assert_eq!(load(&path).settings, picked);
         // A fresh file writes the default as `system`.
         assert!(render(&Settings::default()).contains("language = \"system\""));
+    }
+
+    #[test]
+    fn google_drive_marker_roundtrip_and_invalid() {
+        let defaults = Settings::default();
+        assert!(!defaults.google_drive);
+        assert!(!render(&defaults).contains("google_drive"));
+        let on = Settings {
+            google_drive: true,
+            ..Settings::default()
+        };
+        assert!(render(&on).contains("google_drive = true"));
+        assert_eq!(parse(&render(&on)).unwrap(), on);
+        assert!(!parse("google_drive = \"yes\"").unwrap().google_drive);
+        assert!(!parse("google_drive = 1").unwrap().google_drive);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        std::fs::write(&path, "future_key = 1\ngoogle_drive = true\n").unwrap();
+        let loaded = load(&path).settings;
+        assert!(loaded.google_drive);
+        save(&path, &loaded).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("google_drive = true"), "{text}");
+        save(
+            &path,
+            &Settings {
+                google_drive: false,
+                ..loaded
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("google_drive"), "{text}");
+        assert!(text.contains("future_key = 1"), "{text}");
     }
 }
