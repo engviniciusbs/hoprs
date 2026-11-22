@@ -862,3 +862,210 @@ async fn agent_guard_runs_for_every_agent_item() {
         b"secret"
     );
 }
+
+/// An agent's transfer enqueued with `Skip`: the first run of `target` fails
+/// before its copy is decided (refused by the guard, or its `stat` fails),
+/// then `target` is retried. Its destination exists, so the retry skips it.
+async fn agent_skip_retry(folder: bool, by_guard: bool) {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+    let (target, dst) = if folder {
+        ("/w/d/a.txt", "/srv/d/a.txt")
+    } else {
+        ("/w/a.txt", "/srv/a.txt")
+    };
+    let refuse = Arc::new(AtomicBool::new(by_guard));
+    let flag = Arc::clone(&refuse);
+    let guard = LocalGuard::new(move |path: RemotePath| {
+        let flag = Arc::clone(&flag);
+        Box::pin(async move {
+            if path.as_str() == target && flag.swap(false, SeqCst) {
+                return Err(hoprs_core::Error::new(ErrorKind::Permission, "refused"));
+            }
+            Ok(())
+        })
+    });
+    let local_mem = MemFs::new();
+    local_mem.add_file(target, b"new", mtime());
+    let remote = MemFs::new();
+    remote.add_file(dst, b"old", mtime());
+    let local = FaultFs::new(local_mem);
+    let stat_fails_in_child = folder && !by_guard;
+    if stat_fails_in_child {
+        // Slow enough that the pause below reaches the folder while it is listed.
+        local.set_latency(Duration::from_millis(100));
+    } else if !by_guard {
+        local.fail_next(hoprs_remote::Op::Stat, ErrorKind::Permission);
+    }
+    let config = EngineConfig {
+        agent_guard: Some(guard),
+        ..EngineConfig::default()
+    };
+    let (engine, mut rx) =
+        engine_with(Arc::new(local.clone()), Arc::new(remote.clone()), 1, config).await;
+
+    let source = if folder { "/w/d" } else { target };
+    let remote_root = if folder { "/srv/d" } else { dst };
+    let root = engine
+        .enqueue_with(
+            spec(Direction::Upload, source, remote_root),
+            EnqueueOptions {
+                policy: Some(ConflictPolicy::Skip),
+                origin: Origin::Agent,
+            },
+        )
+        .await
+        .unwrap();
+    if stat_fails_in_child {
+        engine.pause(root).await.unwrap();
+        wait_for(
+            &mut rx,
+            |e| matches!(e, EventKind::StateChanged { id, state: TransferState::Paused } if *id == root),
+        )
+        .await;
+        local.set_latency(Duration::ZERO);
+        local.fail_next(hoprs_remote::Op::Stat, ErrorKind::Permission);
+        engine.resume(root).await.unwrap();
+    }
+    assert!(matches!(
+        wait_terminal(&mut rx, root).await,
+        TransferState::Failed(_)
+    ));
+    let snap = engine.snapshot().await;
+    let item = snap
+        .iter()
+        .find(|i| i.spec.local.as_str() == target)
+        .unwrap();
+    match &item.state {
+        TransferState::Failed(e) => assert_eq!(e.kind, ErrorKind::Permission),
+        other => panic!("{target} ended {other:?}"),
+    }
+    let id = item.id;
+
+    engine.retry(id).await.unwrap();
+    let mut seen = Vec::new();
+    let end = wait_for(&mut rx, |e| {
+        seen.push(e.clone());
+        matches!(e, EventKind::StateChanged { id: i, state } if *i == id && state.is_terminal())
+    })
+    .await;
+    let EventKind::StateChanged { state, .. } = end else {
+        unreachable!()
+    };
+    assert_eq!(state, TransferState::Skipped("exists".to_string()));
+    assert!(
+        !seen.iter().any(|e| matches!(
+            e,
+            EventKind::StateChanged {
+                state: TransferState::AwaitingDecision(_),
+                ..
+            }
+        )),
+        "{seen:?}"
+    );
+    assert_eq!(remote.read_file(dst).unwrap(), b"old");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn skip_root_refused_by_the_guard_skips_on_retry() {
+    agent_skip_retry(false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn skip_root_failing_stat_skips_on_retry() {
+    agent_skip_retry(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn skip_folder_child_refused_by_the_guard_skips_on_retry() {
+    agent_skip_retry(true, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn skip_folder_child_failing_stat_skips_on_retry() {
+    agent_skip_retry(true, false).await;
+}
+
+/// A copy that was decided and then failed still starts over on retry, even
+/// under `Skip`: its destination may be partial.
+#[tokio::test(flavor = "multi_thread")]
+async fn decided_copy_failure_still_overwrites_on_retry() {
+    let bytes = data(1 << 20);
+    let local_mem = MemFs::new();
+    local_mem.add_file("/w/a.bin", &bytes, mtime());
+    let remote = MemFs::new();
+    remote.add_dir("/srv");
+    let local = FaultFs::new(local_mem);
+    local.fail_io_after(300_000, ErrorKind::Io);
+    let (engine, mut rx) = engine_with(
+        Arc::new(local),
+        Arc::new(remote.clone()),
+        1,
+        EngineConfig::default(),
+    )
+    .await;
+    let id = engine
+        .enqueue_with(
+            spec(Direction::Upload, "/w/a.bin", "/srv/a.bin"),
+            EnqueueOptions {
+                policy: Some(ConflictPolicy::Skip),
+                origin: Origin::Agent,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        wait_terminal(&mut rx, id).await,
+        TransferState::Failed(_)
+    ));
+    assert!(remote.read_file("/srv/a.bin").is_some(), "a partial file");
+
+    engine.retry(id).await.unwrap();
+    assert_eq!(wait_terminal(&mut rx, id).await, TransferState::Done);
+    assert_eq!(remote.read_file("/srv/a.bin").unwrap(), bytes);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn agent_enqueue_needs_a_policy_that_never_asks() {
+    let (engine, local, remote, mut rx) = engine_with_memfs(4).await;
+    local.add_file("/w/a.txt", b"a", mtime());
+    remote.add_dir("/srv");
+    let agent = |policy| EnqueueOptions {
+        policy,
+        origin: Origin::Agent,
+    };
+    for policy in [None, Some(ConflictPolicy::Ask)] {
+        let err = engine
+            .enqueue_with(
+                spec(Direction::Upload, "/w/a.txt", "/srv/a.txt"),
+                agent(policy),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Conflict, "{policy:?}");
+    }
+    assert!(engine.snapshot().await.is_empty(), "nothing enqueued");
+
+    for policy in [
+        ConflictPolicy::Overwrite,
+        ConflictPolicy::Skip,
+        ConflictPolicy::OverwriteIfNewer,
+        ConflictPolicy::Resume,
+    ] {
+        let id = engine
+            .enqueue_with(
+                spec(Direction::Upload, "/w/a.txt", "/srv/a.txt"),
+                agent(Some(policy)),
+            )
+            .await
+            .unwrap();
+        assert!(wait_terminal(&mut rx, id).await.is_terminal(), "{policy:?}");
+    }
+    // The user's transfers may still ask.
+    engine
+        .enqueue_with(
+            spec(Direction::Upload, "/w/a.txt", "/srv/b.txt"),
+            EnqueueOptions::default(),
+        )
+        .await
+        .unwrap();
+}

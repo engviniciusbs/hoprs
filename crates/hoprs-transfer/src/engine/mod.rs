@@ -75,6 +75,12 @@ impl fmt::Debug for LocalGuard {
 }
 
 /// How [`TransferEngine::enqueue_with`] enqueues a transfer.
+///
+/// An agent's transfer never waits on a question meant for a person: with
+/// `origin: Origin::Agent`, `policy` must be a policy that never asks (not
+/// `None`, which is the global policy and may be `Ask`, and not
+/// `Some(ConflictPolicy::Ask)`). `enqueue_with` refuses anything else with a
+/// `Conflict` error and enqueues nothing.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct EnqueueOptions {
     /// The conflict policy of the whole tree: the enqueued item's own run,
@@ -228,12 +234,23 @@ impl TransferEngine {
     /// they run under these policies once resumed.
     ///
     /// `options.origin` is recorded on every item of the tree; the items of
-    /// [`Origin::Agent`] pass the engine's `agent_guard` before each run.
+    /// [`Origin::Agent`] pass the engine's `agent_guard` before each run. An
+    /// agent's transfer without a policy that never asks is refused (see
+    /// [`EnqueueOptions`]).
     pub async fn enqueue_with(
         &self,
         spec: TransferSpec,
         options: EnqueueOptions,
     ) -> Result<TransferId> {
+        if options.origin == Origin::Agent
+            && matches!(options.policy, None | Some(ConflictPolicy::Ask))
+        {
+            // A contract of the caller (the agent service), never shown in the UI.
+            return Err(Error::new(
+                ErrorKind::Conflict,
+                "An agent's transfer needs a conflict policy that never asks",
+            ));
+        }
         let (reply, rx) = oneshot::channel();
         self.commands
             .send(Command::Enqueue {

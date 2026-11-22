@@ -135,8 +135,9 @@ pub(super) struct Running {
     pub(super) cancel: CancellationToken,
     pub(super) intent: Option<Intent>,
     /// Policy for the item's next run if this one is interrupted: the
-    /// override this run consumed, until the copy is decided; then the
-    /// policy that continues that copy. Mirrors the stored `next_policy`.
+    /// override this run consumed (unless it is only the item's tree
+    /// policy), until the copy is decided; then the policy that continues
+    /// that copy. Mirrors the stored `next_policy`.
     pub(super) retry: Option<ConflictPolicy>,
     /// The copy phase has started (`prepare` is over).
     pub(super) copying: bool,
@@ -674,7 +675,12 @@ impl Actor {
                     Running {
                         cancel: cancel.clone(),
                         intent: None,
-                        retry: policy_override,
+                        // The item's own tree policy is what it runs under
+                        // anyway: not a continuation, so a failure before the
+                        // copy is decided keeps it (a `Skip` never becomes
+                        // `Overwrite`). `Resume` always is one.
+                        retry: policy_override
+                            .filter(|p| Some(*p) != tree_policy || *p == ConflictPolicy::Resume),
                         copying: false,
                     },
                 );
@@ -728,8 +734,9 @@ impl Actor {
     /// one. That covers a copy that was decided (its destination was, or
     /// may have been, opened), and also a run that only consumed an
     /// override (a stored continuation, or a user `resolve`) and failed
-    /// before the copy was decided. A run without one keeps no
-    /// continuation, so a retry uses the global policy. (A `Cancelled` item
+    /// before the copy was decided. A run without one (also one whose
+    /// override was only its tree policy) keeps its stored policy, so a
+    /// retry uses its tree policy, else the global policy. (A `Cancelled` item
     /// is not handled here: it keeps its own continuation, `Resume`, or
     /// `Overwrite` when the run was replacing an existing file.) Returns
     /// `error`, with a store error in its detail.

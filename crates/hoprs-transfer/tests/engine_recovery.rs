@@ -1120,9 +1120,9 @@ async fn inherited_policy_and_origin_survive_a_restart() {
     remote.add_file("/srv/d/a.txt", b"old a", mtime());
     remote.add_file("/srv/d/b.txt", b"old b", mtime());
 
-    // Slow enough that no child gets past its first call before the shutdown.
+    // Slow enough that the pause below reaches the folder while it is listed.
     let slow = FaultFs::new(local.clone());
-    slow.set_latency(Duration::from_millis(300));
+    slow.set_latency(Duration::from_millis(100));
     let (engine, mut rx) = engine_on_file(
         &db,
         Arc::new(slow),
@@ -1141,15 +1141,14 @@ async fn inherited_policy_and_origin_survive_a_restart() {
         )
         .await
         .unwrap();
-    let mut children = 0;
-    while children < 3 {
-        wait_for(
-            &mut rx,
-            |e| matches!(e, EventKind::Added(i) if i.parent == Some(root)),
-        )
-        .await;
-        children += 1;
-    }
+    // Paused while listing: the children are created paused and never run.
+    engine.pause(root).await.unwrap();
+    wait_for(
+        &mut rx,
+        |e| matches!(e, EventKind::StateChanged { id, state: TransferState::Paused } if *id == root),
+    )
+    .await;
+    assert_eq!(engine.snapshot().await.len(), 4);
     engine.shutdown().await;
 
     let (engine, mut rx) = engine_on_file(
