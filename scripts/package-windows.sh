@@ -4,6 +4,10 @@
 # both bash and PowerShell read); everything else goes to stderr.
 # Usage: scripts/package-windows.sh   (on Windows, in Git Bash, with the MSVC build tools)
 #
+# HOPRS_GOOGLE_CLIENT_ID and HOPRS_GOOGLE_CLIENT_SECRET, when set in the environment, are
+# inherited by the build (the compiler bakes them in); without them the Google Drive
+# destination is hidden.
+#
 # 1. installs cargo-packager (pinned) if missing, and the x86_64-pc-windows-msvc target
 #    for the toolchain rust-toolchain.toml pins;
 # 2. `cargo build --release --locked -p hoprs-app --target x86_64-pc-windows-msvc`, with

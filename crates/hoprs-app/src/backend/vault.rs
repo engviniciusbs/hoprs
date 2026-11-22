@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use hoprs_core::{Error, ErrorKind, Protocol, Result, Site, SiteId, Workspace, WorkspaceId};
 use hoprs_vault::{
-    KeyringStore, SecretKind, SecretStore, UnreadableEntry, Vault, is_keyring_unavailable,
+    AppSecret, AppSecretStore, KeyringStore, SecretKind, SecretStore, UnreadableEntry, Vault,
+    is_keyring_unavailable,
 };
 use secrecy::SecretString;
 
@@ -340,6 +341,20 @@ impl SecretStore for LazyKeyringStore {
 
     fn delete(&self, site: &SiteId, kind: SecretKind) -> Result<()> {
         self.get_store()?.delete(site, kind)
+    }
+}
+
+impl AppSecretStore for LazyKeyringStore {
+    fn get_app(&self, which: AppSecret) -> Result<Option<SecretString>> {
+        self.get_store()?.get_app(which)
+    }
+
+    fn set_app(&self, which: AppSecret, value: &SecretString) -> Result<()> {
+        self.get_store()?.set_app(which, value)
+    }
+
+    fn delete_app(&self, which: AppSecret) -> Result<()> {
+        self.get_store()?.delete_app(which)
     }
 }
 

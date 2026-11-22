@@ -21,7 +21,10 @@ use secrecy::SecretString;
 pub use atomic::write_atomic;
 pub use export::{BackupImportReport, ExportParams, ExportReport, ExportScope, ImportMode};
 pub use profiles::UnreadableEntry;
-pub use secrets::{KeyringStore, MemoryStore, SecretKind, SecretStore, is_keyring_unavailable};
+pub use secrets::{
+    AppSecret, AppSecretStore, KeyringStore, MemoryStore, SecretKind, SecretStore,
+    is_keyring_unavailable,
+};
 
 use profiles::Profiles;
 

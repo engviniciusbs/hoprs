@@ -10,6 +10,7 @@ mod backend;
 #[doc(hidden)]
 pub mod bench;
 pub mod cli;
+mod drive;
 mod effects;
 mod i18n;
 mod icon;
