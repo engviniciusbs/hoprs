@@ -241,9 +241,14 @@ impl ExportFlow {
         self.state.running() || self.drive.running()
     }
 
-    /// The sealed bytes are there to upload again or to save.
+    /// The sealed bytes can be uploaded again or saved: only on the Google Drive
+    /// destination, while nothing runs (one export job at a time). Switching to File
+    /// keeps them for a switch back; a new export, on either destination, drops them.
     fn has_bytes(&self) -> bool {
-        matches!(self.drive, DriveExport::Failed(_)) && self.sealed.is_some()
+        !self.running()
+            && self.destination == Destination::Drive
+            && matches!(self.drive, DriveExport::Failed(_))
+            && self.sealed.is_some()
     }
 
     /// Empties the passwords and drops the questions that would send them.
@@ -587,6 +592,9 @@ impl App {
         // From here on only the effect holds the password.
         let password = SecretString::from(std::mem::take(&mut flow.password.0));
         flow.confirm = Password::default();
+        // A new export: the bytes of a failed upload can no longer stand in for it.
+        flow.sealed = None;
+        flow.drive = DriveExport::Idle;
         flow.state = BackupState::Running;
         vec![Effect::ExportBackup {
             scope: flow.scope.clone(),

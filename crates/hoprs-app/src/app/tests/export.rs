@@ -1299,6 +1299,85 @@ async fn one_export_at_a_time_for_drive_too() {
     }
 }
 
+/// Review fix: the Drive recovery actions only exist on the Drive destination while
+/// nothing runs; a file export and an upload never run together.
+#[tokio::test]
+async fn recovery_only_on_drive_while_nothing_runs() {
+    // Switched to File: the bytes stay, but Try again and Save do nothing there.
+    let mut f = drive_fixture().await;
+    let sent = failed_upload(&mut f);
+    assert!(export(&mut f.app, ExportMsg::Destination(Destination::File)).is_empty());
+    assert!(std::ptr::eq(kept_bytes(&f.app).bytes(), sent.bytes()));
+    let path = f.dir.path().join("late.hoprs");
+    for msg in [
+        ExportMsg::TryAgain,
+        ExportMsg::SaveLocal,
+        ExportMsg::SavePicked(Some(path.clone())),
+    ] {
+        let effects = export(&mut f.app, msg.clone());
+        assert!(effects.is_empty(), "{msg:?}: {effects:?}");
+    }
+    // Back on Drive: offered again, with the same bytes.
+    export(&mut f.app, ExportMsg::Destination(Destination::Drive));
+    match &export(&mut f.app, ExportMsg::TryAgain)[..] {
+        [Effect::DriveUpload { sealed, .. }] => {
+            assert!(std::ptr::eq(sealed.bytes(), sent.bytes()));
+        }
+        other => panic!("expected one DriveUpload, got {other:?}"),
+    }
+
+    // Failed with bytes, File, Submit: the file export runs and the Drive actions (and a
+    // save dialog coming back late) start nothing; the old bytes are gone.
+    let mut f = drive_fixture().await;
+    failed_upload(&mut f);
+    export(&mut f.app, ExportMsg::SaveLocal);
+    export(&mut f.app, ExportMsg::Destination(Destination::File));
+    let picked = f.dir.path().join("picked.hoprs");
+    export(&mut f.app, ExportMsg::Picked(Some(picked)));
+    typed(&mut f.app, "pw", "pw");
+    let effects = export(&mut f.app, ExportMsg::Submit);
+    assert!(
+        matches!(effects[..], [Effect::ExportBackup { .. }]),
+        "{effects:?}"
+    );
+    assert!(flow(&f.app).sealed.is_none());
+    assert!(matches!(flow(&f.app).drive, DriveExport::Idle));
+    for msg in [
+        ExportMsg::TryAgain,
+        ExportMsg::SaveLocal,
+        ExportMsg::SavePicked(Some(path.clone())),
+        ExportMsg::Destination(Destination::Drive),
+    ] {
+        let effects = export(&mut f.app, msg.clone());
+        assert!(effects.is_empty(), "{msg:?}: {effects:?}");
+    }
+    export(&mut f.app, ExportMsg::Done(Ok(report())));
+    assert_eq!(flow(&f.app).state, BackupState::Done(report()));
+    // Back on Drive after it: nothing left to upload or save.
+    export(&mut f.app, ExportMsg::Destination(Destination::Drive));
+    assert!(export(&mut f.app, ExportMsg::TryAgain).is_empty());
+    assert!(export(&mut f.app, ExportMsg::SaveLocal).is_empty());
+
+    // A new Drive export drops the old bytes too: they never stand in for it.
+    let mut f = drive_fixture().await;
+    failed_upload(&mut f);
+    typed(&mut f.app, "pw2", "pw2");
+    let effects = export(&mut f.app, ExportMsg::Submit);
+    assert!(
+        matches!(effects[..], [Effect::SealExport { .. }]),
+        "{effects:?}"
+    );
+    assert!(flow(&f.app).sealed.is_none());
+    for msg in [
+        ExportMsg::TryAgain,
+        ExportMsg::SaveLocal,
+        ExportMsg::SavePicked(Some(path.clone())),
+    ] {
+        let effects = export(&mut f.app, msg.clone());
+        assert!(effects.is_empty(), "{msg:?}: {effects:?}");
+    }
+}
+
 #[tokio::test]
 async fn bytes_are_dropped_with_the_form() {
     let mut f = drive_fixture().await;
