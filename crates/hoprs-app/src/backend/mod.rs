@@ -334,38 +334,24 @@ pub trait BackendApi: Send + Sync {
     // fails with `drive-not-configured`.
     /// The connected account: the connection in memory, else the keyring entry (read
     /// once). `None`: not connected.
-    // TODO(task 11): the export flow's effects call this; remove this allow then.
-    #[allow(dead_code)]
     async fn drive_status(&self) -> Result<Option<DriveAccount>>;
     /// Signs in through the browser (see [`Drive::connect`]): `Waiting { url }`, then
     /// exactly one `Done`, last. `pages` are the texts the browser sees afterwards.
-    // TODO(task 11): the export flow's effects call this; remove this allow then.
-    #[allow(dead_code)]
     fn drive_connect(&self, pages: Pages) -> BoxStream<'static, ConnectEvent>;
     /// Ends the wait of a running connect (its `Done` is `drive-connect-cancelled`).
-    // TODO(task 11): the export flow's effects call this; remove this allow then.
-    #[allow(dead_code)]
     fn drive_cancel(&self);
     /// Revokes the connection at Google (a failure is only logged) and deletes it here.
-    // TODO(task 11): the export flow's effects call this; remove this allow then.
-    #[allow(dead_code)]
     async fn drive_disconnect(&self) -> Result<()>;
     /// Seals the encrypted backup of `scope` in memory (like
     /// [`export_backup`](Self::export_backup), without writing it). Slow on purpose.
-    // TODO(task 11): the export flow's effects call this; remove this allow then.
-    #[allow(dead_code)]
     async fn seal_export(
         &self,
         scope: ExportScope,
         password: SecretString,
     ) -> Result<(ExportReport, Sealed)>;
     /// Uploads a sealed file as `name` into the `hoprs` folder of the connected Drive.
-    // TODO(task 11): the export flow's effects call this; remove this allow then.
-    #[allow(dead_code)]
     async fn drive_upload(&self, name: String, sealed: Sealed) -> Result<DriveFile>;
     /// Writes a sealed file to `path` (atomically, `0o600` on Unix).
-    // TODO(task 11): the export flow's effects call this; remove this allow then.
-    #[allow(dead_code)]
     async fn save_sealed(&self, path: PathBuf, sealed: Sealed) -> Result<()>;
 }
 

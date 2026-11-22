@@ -221,6 +221,16 @@ pub struct App {
     pub export: Option<export::ExportFlow>,
     /// Where the export screen's File field starts: Documents, else home.
     pub export_dir: Option<PathBuf>,
+    /// This build has an OAuth client: the export screen offers Google Drive.
+    pub drive_available: bool,
+    /// The Google Drive connection, as known for this session ([`export`]).
+    pub drive_link: export::DriveLink,
+    /// The last Google Drive step that failed outside an export (reading the keyring,
+    /// connecting, opening the browser, disconnecting).
+    pub drive_error: Option<Error>,
+    /// The keyring could not be read (or the entry deleted): the next pick of the Google
+    /// Drive destination reads it again.
+    drive_unreadable: bool,
     /// Advances while something runs without a known end (import, backup): drives the
     /// indeterminate progress bar.
     pub busy_phase: u32,
@@ -730,6 +740,40 @@ pub enum Effect {
         path: PathBuf,
         password: SecretString,
     },
+    /// Reads the Google Drive connection (the keyring, once); back as
+    /// [`ExportMsg::DriveStatus`].
+    DriveStatus,
+    /// Signs in to Google Drive through the browser; its events come back as
+    /// [`ExportMsg::Connecting`].
+    DriveConnect,
+    /// Ends the wait of a running connect (no message: its `Done` says it).
+    DriveCancel,
+    /// Disconnects Google Drive; back as [`ExportMsg::Disconnected`].
+    DriveDisconnect,
+    /// Seals the encrypted backup of `scope` in memory; back as [`ExportMsg::SealDone`].
+    /// The only holder of the password once emitted.
+    SealExport {
+        scope: ExportScope,
+        password: SecretString,
+    },
+    /// Uploads the sealed bytes as `name`; back as [`ExportMsg::UploadDone`].
+    DriveUpload {
+        name: String,
+        sealed: crate::drive::Sealed,
+    },
+    /// The save dialog for the sealed bytes, proposing `name`; back as
+    /// [`ExportMsg::SavePicked`].
+    PickSealedTarget {
+        name: String,
+    },
+    /// Writes the sealed bytes to `path`; back as [`ExportMsg::SaveDone`].
+    SaveSealed {
+        path: PathBuf,
+        sealed: crate::drive::Sealed,
+    },
+    /// Opens a Google page in the browser (the authorisation URL, which holds the `state`,
+    /// or the uploaded file's); back as [`ExportMsg::PageOpened`].
+    OpenDrivePage(Redacted<String>),
     /// Restores a backup; back as [`Message::BackupRestored`]. The only holder of the
     /// password once emitted.
     RestoreBackup {
@@ -872,6 +916,10 @@ impl App {
             backup: settings::Backup::default(),
             export: None,
             export_dir: dirs::document_dir().or_else(dirs::home_dir),
+            drive_available: crate::drive::client_configured(),
+            drive_link: export::DriveLink::Unknown,
+            drive_error: None,
+            drive_unreadable: false,
             busy_phase: 0,
             window_width: INITIAL_WINDOW_WIDTH,
             window_height: INITIAL_WINDOW_HEIGHT,
@@ -1035,7 +1083,7 @@ impl App {
             self.editor_input = None;
         }
         // The same for the export screen's: a flow that does not run goes with it.
-        self.export_left();
+        effects.extend(self.export_left());
         // The center shows another tab (or Settings, or a form): a menu about what it
         // showed goes.
         if self.shown_tab() != shown {

@@ -59,7 +59,7 @@ fn upload_failed(detail: impl Into<String>) -> Error {
     .with_detail(detail)
 }
 
-pub(super) fn not_connected() -> Error {
+pub(crate) fn not_connected() -> Error {
     Error::coded(
         ErrorKind::Auth,
         "drive-not-connected",

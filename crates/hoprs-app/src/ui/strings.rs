@@ -1526,6 +1526,15 @@ pub fn backup_password_required() -> &'static str {
 pub fn backup_passwords_differ() -> &'static str {
     tr("backup-passwords-differ")
 }
+pub fn drive_name_required() -> &'static str {
+    tr("drive-name-required")
+}
+pub fn drive_page_connected() -> &'static str {
+    tr("drive-page-connected")
+}
+pub fn drive_page_failed() -> &'static str {
+    tr("drive-page-failed")
+}
 pub fn export() -> &'static str {
     tr("export")
 }

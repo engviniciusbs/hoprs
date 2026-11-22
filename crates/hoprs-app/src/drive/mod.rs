@@ -24,7 +24,7 @@ use hoprs_vault::{AppSecret, AppSecretStore, is_keyring_unavailable};
 use secrecy::{ExposeSecret, SecretString};
 
 pub use client::Client;
-use client::not_connected;
+pub(crate) use client::not_connected;
 pub use loopback::Pages;
 
 /// A file in the user's Google Drive, as the upload reports it.
@@ -47,8 +47,6 @@ pub struct DriveAccount {
 /// What [`Drive::connect`] reports: `Waiting` once the browser can be sent to `url`, then
 /// exactly one `Done`, last.
 #[derive(Clone)]
-// TODO(task 11): the export flow reads the events; remove this allow then.
-#[allow(dead_code)]
 pub enum ConnectEvent {
     /// The authorisation URL, to open in the browser and to copy. It holds the `state`
     /// and the PKCE challenge: its `Debug` is redacted, never log it.
@@ -178,7 +176,6 @@ fn parse_entry(value: &SecretString) -> Option<(SecretString, Option<String>)> {
 }
 
 /// Whether this build (or, in a debug build, its environment) has an OAuth client.
-#[cfg(test)]
 pub fn client_configured() -> bool {
     config::client().is_some()
 }

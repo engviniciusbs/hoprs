@@ -6,7 +6,13 @@
 //! passwords and the questions, and drops the flow unless an export runs; a result that
 //! arrives with the form gone drops the flow. The typed password leaves the form inside
 //! the effect (a [`SecretString`]) and both fields are emptied.
+//!
+//! The second destination is Google Drive: the export is sealed in memory, then uploaded;
+//! the same bytes serve "Try again" and "Save to this computer…", and go with the flow.
+//! The connection ([`App::drive_link`]) lasts for the session (ruling 11): the keyring is
+//! read the first time the destination is picked, never to draw a screen.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use chrono::NaiveDate;
@@ -16,6 +22,8 @@ use secrecy::SecretString;
 
 use super::settings::{BackupState, path_of};
 use super::{App, Effect, Form};
+use crate::drive::{ConnectEvent, DriveAccount, DriveFile, Sealed};
+use crate::terminal::Redacted;
 use crate::ui::site_form::Password;
 use crate::ui::strings;
 
@@ -95,6 +103,77 @@ impl App {
     }
 }
 
+/// What the app knows of the Google Drive connection (for the session).
+#[derive(Clone, PartialEq, Eq)]
+pub enum DriveLink {
+    /// The keyring was not read (or could not be: it is asked again next time).
+    Unknown,
+    /// The keyring is being read.
+    Reading,
+    Disconnected,
+    /// Connect runs: the browser is awaited. `url` (once the backend sent it) is the
+    /// authorisation URL, for "Copy the link"; it holds the `state`, so the `Debug` of
+    /// this type never shows it.
+    Waiting {
+        url: Option<String>,
+    },
+    Connected(DriveAccount),
+}
+
+/// Never shows the authorisation URL.
+impl fmt::Debug for DriveLink {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Unknown => f.write_str("Unknown"),
+            Self::Reading => f.write_str("Reading"),
+            Self::Disconnected => f.write_str("Disconnected"),
+            Self::Waiting { url: None } => f.write_str("Waiting { url: None }"),
+            Self::Waiting { url: Some(_) } => f.write_str("Waiting { url: <redacted> }"),
+            Self::Connected(account) => f.debug_tuple("Connected").field(account).finish(),
+        }
+    }
+}
+
+/// Where the export goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Destination {
+    File,
+    Drive,
+}
+
+/// An export to Google Drive, step by step.
+#[derive(Clone, Debug)]
+pub enum DriveExport {
+    Idle,
+    Sealing,
+    Uploading,
+    // TODO(task 12): the view shows the report and the file; remove this allow then.
+    #[allow(dead_code)]
+    Uploaded {
+        report: ExportReport,
+        file: DriveFile,
+    },
+    /// Sealing, the upload or the local save failed; after an upload or a save the bytes
+    /// are still in [`ExportFlow::sealed`].
+    // TODO(task 12): the view shows the error; remove this allow then.
+    #[allow(dead_code)]
+    Failed(Error),
+    /// "Save to this computer…" writes the sealed bytes.
+    Saving,
+    // TODO(task 12): the view shows the report and the path; remove this allow then.
+    #[allow(dead_code)]
+    Saved {
+        report: ExportReport,
+        path: PathBuf,
+    },
+}
+
+impl DriveExport {
+    fn running(&self) -> bool {
+        matches!(self, Self::Sealing | Self::Uploading | Self::Saving)
+    }
+}
+
 /// The export screen's state.
 #[derive(Debug)]
 pub struct ExportFlow {
@@ -114,7 +193,15 @@ pub struct ExportFlow {
     pub confirm: Password,
     /// What is wrong with the fields.
     pub field_error: Option<&'static str>,
+    /// The file destination's export.
     pub state: BackupState<ExportReport>,
+    pub destination: Destination,
+    /// The file's name in Google Drive (starts as [`ExportFlow::file_name`]).
+    pub drive_name: String,
+    /// The sealed export and its report, from sealing until it is uploaded or saved
+    /// (kept for "Try again" and "Save to this computer…"; its `Debug` is the length).
+    pub sealed: Option<(ExportReport, Sealed)>,
+    pub drive: DriveExport,
 }
 
 impl ExportFlow {
@@ -133,6 +220,7 @@ impl ExportFlow {
         ExportFlow {
             scope,
             title,
+            drive_name: file_name.clone(),
             file_name,
             path,
             path_picked: false,
@@ -142,11 +230,20 @@ impl ExportFlow {
             confirm: Password::default(),
             field_error: None,
             state: BackupState::Idle,
+            destination: Destination::File,
+            sealed: None,
+            drive: DriveExport::Idle,
         }
     }
 
+    /// An export runs, to either destination (sealing, uploading or saving the bytes).
     pub fn running(&self) -> bool {
-        self.state.running()
+        self.state.running() || self.drive.running()
+    }
+
+    /// The sealed bytes are there to upload again or to save.
+    fn has_bytes(&self) -> bool {
+        matches!(self.drive, DriveExport::Failed(_)) && self.sealed.is_some()
     }
 
     /// Empties the passwords and drops the questions that would send them.
@@ -182,6 +279,38 @@ pub enum ExportMsg {
     /// The export finished.
     Done(Result<ExportReport, Error>),
     Close,
+    /// The destination picked.
+    Destination(Destination),
+    /// The keyring's answer (see [`App::drive_link`]).
+    DriveStatus(Result<Option<DriveAccount>, Error>),
+    /// "Connect to Google Drive…".
+    Connect,
+    /// What the connect reports (its `Debug` never shows the URL).
+    Connecting(ConnectEvent),
+    CancelConnect,
+    /// "Copy the link" while the browser is awaited.
+    CopyLink,
+    /// "Disconnect", from the form or from Settings.
+    Disconnect,
+    Disconnected(Result<(), Error>),
+    DriveName(String),
+    /// Sealing in memory finished.
+    SealDone(Result<(ExportReport, Sealed), Error>),
+    UploadDone(Result<DriveFile, Error>),
+    /// Uploads the same bytes again.
+    TryAgain,
+    /// "Save to this computer…": the save dialog for the same bytes.
+    SaveLocal,
+    /// That save dialog closed: the path chosen, `None` if cancelled.
+    SavePicked(Option<PathBuf>),
+    SaveDone {
+        path: PathBuf,
+        result: Result<(), Error>,
+    },
+    /// "Open in Drive".
+    OpenInDrive,
+    /// The browser was (or could not be) opened.
+    PageOpened(Result<(), Error>),
 }
 
 impl ExportMsg {
@@ -190,7 +319,17 @@ impl ExportMsg {
     pub fn is_user(&self) -> bool {
         !matches!(
             self,
-            ExportMsg::Picked(_) | ExportMsg::TargetChecked { .. } | ExportMsg::Done(_)
+            ExportMsg::Picked(_)
+                | ExportMsg::TargetChecked { .. }
+                | ExportMsg::Done(_)
+                | ExportMsg::DriveStatus(_)
+                | ExportMsg::Connecting(_)
+                | ExportMsg::Disconnected(_)
+                | ExportMsg::SealDone(_)
+                | ExportMsg::UploadDone(_)
+                | ExportMsg::SavePicked(_)
+                | ExportMsg::SaveDone { .. }
+                | ExportMsg::PageOpened(_)
         )
     }
 }
@@ -224,6 +363,23 @@ impl App {
             ExportMsg::TargetChecked { path, exists } => {
                 return self.export_target_checked(path, exists);
             }
+            // The connection outlives the form: its answers land wherever the user is.
+            ExportMsg::DriveStatus(result) => return self.drive_status(result),
+            ExportMsg::Connecting(event) => return self.drive_connecting(event),
+            ExportMsg::Disconnect => return self.drive_disconnect(),
+            ExportMsg::Disconnected(result) => return self.drive_disconnected(result),
+            ExportMsg::PageOpened(result) => {
+                if let Err(error) = result {
+                    self.drive_error = Some(error);
+                }
+                return Vec::new();
+            }
+            ExportMsg::SealDone(result) => return self.seal_done(result),
+            ExportMsg::UploadDone(result) => return self.upload_done(result),
+            ExportMsg::SaveDone { path, result } => {
+                self.sealed_saved(path, result);
+                return Vec::new();
+            }
             _ => {}
         }
         // The rest is the form's own input (or the save dialog it opened).
@@ -234,7 +390,17 @@ impl App {
             return Vec::new();
         };
         match msg {
-            ExportMsg::Open(_) | ExportMsg::Done(_) | ExportMsg::TargetChecked { .. } => {}
+            ExportMsg::Open(_)
+            | ExportMsg::Done(_)
+            | ExportMsg::TargetChecked { .. }
+            | ExportMsg::DriveStatus(_)
+            | ExportMsg::Connecting(_)
+            | ExportMsg::Disconnect
+            | ExportMsg::Disconnected(_)
+            | ExportMsg::PageOpened(_)
+            | ExportMsg::SealDone(_)
+            | ExportMsg::UploadDone(_)
+            | ExportMsg::SaveDone { .. } => {}
             ExportMsg::Path(path) => {
                 flow.path = path;
                 flow.path_picked = false;
@@ -265,6 +431,61 @@ impl App {
             }
             ExportMsg::CancelOverwrite => flow.confirm_overwrite = false,
             ExportMsg::Close => self.form = None,
+            ExportMsg::Destination(destination) => return self.pick_destination(destination),
+            ExportMsg::Connect => return self.drive_connect(),
+            ExportMsg::CancelConnect => return self.cancel_connect(),
+            ExportMsg::CopyLink => {
+                if let DriveLink::Waiting { url: Some(url) } = &self.drive_link {
+                    return vec![Effect::WriteClipboard(Redacted(url.clone()))];
+                }
+            }
+            ExportMsg::DriveName(name) => {
+                if !flow.running() {
+                    flow.drive_name = name;
+                }
+            }
+            ExportMsg::TryAgain => {
+                if flow.has_bytes()
+                    && matches!(self.drive_link, DriveLink::Connected(_))
+                    && let Some((_, sealed)) = &flow.sealed
+                {
+                    let sealed = sealed.clone();
+                    flow.drive = DriveExport::Uploading;
+                    return vec![Effect::DriveUpload {
+                        name: flow.drive_name.trim().to_owned(),
+                        sealed,
+                    }];
+                }
+            }
+            ExportMsg::SaveLocal => {
+                if flow.has_bytes() {
+                    return vec![Effect::PickSealedTarget {
+                        name: flow.drive_name.trim().to_owned(),
+                    }];
+                }
+            }
+            ExportMsg::SavePicked(None) => {}
+            ExportMsg::SavePicked(Some(path)) => {
+                if flow.has_bytes()
+                    && let Some((_, sealed)) = &flow.sealed
+                {
+                    let sealed = sealed.clone();
+                    flow.drive = DriveExport::Saving;
+                    return vec![Effect::SaveSealed { path, sealed }];
+                }
+            }
+            ExportMsg::OpenInDrive => {
+                if let DriveExport::Uploaded {
+                    file:
+                        DriveFile {
+                            link: Some(link), ..
+                        },
+                    ..
+                } = &flow.drive
+                {
+                    return vec![Effect::OpenDrivePage(Redacted(link.clone()))];
+                }
+            }
         }
         Vec::new()
     }
@@ -292,6 +513,13 @@ impl App {
     fn submit_export(&mut self) -> Vec<Effect> {
         if !self.export_ready() {
             return Vec::new();
+        }
+        if self
+            .export
+            .as_ref()
+            .is_some_and(|flow| flow.destination == Destination::Drive)
+        {
+            return self.submit_to_drive();
         }
         let Some(flow) = self.export.as_mut() else {
             return Vec::new();
@@ -326,7 +554,10 @@ impl App {
             return Vec::new();
         };
         // A path edited meanwhile (or the form left) drops this answer.
-        if !flow.checking || path_of(&flow.path).ok() != Some(path) {
+        if !flow.checking
+            || flow.destination != Destination::File
+            || path_of(&flow.path).ok() != Some(path)
+        {
             return Vec::new();
         }
         flow.checking = false;
@@ -383,15 +614,280 @@ impl App {
     }
 
     /// The centre shows something else: a running export keeps its flow without the
-    /// passwords and questions; any other goes.
-    pub(super) fn export_left(&mut self) {
+    /// passwords and questions; any other goes (and its sealed bytes with it). A connect
+    /// that waits for the browser is cancelled.
+    pub(super) fn export_left(&mut self) -> Vec<Effect> {
         if self.export_shown() {
-            return;
+            return Vec::new();
         }
         match self.export.as_mut() {
             Some(flow) if flow.running() => flow.forget_passwords(),
             Some(_) => self.export = None,
             None => {}
+        }
+        if matches!(self.drive_link, DriveLink::Waiting { .. }) {
+            self.drive_link = DriveLink::Disconnected;
+            return vec![Effect::DriveCancel];
+        }
+        Vec::new()
+    }
+
+    /// The marker in `settings.toml` (Settings draws its line from it), saved if changed.
+    fn set_drive_marker(&mut self, on: bool) -> Vec<Effect> {
+        if self.settings.google_drive == on {
+            return Vec::new();
+        }
+        self.settings.google_drive = on;
+        self.save_settings_effect().into_iter().collect()
+    }
+
+    /// File or Google Drive; not while an export runs, Google Drive only with an OAuth
+    /// client in the build. Picking Google Drive is the only place a form reads the
+    /// keyring: the first time, or again after the keyring could not be read.
+    fn pick_destination(&mut self, destination: Destination) -> Vec<Effect> {
+        if destination == Destination::Drive && !self.drive_available {
+            return Vec::new();
+        }
+        let Some(flow) = self.export.as_mut() else {
+            return Vec::new();
+        };
+        if flow.running() {
+            return Vec::new();
+        }
+        flow.destination = destination;
+        flow.field_error = None;
+        // A check or question about the file has no meaning any more.
+        flow.checking = false;
+        flow.confirm_overwrite = false;
+        let unread = match self.drive_link {
+            DriveLink::Unknown => true,
+            DriveLink::Disconnected => self.drive_unreadable,
+            _ => false,
+        };
+        if destination == Destination::Drive && unread {
+            self.drive_link = DriveLink::Reading;
+            self.drive_error = None;
+            return vec![Effect::DriveStatus];
+        }
+        Vec::new()
+    }
+
+    /// The keyring's answer. Absent: the marker goes. Unreadable (locked, its unlock
+    /// refused): the error shows, the marker stays, and the next pick asks again.
+    fn drive_status(&mut self, result: Result<Option<DriveAccount>, Error>) -> Vec<Effect> {
+        if self.drive_link != DriveLink::Reading {
+            return Vec::new();
+        }
+        self.drive_unreadable = false;
+        match result {
+            Ok(Some(account)) => {
+                self.drive_link = DriveLink::Connected(account);
+                self.set_drive_marker(true)
+            }
+            Ok(None) => {
+                self.drive_link = DriveLink::Disconnected;
+                self.set_drive_marker(false)
+            }
+            Err(error) => {
+                // Shown as not connected (Connect still works, for this session if the
+                // keyring stays out of reach); the next pick asks the keyring again.
+                self.drive_link = DriveLink::Disconnected;
+                self.drive_unreadable = true;
+                self.drive_error = Some(error);
+                Vec::new()
+            }
+        }
+    }
+
+    /// "Connect to Google Drive…": only when not connected and not already waiting.
+    fn drive_connect(&mut self) -> Vec<Effect> {
+        if !self.drive_available
+            || self.drive_link != DriveLink::Disconnected
+            || self
+                .export
+                .as_ref()
+                .is_none_or(|flow| flow.destination != Destination::Drive)
+        {
+            return Vec::new();
+        }
+        self.drive_link = DriveLink::Waiting { url: None };
+        self.drive_error = None;
+        vec![Effect::DriveConnect]
+    }
+
+    fn drive_connecting(&mut self, event: ConnectEvent) -> Vec<Effect> {
+        match event {
+            ConnectEvent::Waiting { url } => {
+                if self.drive_link == (DriveLink::Waiting { url: None }) {
+                    self.drive_link = DriveLink::Waiting {
+                        url: Some(url.clone()),
+                    };
+                    return vec![Effect::OpenDrivePage(Redacted(url))];
+                }
+                // Cancelled (or the form left) before the backend's wait began, when the
+                // cancel could not reach it: cancelled again now that it can.
+                vec![Effect::DriveCancel]
+            }
+            // A success that raced a cancel is kept.
+            ConnectEvent::Done(Ok(account)) => {
+                self.drive_link = DriveLink::Connected(account);
+                self.drive_unreadable = false;
+                self.drive_error = None;
+                self.set_drive_marker(true)
+            }
+            ConnectEvent::Done(Err(error)) => {
+                if matches!(self.drive_link, DriveLink::Waiting { .. }) {
+                    self.drive_link = DriveLink::Disconnected;
+                    if error.code != Some("drive-connect-cancelled") {
+                        self.drive_error = Some(error);
+                    }
+                }
+                Vec::new()
+            }
+        }
+    }
+
+    /// Cancel while the browser is awaited. A cancel sent before the backend's wait began
+    /// is lost there: the `Waiting` that follows is then cancelled at once
+    /// ([`App::drive_connecting`]).
+    fn cancel_connect(&mut self) -> Vec<Effect> {
+        if !matches!(self.drive_link, DriveLink::Waiting { .. }) {
+            return Vec::new();
+        }
+        self.drive_link = DriveLink::Disconnected;
+        vec![Effect::DriveCancel]
+    }
+
+    /// "Disconnect" (from the form or Settings): not while an export runs or the browser
+    /// is awaited.
+    fn drive_disconnect(&mut self) -> Vec<Effect> {
+        if self.export_running() || matches!(self.drive_link, DriveLink::Waiting { .. }) {
+            return Vec::new();
+        }
+        vec![Effect::DriveDisconnect]
+    }
+
+    /// Disconnected: whatever the outcome, the connection is gone here (a failure to
+    /// delete the entry shows).
+    fn drive_disconnected(&mut self, result: Result<(), Error>) -> Vec<Effect> {
+        if !matches!(self.drive_link, DriveLink::Waiting { .. }) {
+            self.drive_link = DriveLink::Disconnected;
+        }
+        // A failure may have left the entry there: the next pick reads it again.
+        self.drive_unreadable = result.is_err();
+        self.drive_error = result.err();
+        self.set_drive_marker(false)
+    }
+
+    /// Export to Google Drive: connected, the name, then the passwords as for a file;
+    /// the password leaves the form with the effect.
+    fn submit_to_drive(&mut self) -> Vec<Effect> {
+        if !matches!(self.drive_link, DriveLink::Connected(_)) {
+            return Vec::new();
+        }
+        let Some(flow) = self.export.as_mut() else {
+            return Vec::new();
+        };
+        if flow.drive_name.trim().is_empty() {
+            flow.field_error = Some(strings::drive_name_required());
+            return Vec::new();
+        }
+        if flow.password.0.is_empty() {
+            flow.field_error = Some(strings::backup_password_required());
+            return Vec::new();
+        }
+        if flow.password != flow.confirm {
+            flow.field_error = Some(strings::backup_passwords_differ());
+            return Vec::new();
+        }
+        flow.field_error = None;
+        // From here on only the effect holds the password.
+        let password = SecretString::from(std::mem::take(&mut flow.password.0));
+        flow.confirm = Password::default();
+        flow.sealed = None;
+        flow.drive = DriveExport::Sealing;
+        vec![Effect::SealExport {
+            scope: flow.scope.clone(),
+            password,
+        }]
+    }
+
+    /// The flow a Drive step's result lands in: `None` when that step does not run, and
+    /// the flow is dropped (its bytes with it) when the form was left meanwhile.
+    fn drive_step(&mut self, step: fn(&DriveExport) -> bool) -> Option<&mut ExportFlow> {
+        if !self.export.as_ref().is_some_and(|flow| step(&flow.drive)) {
+            return None;
+        }
+        if !self.export_shown() {
+            self.export = None;
+            return None;
+        }
+        self.export.as_mut()
+    }
+
+    fn seal_done(&mut self, result: Result<(ExportReport, Sealed), Error>) -> Vec<Effect> {
+        let Some(flow) = self.drive_step(|drive| matches!(drive, DriveExport::Sealing)) else {
+            return Vec::new();
+        };
+        match result {
+            Ok((report, sealed)) => {
+                flow.sealed = Some((report, sealed.clone()));
+                flow.drive = DriveExport::Uploading;
+                vec![Effect::DriveUpload {
+                    name: flow.drive_name.trim().to_owned(),
+                    sealed,
+                }]
+            }
+            Err(error) => {
+                flow.drive = DriveExport::Failed(error);
+                Vec::new()
+            }
+        }
+    }
+
+    fn upload_done(&mut self, result: Result<DriveFile, Error>) -> Vec<Effect> {
+        if !self
+            .export
+            .as_ref()
+            .is_some_and(|flow| matches!(flow.drive, DriveExport::Uploading))
+        {
+            return Vec::new();
+        }
+        // Google refused the grant (revoked from the account page): Connect again.
+        let mut effects = Vec::new();
+        if let Err(error) = &result
+            && error.code == Some("drive-not-connected")
+        {
+            self.drive_link = DriveLink::Disconnected;
+            effects = self.set_drive_marker(false);
+        }
+        let Some(flow) = self.drive_step(|drive| matches!(drive, DriveExport::Uploading)) else {
+            return effects;
+        };
+        match result {
+            Ok(file) => {
+                flow.drive = match flow.sealed.take() {
+                    Some((report, _)) => DriveExport::Uploaded { report, file },
+                    None => DriveExport::Idle,
+                };
+            }
+            Err(error) => flow.drive = DriveExport::Failed(error),
+        }
+        effects
+    }
+
+    fn sealed_saved(&mut self, path: PathBuf, result: Result<(), Error>) {
+        let Some(flow) = self.drive_step(|drive| matches!(drive, DriveExport::Saving)) else {
+            return;
+        };
+        match result {
+            Ok(()) => {
+                flow.drive = match flow.sealed.take() {
+                    Some((report, _)) => DriveExport::Saved { report, path },
+                    None => DriveExport::Idle,
+                };
+            }
+            Err(error) => flow.drive = DriveExport::Failed(error),
         }
     }
 }

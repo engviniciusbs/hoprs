@@ -565,6 +565,10 @@ export-partial-note = Bu dosya sitelerinizin yalnızca bir kısmını içerecek.
 pick-export = hoprs yedeğini kaydet
 pick-restore = Bir hoprs yedeği seçin
 export-done = { $sites }, { $workspaces } ve { $secrets } dışa aktarıldı.
+drive-name-required = Dosya için bir ad girin
+# The pages the browser shows after connecting to Google Drive.
+drive-page-connected = hoprs bağlandı. Bu sekmeyi kapatabilirsiniz.
+drive-page-failed = hoprs bağlanamadı. hoprs'a dönüp yeniden deneyin.
 workspace-count =
     { $count ->
     [one] { $count } çalışma alanı

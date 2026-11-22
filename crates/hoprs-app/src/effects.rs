@@ -25,6 +25,7 @@ use crate::backend::{
     BackendApi, KeptEdit, KnownHostEntry, PromptAnswer, PromptId, SessionId, ShellId, ShellOutput,
     Side, WorkspaceTabs,
 };
+use crate::drive::{Pages, Sealed};
 use crate::settings::Settings;
 use crate::ui::site_form::PasswordChange;
 use crate::ui::{dialogs, files, strings, tabs};
@@ -293,6 +294,24 @@ pub fn run(
             path,
             password,
         } => Task::future(export_backup(backend, scope, path, password)),
+        Effect::DriveStatus => Task::future(drive_status(backend)),
+        Effect::DriveConnect => Task::run(drive_connect(backend), |m| m),
+        Effect::DriveCancel => {
+            backend.drive_cancel();
+            Task::none()
+        }
+        Effect::DriveDisconnect => Task::future(drive_disconnect(backend)),
+        Effect::SealExport { scope, password } => {
+            Task::future(seal_export(backend, scope, password))
+        }
+        Effect::DriveUpload { name, sealed } => Task::future(drive_upload(backend, name, sealed)),
+        Effect::PickSealedTarget { name } => Task::perform(pick_export_file(name), |path| {
+            Message::Export(ExportMsg::SavePicked(path))
+        }),
+        Effect::SaveSealed { path, sealed } => Task::future(save_sealed(backend, path, sealed)),
+        Effect::OpenDrivePage(url) => Task::perform(crate::opener::open(url.0.into()), |result| {
+            Message::Export(ExportMsg::PageOpened(result))
+        }),
         Effect::RestoreBackup {
             path,
             password,
@@ -579,6 +598,48 @@ pub async fn export_backup(
     Message::Export(ExportMsg::Done(
         backend.export_backup(scope, path, password).await,
     ))
+}
+
+/// The Google Drive connection: memory, else the keyring (once).
+pub async fn drive_status(backend: Arc<dyn BackendApi>) -> Message {
+    Message::Export(ExportMsg::DriveStatus(backend.drive_status().await))
+}
+
+/// Signs in through the browser; the pages it shows afterwards are in the app's language.
+pub fn drive_connect(backend: Arc<dyn BackendApi>) -> impl Stream<Item = Message> + use<> {
+    let pages = Pages {
+        connected: strings::drive_page_connected().to_owned(),
+        failed: strings::drive_page_failed().to_owned(),
+    };
+    backend
+        .drive_connect(pages)
+        .map(|event| Message::Export(ExportMsg::Connecting(event)))
+}
+
+pub async fn drive_disconnect(backend: Arc<dyn BackendApi>) -> Message {
+    Message::Export(ExportMsg::Disconnected(backend.drive_disconnect().await))
+}
+
+/// Seals a backup in memory; the password goes straight from the effect to the vault.
+pub async fn seal_export(
+    backend: Arc<dyn BackendApi>,
+    scope: ExportScope,
+    password: SecretString,
+) -> Message {
+    Message::Export(ExportMsg::SealDone(
+        backend.seal_export(scope, password).await,
+    ))
+}
+
+pub async fn drive_upload(backend: Arc<dyn BackendApi>, name: String, sealed: Sealed) -> Message {
+    Message::Export(ExportMsg::UploadDone(
+        backend.drive_upload(name, sealed).await,
+    ))
+}
+
+pub async fn save_sealed(backend: Arc<dyn BackendApi>, path: PathBuf, sealed: Sealed) -> Message {
+    let result = backend.save_sealed(path.clone(), sealed).await;
+    Message::Export(ExportMsg::SaveDone { path, result })
 }
 
 pub async fn restore_backup(

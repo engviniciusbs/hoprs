@@ -635,6 +635,10 @@ pick-export = Save the hoprs backup
 pick-restore = Choose a hoprs backup
 # "Exported 12 sites, 3 workspaces and 9 passwords."
 export-done = Exported { $sites }, { $workspaces } and { $secrets }.
+drive-name-required = Enter a name for the file
+# The pages the browser shows after connecting to Google Drive.
+drive-page-connected = hoprs is connected. You can close this tab.
+drive-page-failed = hoprs could not connect. Go back to hoprs and try again.
 workspace-count =
     { $count ->
     [one] { $count } workspace

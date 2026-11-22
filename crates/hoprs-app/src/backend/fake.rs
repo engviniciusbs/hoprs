@@ -60,9 +60,12 @@
 //! Google Drive is scripted: `drive_status` answers [`FakeBackend::with_drive`] (or the
 //! error of [`FakeBackend::fail_drive_status`]), `drive_connect` streams the events of
 //! [`FakeBackend::set_drive_connect`] (once; nothing when none are set), `seal_export`
-//! answers `b"sealed"` with the scope's report, uploads succeed unless
-//! [`FakeBackend::fail_next_upload`] says otherwise; statuses, uploads, cancels,
-//! disconnects and sealed saves are counted or recorded.
+//! answers `b"sealed"` with the scope's report (unless [`FakeBackend::fail_next_seal`]),
+//! uploads succeed unless [`FakeBackend::fail_next_upload`] says otherwise; statuses,
+//! uploads, cancels, disconnects and sealed saves are counted or recorded. The fake
+//! follows its own calls as the real backend does: a connect that ends connected makes
+//! `drive_status` answer that account, `drive_disconnect` forgets it, and an upload with
+//! no account fails with `drive-not-connected`.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -203,7 +206,8 @@ fn fake_output(rx: mpsc::UnboundedReceiver<ShellOutput>) -> BoxStream<'static, S
 
 /// See the module docs.
 pub struct FakeBackend {
-    state: Mutex<State>,
+    /// Shared with the streams that change it (a connect that ends connected).
+    state: Arc<Mutex<State>>,
     next_session: AtomicU64,
     next_transfer: AtomicI64,
     events: mpsc::UnboundedSender<BrokerEvent>,
@@ -267,6 +271,8 @@ struct State {
     backup_calls: Vec<BackupCall>,
     /// The next `export_backup` calls fail with these.
     export_failures: VecDeque<Error>,
+    /// The next `seal_export` calls fail with these.
+    seal_failures: VecDeque<Error>,
     /// What `settings` returns.
     settings: SettingsLoad,
     /// What `queue_error` returns.
@@ -319,7 +325,7 @@ impl FakeBackend {
     pub fn new() -> Self {
         let (events, receiver) = mpsc::unbounded_channel();
         Self {
-            state: Mutex::new(State::default()),
+            state: Arc::new(Mutex::new(State::default())),
             next_session: AtomicU64::new(1),
             next_transfer: AtomicI64::new(1),
             events,
@@ -747,6 +753,11 @@ impl FakeBackend {
     /// The next `export_backup` fails with `error`.
     pub fn fail_next_export(&self, error: Error) {
         self.state().export_failures.push_back(error);
+    }
+
+    /// The next `seal_export` fails with `error`.
+    pub fn fail_next_seal(&self, error: Error) {
+        self.state().seal_failures.push_back(error);
     }
 
     /// From now on `save_workspace_tabs` never returns.
@@ -1389,7 +1400,11 @@ impl BackendApi for FakeBackend {
             scope: scope.clone(),
             password: password.expose_secret().to_owned(),
         });
-        let report = Self::export_report(&self.state(), &scope)?;
+        let mut state = self.state();
+        if let Some(error) = state.seal_failures.pop_front() {
+            return Err(error);
+        }
+        let report = Self::export_report(&state, &scope)?;
         Ok((report, Sealed::new(b"sealed".to_vec())))
     }
 
@@ -1403,7 +1418,18 @@ impl BackendApi for FakeBackend {
     }
 
     fn drive_connect(&self, _pages: Pages) -> BoxStream<'static, ConnectEvent> {
-        futures_util::stream::iter(std::mem::take(&mut self.state().drive_connect)).boxed()
+        // As the real backend: a connect that ends connected is what `drive_status`
+        // answers from then on (from memory: the keyring is not asked again).
+        let state = self.state.clone();
+        futures_util::stream::iter(std::mem::take(&mut self.state().drive_connect))
+            .inspect(move |event| {
+                if let ConnectEvent::Done(Ok(account)) = event {
+                    let mut state = state.lock().unwrap_or_else(PoisonError::into_inner);
+                    state.drive_account = Some(account.clone());
+                    state.drive_status_error = None;
+                }
+            })
+            .boxed()
     }
 
     fn drive_cancel(&self) {
@@ -1411,7 +1437,9 @@ impl BackendApi for FakeBackend {
     }
 
     async fn drive_disconnect(&self) -> Result<()> {
-        self.state().drive_disconnects += 1;
+        let mut state = self.state();
+        state.drive_disconnects += 1;
+        state.drive_account = None;
         Ok(())
     }
 
@@ -1422,6 +1450,10 @@ impl BackendApi for FakeBackend {
             .push((name.clone(), sealed.bytes().len()));
         if let Some(error) = state.upload_failures.pop_front() {
             return Err(error);
+        }
+        // As the real backend: nothing to upload with.
+        if state.drive_account.is_none() {
+            return Err(crate::drive::not_connected());
         }
         Ok(DriveFile {
             name,
