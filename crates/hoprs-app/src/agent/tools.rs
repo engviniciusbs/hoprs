@@ -13,8 +13,6 @@
 use serde_json::{Value, json};
 
 /// The level of access a call needs on its site.
-// TODO(Task 9): remove
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Need {
     /// No site argument: the call names no site.
@@ -51,8 +49,6 @@ pub fn all() -> &'static [ToolSpec] {
 }
 
 /// The tool called `name`.
-// TODO(Task 9): remove
-#[allow(dead_code)]
 pub fn find(name: &str) -> Option<&'static ToolSpec> {
     TOOLS.iter().find(|t| t.name == name)
 }

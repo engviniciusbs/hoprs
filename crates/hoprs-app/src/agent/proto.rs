@@ -62,8 +62,6 @@ pub enum ToApp {
 }
 
 /// The outcome of one call: text blocks, or the text of an error.
-// TODO(Task 9): remove
-#[allow(dead_code)]
 #[derive(Clone, PartialEq, Eq)]
 pub enum Reply {
     Ok(Vec<String>),

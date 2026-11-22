@@ -53,6 +53,8 @@ pub struct RealHost {
     broker: PromptBroker,
     agents: watch::Receiver<bool>,
     /// The protected roots before the saved sites' key files.
+    // TODO(Task 11): remove
+    #[allow(dead_code)]
     fixed: Arc<Vec<PathBuf>>,
 }
 

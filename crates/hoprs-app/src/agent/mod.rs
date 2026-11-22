@@ -5,55 +5,57 @@
 pub mod host;
 pub mod paths;
 pub mod proto;
+pub mod service;
 #[cfg(test)]
 pub mod testing;
 pub mod tools;
 
 use std::time::Duration;
 
+use hoprs_core::{Error, SiteId};
+
+use crate::backend::SessionId;
+
+/// What the agent side tells the window. None of it opens a tab or takes focus.
+#[derive(Clone, Debug, PartialEq)]
+pub enum AgentEvent {
+    /// How many relays (`hoprs mcp` processes) are connected now.
+    // TODO(Task 12): remove
+    #[allow(dead_code)]
+    Relays(usize),
+    /// The sites whose session only an agent uses, sorted.
+    Sites(Vec<SiteId>),
+    /// A session an agent asked for is up.
+    Connected(SessionId),
+    /// The channel could not start (`Some`), or started after a failure (`None`).
+    // TODO(Task 12): remove
+    #[allow(dead_code)]
+    Channel(Option<Error>),
+}
+
 /// Entries a `list_directory` call answers without a `limit`.
-// TODO(Task 9): remove
-#[allow(dead_code)]
 pub const LIST_DEFAULT: usize = 1000;
 /// The most entries one `list_directory` call answers (`limit` is capped here).
-// TODO(Task 9): remove
-#[allow(dead_code)]
 pub const LIST_MAX: usize = 5000;
 /// The most bytes one `read_file` returns or one `write_file` takes (1 MiB).
-// TODO(Task 9): remove
-#[allow(dead_code)]
 pub const FILE_MAX: usize = 1024 * 1024;
 /// The most bytes of each stream (stdout, stderr) `run_command` keeps (256 KiB).
-// TODO(Task 9): remove
-#[allow(dead_code)]
 pub const EXEC_STREAM_MAX: usize = 256 * 1024;
 /// A command's time limit when the call names none.
-// TODO(Task 9): remove
-#[allow(dead_code)]
 pub const EXEC_DEFAULT: Duration = Duration::from_secs(60);
 /// The longest time limit a call may ask for.
-// TODO(Task 9): remove
-#[allow(dead_code)]
 pub const EXEC_MAX: Duration = Duration::from_secs(600);
 /// How long `download` / `upload` wait before answering `"running"`.
-// TODO(Task 9): remove
-#[allow(dead_code)]
 pub const TRANSFER_WAIT: Duration = Duration::from_secs(60);
 /// How long a call waits for a connection, security prompts included.
-// TODO(Task 9): remove
-#[allow(dead_code)]
 pub const PROMPT_WAIT: Duration = Duration::from_secs(120);
 /// An agent-only session closes after this long without a call.
-// TODO(Task 9): remove
-#[allow(dead_code)]
 pub const IDLE_CLOSE: Duration = Duration::from_secs(10 * 60);
 /// How often the idle sessions are looked for.
 // TODO(Task 12): remove
 #[allow(dead_code)]
 pub const REAP_EVERY: Duration = Duration::from_secs(30);
 /// The most failed items a transfer summary names.
-// TODO(Task 9): remove
-#[allow(dead_code)]
 pub const FAILED_LISTED: usize = 20;
 /// Calls in flight per relay; the next ones wait.
 // TODO(Task 12): remove
@@ -70,19 +72,27 @@ pub const HELLO_WAIT: Duration = Duration::from_secs(5);
 
 /// The limits the agent service applies, as a value so tests can shorten them.
 /// [`Default`] is the constants above.
-// TODO(Task 9): remove
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub list_default: usize,
     pub list_max: usize,
     pub file_max: usize,
+    // TODO(Task 10): remove
+    #[allow(dead_code)]
     pub exec_stream: usize,
+    // TODO(Task 10): remove
+    #[allow(dead_code)]
     pub exec_default: Duration,
+    // TODO(Task 10): remove
+    #[allow(dead_code)]
     pub exec_max: Duration,
+    // TODO(Task 11): remove
+    #[allow(dead_code)]
     pub transfer_wait: Duration,
     pub prompt_wait: Duration,
     pub idle_close: Duration,
+    // TODO(Task 11): remove
+    #[allow(dead_code)]
     pub failed_listed: usize,
 }
 
@@ -110,8 +120,6 @@ impl Default for Limits {
 #[allow(dead_code)]
 pub const UNREACHABLE: &str = "hoprs is not reachable: it is not running, or agent access is off. Open hoprs and turn on Settings › Agents (MCP), then call the tool again.";
 /// The app closed the channel because the user turned agent access off.
-// TODO(Task 9): remove
-#[allow(dead_code)]
 pub const TURNED_OFF: &str = "Agent access was turned off in hoprs. Turn on Settings › Agents (MCP) in the hoprs window, then call the tool again.";
 /// The running window is another version than the relay.
 // TODO(Task 13): remove
@@ -122,21 +130,15 @@ pub fn version_mismatch(app: &str, relay: &str) -> String {
     )
 }
 /// An unknown site id, and a site with no access: one text for both.
-// TODO(Task 9): remove
-#[allow(dead_code)]
 pub const SITE_UNAVAILABLE: &str =
     "No site with this id is open to agents. Call list_sites to see the sites you can use.";
 /// The site's level is reading only.
-// TODO(Task 9): remove
-#[allow(dead_code)]
 pub fn read_only(site: &str) -> String {
     format!(
         "The site \"{site}\" allows reading only. The user can allow more in hoprs: edit the site, Agents (MCP)."
     )
 }
 /// `run_command` on a site that is not SSH.
-// TODO(Task 9): remove
-#[allow(dead_code)]
 pub fn ssh_only(site: &str) -> String {
     format!(
         "The site \"{site}\" is not an SSH site, and only SSH sites can run commands. Use the file tools on it instead."
@@ -151,12 +153,8 @@ pub fn protected(path: &str) -> String {
     )
 }
 /// A connection needs an answer from the user.
-// TODO(Task 9): remove
-#[allow(dead_code)]
 pub const WAITING_FOR_USER: &str = "hoprs is waiting for the user: a question about this connection (host key, certificate, password or passphrase) must be answered in the hoprs window. Ask the user, then call the tool again.";
 /// The server's host key changed.
-// TODO(Task 9): remove
-#[allow(dead_code)]
 pub const HOST_KEY_CHANGED: &str = "The server's host key changed. The user has to resolve it in the hoprs window; an agent cannot accept a new key.";
 /// The server's `instructions`.
 // TODO(Task 13): remove

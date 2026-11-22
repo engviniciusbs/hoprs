@@ -171,6 +171,8 @@ struct State {
 /// The in-memory [`AgentHost`] (see the module docs).
 pub struct FakeHost {
     shared: Arc<Shared>,
+    // TODO(Task 11): remove
+    #[allow(dead_code)]
     events: broadcast::Sender<Event>,
 }
 
@@ -209,9 +211,6 @@ fn not_connected() -> Error {
     Error::coded(ErrorKind::Network, "net-not-connected", "Not connected")
 }
 
-// The service's tests use these from Task 9 on.
-// TODO(Task 9): remove
-#[allow(dead_code)]
 impl FakeHost {
     /// No sites, the switch on, every command exits 0 with no output.
     pub fn new() -> Arc<FakeHost> {
@@ -355,6 +354,8 @@ impl FakeHost {
     }
 
     /// What the next commands return.
+    // TODO(Task 10): remove
+    #[allow(dead_code)]
     pub fn set_exec(&self, output: Result<ExecOutput>) {
         self.state().exec_output = output;
     }
@@ -394,6 +395,8 @@ impl FakeHost {
     }
 
     /// The transfers enqueued so far, with their policies.
+    // TODO(Task 11): remove
+    #[allow(dead_code)]
     pub fn enqueued(&self) -> Vec<(TransferSpec, ConflictPolicy)> {
         self.state().enqueued.clone()
     }
@@ -404,11 +407,15 @@ impl FakeHost {
     }
 
     /// Sends an engine event to the receivers of `transfer_events`.
+    // TODO(Task 11): remove
+    #[allow(dead_code)]
     pub fn send_event(&self, event: Event) {
         let _ = self.events.send(event);
     }
 
     /// The protected roots `protected` answers.
+    // TODO(Task 11): remove
+    #[allow(dead_code)]
     pub fn set_protected(&self, roots: Vec<PathBuf>) {
         self.state().protected = roots;
     }

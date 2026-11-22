@@ -25,8 +25,6 @@ use crate::backend::SessionId;
 /// `Debug` prints only the error's kind and code: an authentication error's message or
 /// detail can name key files. The service answers the agent with a fixed sentence per
 /// kind, never with this error's text.
-// TODO(Task 9): remove
-#[allow(dead_code)]
 pub struct ConnectFailure {
     pub error: Error,
 }
@@ -41,8 +39,6 @@ impl fmt::Debug for ConnectFailure {
 }
 
 /// The operations the agent service needs (see the module docs).
-// TODO(Task 9): remove
-#[allow(dead_code)]
 #[async_trait]
 pub trait AgentHost: Send + Sync + 'static {
     /// The master switch of Settings › Agents (MCP), now.
@@ -63,6 +59,8 @@ pub trait AgentHost: Send + Sync + 'static {
     /// The remote filesystem of a connected session.
     fn remote(&self, session: SessionId) -> Result<Arc<dyn RemoteFs>>;
     /// Runs one command on an SSH session.
+    // TODO(Task 10): remove
+    #[allow(dead_code)]
     async fn exec(
         &self,
         session: SessionId,
@@ -71,12 +69,18 @@ pub trait AgentHost: Send + Sync + 'static {
     ) -> Result<ExecOutput>;
     /// Enqueues an agent's transfer under `policy` (one that never asks); the engine
     /// checks each of its items' local path against the protected ones.
+    // TODO(Task 11): remove
+    #[allow(dead_code)]
     async fn enqueue(&self, spec: TransferSpec, policy: ConflictPolicy) -> Result<TransferId>;
     /// The transfer queue, every origin.
     async fn transfers(&self) -> Vec<TransferItem>;
     /// A new receiver of the engine's events.
+    // TODO(Task 11): remove
+    #[allow(dead_code)]
     fn transfer_events(&self) -> broadcast::Receiver<Event>;
     /// The local paths an agent may not touch, as they are now.
+    // TODO(Task 11): remove
+    #[allow(dead_code)]
     async fn protected(&self) -> Protected;
 }
 
