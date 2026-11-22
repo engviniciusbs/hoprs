@@ -993,9 +993,26 @@ impl BackendApi for Backend {
         password: SecretString,
     ) -> Result<ExportReport> {
         let params = self.backup_params;
-        self.vault
+        let kind = scope_kind(&scope);
+        let shown = path.display().to_string();
+        let result = self
+            .vault
             .call(move |vault| vault.export(&path, &scope, &password, params))
-            .await
+            .await;
+        match &result {
+            Ok(report) => tracing::info!(
+                scope = kind,
+                sites = report.sites,
+                workspaces = report.workspaces,
+                secrets = report.secrets,
+                path = %shown,
+                "exported to a file"
+            ),
+            Err(err) => {
+                tracing::warn!(scope = kind, path = %shown, error = %err, "export to a file failed")
+            }
+        }
+        result
     }
 
     async fn restore_backup(
@@ -1083,20 +1100,61 @@ impl BackendApi for Backend {
         password: SecretString,
     ) -> Result<(ExportReport, Sealed)> {
         let params = self.backup_params;
-        let (report, bytes) = self
+        let kind = scope_kind(&scope);
+        let sealed = self
             .vault
             .call(move |vault| vault.export_bytes(&scope, &password, params))
-            .await?;
-        Ok((report, Sealed::new(bytes)))
+            .await;
+        match sealed {
+            Ok((report, bytes)) => {
+                tracing::info!(
+                    scope = kind,
+                    sites = report.sites,
+                    workspaces = report.workspaces,
+                    secrets = report.secrets,
+                    "export encrypted in memory"
+                );
+                Ok((report, Sealed::new(bytes)))
+            }
+            Err(err) => {
+                tracing::warn!(scope = kind, error = %err, "export failed before it was encrypted");
+                Err(err)
+            }
+        }
     }
 
     async fn drive_upload(&self, name: String, sealed: Sealed) -> Result<DriveFile> {
         let drive = self.drive.clone();
-        blocking(move || drive.upload(&name, sealed.bytes())).await
+        let shown = name.clone();
+        let result = blocking(move || drive.upload(&name, sealed.bytes())).await;
+        match &result {
+            Ok(file) => tracing::info!(name = %file.name, "export uploaded to Google Drive"),
+            Err(err) => {
+                tracing::warn!(name = %shown, error = %err, "export upload to Google Drive failed")
+            }
+        }
+        result
     }
 
     async fn save_sealed(&self, path: PathBuf, sealed: Sealed) -> Result<()> {
-        blocking(move || hoprs_vault::write_atomic(&path, sealed.bytes())).await
+        let shown = path.display().to_string();
+        let result = blocking(move || hoprs_vault::write_atomic(&path, sealed.bytes())).await;
+        match &result {
+            Ok(()) => tracing::info!(path = %shown, "encrypted export saved to a file"),
+            Err(err) => {
+                tracing::warn!(path = %shown, error = %err, "saving the encrypted export failed")
+            }
+        }
+        result
+    }
+}
+
+/// The scope's kind for a log line: never a site's or a workspace's name.
+fn scope_kind(scope: &ExportScope) -> &'static str {
+    match scope {
+        ExportScope::All => "all",
+        ExportScope::Workspace(_) => "workspace",
+        ExportScope::Site(_) => "site",
     }
 }
 
@@ -1878,6 +1936,73 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.code, code);
         backend.drive_cancel();
+    }
+
+    /// Every export outcome reaches the log (INFO done, WARN failed, with the scope kind
+    /// and the path), even when nobody is left on the export screen to see it; the
+    /// password, the secrets and the site's name never do.
+    #[test]
+    fn export_outcomes_are_logged() {
+        let _lock = crate::subscriber_test_lock();
+        let (buffer, capture) = crate::capture_log(&crate::log_filter(Some("info")));
+        let dir = tempfile::tempdir().unwrap();
+        capture.runtime().block_on(async {
+            let backend = open(dir.path());
+            let site = Site::new("Site-Name-Qv31", "h", "u", Protocol::Ssh);
+            backend.save_site(site.clone()).await.unwrap();
+            backend
+                .set_password(site.id.clone(), Some(SecretString::from("secret-Kp83")))
+                .await
+                .unwrap();
+            let path = dir.path().join("out.hoprs");
+            backend
+                .export_backup(
+                    ExportScope::Site(site.id.clone()),
+                    path.clone(),
+                    SecretString::from("password-Zt57"),
+                )
+                .await
+                .unwrap();
+            backend
+                .export_backup(ExportScope::All, path.clone(), SecretString::from(""))
+                .await
+                .unwrap_err();
+            let (_, sealed) = backend
+                .seal_export(ExportScope::All, SecretString::from("password-Zt57"))
+                .await
+                .unwrap();
+            backend
+                .seal_export(ExportScope::All, SecretString::from(""))
+                .await
+                .unwrap_err();
+            let saved = dir.path().join("sealed.hoprs");
+            backend
+                .save_sealed(saved.clone(), sealed.clone())
+                .await
+                .unwrap();
+            // A folder where the file should go: the write fails.
+            let blocked = dir.path().join("blocked");
+            std::fs::create_dir(&blocked).unwrap();
+            backend.save_sealed(blocked, sealed).await.unwrap_err();
+            crate::log_canaries().await;
+        });
+        drop(capture);
+        let text = buffer.text();
+        let path = dir.path().join("out.hoprs").display().to_string();
+        for line in [
+            "exported to a file",
+            "export to a file failed",
+            "export encrypted in memory",
+            "export failed before it was encrypted",
+            "encrypted export saved to a file",
+            "saving the encrypted export failed",
+            "scope=\"site\"",
+            "scope=\"all\"",
+            path.as_str(),
+        ] {
+            assert!(text.contains(line), "{line} missing: {text}");
+        }
+        crate::assert_no_secrets(&buffer, &["password-Zt57", "secret-Kp83", "Site-Name-Qv31"]);
     }
 
     /// Export, then restore (merge and replace), through the vault on the blocking pool.

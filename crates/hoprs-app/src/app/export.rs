@@ -773,10 +773,13 @@ impl App {
         vec![Effect::DriveCancel]
     }
 
-    /// "Disconnect" (from the form or Settings): not while an export runs or the browser
-    /// is awaited.
+    /// "Disconnect" (from the form or Settings): not in a build without Google Drive, nor
+    /// while an export runs or the browser is awaited.
     fn drive_disconnect(&mut self) -> Vec<Effect> {
-        if self.export_running() || matches!(self.drive_link, DriveLink::Waiting { .. }) {
+        if !self.drive_available
+            || self.export_running()
+            || matches!(self.drive_link, DriveLink::Waiting { .. })
+        {
             return Vec::new();
         }
         vec![Effect::DriveDisconnect]

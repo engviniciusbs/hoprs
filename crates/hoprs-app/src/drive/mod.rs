@@ -1026,18 +1026,20 @@ mod tests {
             Some(client),
             Arc::new(MemoryStore::new()),
         ));
+        // The bounds only prove "promptly, not the five-minute time-out", and are wide
+        // for loaded CI machines.
         let first = waiting(&drive);
         let started = Instant::now();
         drive.cancel();
         cancelled(&first.join().unwrap());
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(5));
 
         // A second connect ends the first one the same way.
         let first = waiting(&drive);
         let started = Instant::now();
         let second = waiting(&drive);
         cancelled(&first.join().unwrap());
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < Duration::from_secs(5));
         drive.cancel();
         cancelled(&second.join().unwrap());
         assert_eq!(drive.status().unwrap(), None);

@@ -300,14 +300,16 @@ mod tests {
         let port = port_of(&listener);
         let cancel = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&cancel);
-        let started = Instant::now();
         let waiting = std::thread::spawn(move || {
             listener.wait("S", &flag, Duration::from_secs(30), &pages())
         });
         std::thread::sleep(Duration::from_millis(100));
+        // Measured from the cancel: promptly, far from the 30 s time-out (a wide bound,
+        // for loaded CI machines).
+        let started = Instant::now();
         cancel.store(true, Ordering::Relaxed);
         let err = waiting.join().unwrap().unwrap_err();
-        assert!(started.elapsed() < Duration::from_millis(500) + Duration::from_millis(100));
+        assert!(started.elapsed() < Duration::from_secs(5));
         assert_eq!(err.code, Some("drive-connect-cancelled"));
         TcpListener::bind(("127.0.0.1", port)).unwrap();
 

@@ -720,6 +720,10 @@ async fn drive_is_not_offered_without_a_client() {
     assert!(effects.is_empty(), "{effects:?}");
     assert_eq!(flow(&f.app).destination, Destination::File);
     assert_eq!(f.app.drive_link, DriveLink::Unknown);
+    // Disconnect does nothing either, even with a marker left by another build.
+    f.app.settings.google_drive = true;
+    let effects = export(&mut f.app, ExportMsg::Disconnect);
+    assert!(effects.is_empty(), "{effects:?}");
 }
 
 /// RF5: the keyring is read only when the Google Drive destination is picked, once.

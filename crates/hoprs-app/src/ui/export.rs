@@ -95,10 +95,8 @@ pub fn drive_outcome(app: &App) -> DriveOutcome {
     }
     match &flow.drive {
         DriveExport::Idle => DriveOutcome::None,
-        DriveExport::Sealing => DriveOutcome::Busy(strings::exporting()),
-        DriveExport::Uploading | DriveExport::Saving => {
-            DriveOutcome::Busy(strings::drive_uploading())
-        }
+        DriveExport::Sealing | DriveExport::Saving => DriveOutcome::Busy(strings::exporting()),
+        DriveExport::Uploading => DriveOutcome::Busy(strings::drive_uploading()),
         DriveExport::Uploaded { file, .. } => DriveOutcome::Uploaded {
             path: format!("hoprs/{}", file.name),
             link: file.link.is_some(),
@@ -625,10 +623,12 @@ mod tests {
             outcome(connected(), DriveExport::Uploading, true),
             DriveOutcome::Busy("Uploading to Google Drive…")
         );
+        // Saving the sealed bytes to this computer is not an upload.
         assert_eq!(
             outcome(connected(), DriveExport::Saving, true),
-            DriveOutcome::Busy("Uploading to Google Drive…")
+            DriveOutcome::Busy(strings::exporting())
         );
+        assert_ne!(strings::exporting(), "Uploading to Google Drive…");
         let file = |link: Option<&str>| DriveFile {
             name: "hoprs-cliente-acme-2026-11-22.hoprs".into(),
             link: link.map(str::to_owned),

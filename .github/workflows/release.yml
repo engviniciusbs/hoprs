@@ -60,15 +60,17 @@ jobs:
           echo "version=$crate_version" >> "$GITHUB_OUTPUT"
 
       # Says whether the builds carry the Google Drive OAuth client (the secrets below
-      # arrive as empty strings when unset). Never prints a value.
+      # arrive as empty strings when unset). The app shows Drive only with both values,
+      # so the notice says "enabled" only then. Never prints a value.
       - name: Google Drive destination
         env:
           CLIENT_ID: ${{ secrets.HOPRS_GOOGLE_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.HOPRS_GOOGLE_CLIENT_SECRET }}
         run: |
-          if [ -n "$CLIENT_ID" ]; then
+          if [ -n "$CLIENT_ID" ] && [ -n "$CLIENT_SECRET" ]; then
             echo "::notice::Google Drive destination: enabled"
           else
-            echo "::notice::Google Drive destination: hidden (no client id in the repository secrets)"
+            echo "::notice::Google Drive destination: hidden (the client id and the client secret must both be in the repository secrets)"
           fi
 
       # Before the builds: a missing or empty CHANGELOG section fails in seconds.
