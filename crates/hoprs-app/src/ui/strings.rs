@@ -468,6 +468,25 @@ pub fn agents_levels(read: usize, all: usize) -> String {
         &[("read", read.into()), ("all", all.into())],
     )
 }
+/// The status bar's indicator while an agent is connected.
+pub fn agent_connected() -> &'static str {
+    tr("agent-connected")
+}
+pub fn agent_connected_tip(count: usize) -> String {
+    tr_args("agent-connected-tip", &[("count", count.into())])
+}
+/// The tag of an agent's transfer in the queue.
+pub fn queue_agent_tag() -> &'static str {
+    tr("queue-agent-tag")
+}
+/// A line of a security dialog whose connection an agent asked for.
+pub fn prompt_by_agent() -> &'static str {
+    tr("prompt-by-agent")
+}
+/// The tooltip of a site only an agent's session holds.
+pub fn site_connected_by_agent() -> &'static str {
+    tr("site-connected-by-agent")
+}
 pub fn local_dir() -> &'static str {
     tr("local-dir")
 }

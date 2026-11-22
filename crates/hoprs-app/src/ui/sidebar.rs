@@ -215,6 +215,8 @@ pub enum SiteState<'a> {
     Idle,
     Connecting,
     Connected,
+    /// No connection record of its own, but an agent's session holds the site.
+    ConnectedByAgent,
     Failed(&'a Error),
 }
 
@@ -222,7 +224,11 @@ pub enum SiteState<'a> {
 /// answers "connecting" for a site without tabs.
 pub fn site_state<'a>(app: &'a App, site: &SiteId) -> SiteState<'a> {
     let Some(conn) = app.conns.get(site) else {
-        return SiteState::Idle;
+        return if app.agents.sites.contains(site) {
+            SiteState::ConnectedByAgent
+        } else {
+            SiteState::Idle
+        };
     };
     match &conn.state {
         TabState::Failed(failure) => SiteState::Failed(&failure.error),
@@ -249,7 +255,9 @@ fn state_look(site: &Site, state: SiteState<'_>) -> (Icon, iced::Color, iced::Co
     match state {
         SiteState::Idle => (site_icon(site), p.muted, p.ink_2),
         SiteState::Connecting => (Icon::ArrowsClockwise, p.muted, p.ink_2),
-        SiteState::Connected => (Icon::PlugsConnected, p.success, p.ink),
+        SiteState::Connected | SiteState::ConnectedByAgent => {
+            (Icon::PlugsConnected, p.success, p.ink)
+        }
         SiteState::Failed(_) => (Icon::Warning, p.error, p.ink_2),
     }
 }
@@ -349,6 +357,9 @@ fn site_row<'a>(app: &'a App, site: &'a Site, edit: bool, chrome: f32) -> Elemen
         SiteState::Idle => glyph.into(),
         SiteState::Connecting => state_tip(glyph, strings::connecting().to_owned()),
         SiteState::Connected => state_tip(glyph, strings::connected().to_owned()),
+        SiteState::ConnectedByAgent => {
+            state_tip(glyph, strings::site_connected_by_agent().to_owned())
+        }
         SiteState::Failed(error) => state_tip(glyph, strings::error(error)),
     };
     let name = named(&site.name, name_width, theme::INTER, name_color);
@@ -633,6 +644,24 @@ mod tests {
             keyring_unavailable: false,
         });
         assert_eq!(site_state(&app, &id), SiteState::Failed(&error));
+    }
+
+    #[test]
+    fn site_state_for_an_agent_session() {
+        let mut app = App::new();
+        let id = SiteId::new();
+        assert_eq!(site_state(&app, &id), SiteState::Idle);
+        app.agents.sites.insert(id.clone());
+        assert_eq!(site_state(&app, &id), SiteState::ConnectedByAgent);
+        // With a tab of its own, the tab's state wins.
+        app.conns.insert(id.clone(), SiteConn::connecting());
+        assert_eq!(site_state(&app, &id), SiteState::Connecting);
+        // Both hold it: it stays connected when the tab goes.
+        app.conns.remove(&id);
+        assert_eq!(site_state(&app, &id), SiteState::ConnectedByAgent);
+        // The agent's session closed.
+        app.agents.sites.remove(&id);
+        assert_eq!(site_state(&app, &id), SiteState::Idle);
     }
 
     #[test]

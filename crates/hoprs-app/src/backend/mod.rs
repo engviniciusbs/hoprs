@@ -332,8 +332,6 @@ pub trait BackendApi: Send + Sync {
     /// the first call gets it. Bounded while nobody reads (see
     /// [`crate::agent::latest_events`]): of `Relays`, `Sites` and `Channel` the latest
     /// value always arrives; of `Connected`, at least the latest of each site.
-    // TODO(Task 14): remove
-    #[allow(dead_code)]
     fn agent_events(&self) -> Option<mpsc::Receiver<AgentEvent>>;
 
     /// The latest stable release (the update check). `update-dev-build` in a debug build

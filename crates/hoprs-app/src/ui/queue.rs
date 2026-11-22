@@ -12,7 +12,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Element, Event, Length, Padding, window};
 
-use hoprs_transfer::{Direction, ResolveAction};
+use hoprs_transfer::{Direction, Origin, ResolveAction};
 
 use crate::app::queue::{QueueRow, RowStatus};
 use crate::app::{App, MenuMsg, MenuTarget, Message, Panel, QueueMsg, QueueTab, RowAction};
@@ -346,6 +346,19 @@ fn body(app: &App) -> Element<'_, Message> {
     container(list).height(height).into()
 }
 
+/// The tag of an agent's transfer: `Some` exactly for the rows whose origin is an agent
+/// (the children of an agent's folder carry their root's origin).
+pub fn agent_tag(row: &QueueRow) -> Option<&'static str> {
+    (row.item.origin == Origin::Agent).then(strings::queue_agent_tag)
+}
+
+/// The width a tag of `label` takes: its text, the box's padding and its 1 px border.
+fn tag_width(label: &str) -> f32 {
+    label.chars().count() as f32 * theme::TEXT_XS * fit::INTER_ADVANCE
+        + 2.0 * theme::SPACE_XS
+        + 2.0 * theme::HAIRLINE
+}
+
 /// One 30 px row.
 fn queue_row<'a>(app: &'a App, row: &'a QueueRow) -> Element<'a, Message> {
     let p = palette();
@@ -372,6 +385,12 @@ fn queue_row<'a>(app: &'a App, row: &'a QueueRow) -> Element<'a, Message> {
         - icons::ROW
         - theme::SPACE_XS)
         .max(0.0);
+    // The tag takes its width from the name's room, so the name gives way, not the row.
+    let tag = agent_tag(row);
+    let room = match tag {
+        Some(label) => (room - tag_width(label) - theme::SPACE_XS).max(0.0),
+        None => room,
+    };
     let natural = file_name.chars().count() as f32 * theme::TEXT_MONO * fit::MONO_ADVANCE;
     let mut name = row![
         icons::icon(direction_icon(item.spec.direction), icons::ROW).color(p.muted),
@@ -385,6 +404,18 @@ fn queue_row<'a>(app: &'a App, row: &'a QueueRow) -> Element<'a, Message> {
     .align_y(Alignment::Center);
     if item.is_dir == Some(true) {
         name = name.push(mono(strings::path_separator()).color(p.muted));
+    }
+    if let Some(label) = tag {
+        name = name.push(
+            container(
+                text(label)
+                    .size(theme::TEXT_XS)
+                    .color(p.muted)
+                    .wrapping(text::Wrapping::None),
+            )
+            .padding(Padding::from([0.0, theme::SPACE_XS]))
+            .style(theme::outline_box),
+        );
     }
     let name = row![name.spacing(theme::SPACE_XS)]
         .push(path.parent().map(|parent| {
@@ -529,6 +560,38 @@ fn with_underline(label: Element<'_, Message>, active: bool) -> Element<'_, Mess
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_rows_have_the_tag() {
+        use hoprs_core::{RemotePath, SiteId};
+        use hoprs_transfer::{Origin, TransferId, TransferItem, TransferSpec, TransferState};
+
+        let item = TransferItem {
+            id: TransferId(1),
+            parent: None,
+            spec: TransferSpec {
+                site: SiteId::new(),
+                direction: Direction::Download,
+                local: RemotePath::new("/home/me/f").unwrap(),
+                remote: RemotePath::new("/srv/f").unwrap(),
+            },
+            is_dir: Some(false),
+            size: Some(10),
+            bytes_done: 0,
+            state: TransferState::Queued,
+            origin: Origin::User,
+            tree_policy: None,
+        };
+        let mut row = QueueRow {
+            item,
+            bytes_per_sec: 0,
+            progressed: false,
+        };
+        row.item.origin = Origin::Agent;
+        assert_eq!(agent_tag(&row), Some("agent"));
+        row.item.origin = Origin::User;
+        assert_eq!(agent_tag(&row), None);
+    }
 
     #[test]
     fn queue_icons_per_direction_and_action() {

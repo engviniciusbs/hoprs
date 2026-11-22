@@ -1198,3 +1198,120 @@ async fn closing_a_connecting_tab_drops_its_prompts() {
     assert_eq!(closed(&effects), [SessionId(9)], "{effects:?}");
     assert!(!app.dialogs.is_saving(SessionId(9)));
 }
+
+/// An agent's connection to a site with no tab: its dialog is shown (no tab needed), and
+/// the answer goes to the broker like any other.
+#[test]
+fn agent_prompt_is_shown_without_a_tab() {
+    let mut app = App::new();
+    let mut asked = request(1, 5, "h:22", host_key(&[]));
+    asked.by_agent = true;
+    // A site that was never abandoned, and has no tab.
+    assert!(app.tabs.is_empty());
+    let effects = show(&mut app, asked);
+    assert_eq!(shown(&app), Some(PromptId(1)));
+    assert!(app.tabs.is_empty());
+    assert!(
+        !effects.iter().any(|e| matches!(e, Effect::CloseSession(_))),
+        "{effects:?}"
+    );
+    // Enter in a trust dialog still means Cancel.
+    let effects = dialog_msg(&mut app, DialogMsg::Cancel);
+    let (id, reply) = answer(&effects);
+    assert_eq!(id, PromptId(1));
+    assert!(matches!(reply, PromptAnswer::Cancel), "{reply:?}");
+}
+
+/// A site whose last tab closed while it connected is abandoned: the user's dialogs for
+/// it are dropped with their session. An agent's request is a different session (an
+/// agent's call started it): it is shown, its session kept, and closing a tab later does
+/// not take it away.
+#[test]
+fn an_agent_prompt_survives_an_abandoned_site() {
+    let mut app = App::new();
+    let mut asked = request(1, 5, "h:22", password());
+    asked.by_agent = true;
+    let site = asked.site.clone();
+    app.abandon_site_prompts(&site);
+    let effects = show(&mut app, asked.clone());
+    assert_eq!(shown(&app), Some(PromptId(1)));
+    assert!(
+        effects
+            .iter()
+            .all(|e| !matches!(e, Effect::CloseSession(_)))
+    );
+    // The user's own request for that site is still dropped.
+    let mut own = request(2, 6, "h:22", password());
+    own.site = site.clone();
+    let effects = show(&mut app, own);
+    assert!(
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::CloseSession(SessionId(6))))
+    );
+    // Abandoning the site again leaves the agent's dialog and session alone.
+    let effects = app.abandon_site_prompts(&site);
+    assert_eq!(shown(&app), Some(PromptId(1)));
+    assert!(
+        effects
+            .iter()
+            .all(|e| !matches!(e, Effect::CloseSession(SessionId(5))))
+    );
+    // The agent flag stays on the shown dialog.
+    assert!(dialogs::content(app.dialogs.current.as_ref().unwrap()).by_agent);
+}
+
+/// A password typed in an agent's dialog and saved: once the agent's session is up, the
+/// profiles are reloaded (as for a tab's connect).
+#[test]
+fn saved_secret_from_an_agent_dialog_reloads_profiles() {
+    use crate::agent::AgentEvent;
+
+    let mut app = App::new();
+    let mut asked = request(1, 5, "h:22", password());
+    asked.by_agent = true;
+    let site = asked.site.clone();
+    show(&mut app, asked);
+    dialog_msg(&mut app, DialogMsg::Input(0, Typed("hunter2".into())));
+    dialog_msg(&mut app, DialogMsg::Save(true));
+    dialog_msg(&mut app, DialogMsg::Submit);
+    let effects = app.update(Message::Agent(AgentEvent::Connected(site, SessionId(5))));
+    assert_eq!(
+        effects
+            .iter()
+            .filter(|e| matches!(e, Effect::LoadProfiles(_)))
+            .count(),
+        1,
+        "{effects:?}"
+    );
+    // Another session coming up reloads nothing.
+    let effects = app.update(Message::Agent(AgentEvent::Connected(
+        SiteId::new(),
+        SessionId(9),
+    )));
+    assert!(effects.is_empty());
+}
+
+/// The agent feed delivers what the backend reports, in order; the channel is handed out
+/// once.
+#[tokio::test]
+async fn agent_feed_delivers_events() {
+    use crate::agent::AgentEvent;
+
+    let fake = FakeBackend::new();
+    let mut feed = Box::pin(effects::agent_feed(&fake));
+    fake.push_agent_event(AgentEvent::Relays(2));
+    fake.push_agent_event(AgentEvent::Relays(0));
+    let first = feed.next().await;
+    assert!(
+        matches!(first, Some(Message::Agent(AgentEvent::Relays(2)))),
+        "{first:?}"
+    );
+    let second = feed.next().await;
+    assert!(
+        matches!(second, Some(Message::Agent(AgentEvent::Relays(0)))),
+        "{second:?}"
+    );
+    let mut again = Box::pin(effects::agent_feed(&fake));
+    assert!(again.next().await.is_none());
+}

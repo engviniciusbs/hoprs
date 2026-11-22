@@ -13,6 +13,7 @@ use hoprs_transfer::{ConflictPolicy, Event, TransferId, TransferSpec};
 use hoprs_vault::{BackupImportReport, ExportScope, ImportMode, UnreadableEntry};
 use secrecy::SecretString;
 
+use crate::agent::AgentEvent;
 use crate::backend::{
     AuthMethod, BrokerEvent, ConnectResult, ControlOp, KnownHostEntry, ProfileSnapshot,
     PromptAnswer, PromptId, SessionId, ShellId, Side, TransferSnapshot, WorkspaceTabs,
@@ -21,6 +22,19 @@ use crate::settings::{Settings, SettingsLoad};
 use crate::ui::sidebar;
 use crate::ui::site_form::{PasswordChange, SiteForm, SiteFormMsg, SiteFormOutcome};
 use crate::ui::workspace_form::{WorkspaceForm, WorkspaceFormMsg, WorkspaceFormOutcome};
+
+/// What the agent side last reported (Settings › Agents (MCP), `hoprs mcp`). It only
+/// feeds the status bar, the sidebar's mark and the Settings line: nothing here opens a
+/// tab or moves the focus.
+#[derive(Debug, Default)]
+pub struct Agents {
+    /// How many relays (`hoprs mcp` processes) are connected.
+    pub relays: usize,
+    /// The sites an agent's session holds (the latest list reported).
+    pub sites: HashSet<SiteId>,
+    /// Why the channel for agents could not open, if it could not.
+    pub error: Option<Error>,
+}
 
 /// Where the saved sites are.
 #[derive(Debug, Clone, PartialEq)]
@@ -198,6 +212,8 @@ pub struct App {
     pub os_drag_count: usize,
     /// The security and credential dialogs: the one shown and those waiting.
     pub dialogs: Dialogs,
+    /// The agent side: relays connected, the sites an agent holds, the channel's error.
+    pub agents: Agents,
     /// The workspace "Open workspace" opened last, until it is closed: its tabs and
     /// folders are saved when it closes or the window does.
     pub open_workspace: Option<WorkspaceId>,
@@ -412,6 +428,9 @@ pub enum Message {
     DragCancel,
     /// A dialog to show or withdraw, from the prompt broker's subscription.
     Prompt(BrokerEvent),
+    /// What the agent side reports, from its subscription. A result: it lands behind a
+    /// dialog and while closing, and never opens or focuses anything.
+    Agent(AgentEvent),
     /// Something in the open dialog.
     Dialog(DialogMsg),
     /// "Remove the old entry…" in a tab whose host key changed.
@@ -908,6 +927,7 @@ impl App {
             os_drag: false,
             os_drag_count: 0,
             dialogs: Dialogs::default(),
+            agents: Agents::default(),
             open_workspace: None,
             closing: false,
             filezilla_default: hoprs_import::default_sitemanager_path(),
@@ -1239,6 +1259,7 @@ impl App {
             Message::DragEnd => return self.drag_end(),
             Message::DragCancel => return self.drag_cancel(),
             Message::Prompt(event) => return self.prompt_event(event),
+            Message::Agent(event) => return self.agent_event(event),
             Message::Dialog(msg) => return self.dialog_msg(msg),
             Message::KnownHosts { tab, msg } => return self.known_hosts_msg(tab, msg),
             Message::KnownHostEntries { site, result } => {

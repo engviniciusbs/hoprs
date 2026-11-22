@@ -1167,3 +1167,91 @@ async fn settings_tab_status_line_has_no_connection() {
     select(&mut app, &a.id);
     assert_eq!(status::line(&app).state.as_deref(), Some("Connected"));
 }
+
+/// The agent indicator: only while a relay is connected, also on the settings tab; the
+/// tooltip has the count.
+#[tokio::test]
+async fn agent_indicator_follows_the_relays() {
+    use crate::agent::AgentEvent;
+
+    let a = site("Shop prod", "203.0.113.4", "deploy", Protocol::Ssh);
+    let fake = Arc::new(FakeBackend::new().with_site(a.clone()));
+    let mut app = loaded(&fake).await;
+    assert_eq!(status::line(&app).agents, None);
+    app.update(Message::Agent(AgentEvent::Relays(1)));
+    assert_eq!(
+        status::line(&app).agents.as_deref(),
+        Some("Agent connected")
+    );
+    app.update(Message::Agent(AgentEvent::Relays(3)));
+    assert_eq!(
+        status::line(&app).agents.as_deref(),
+        Some("Agent connected")
+    );
+    assert!(strings::agent_connected_tip(3).contains('3'));
+    app.update(Message::OpenSettings);
+    assert!(app.settings_shown());
+    assert_eq!(
+        status::line(&app).agents.as_deref(),
+        Some("Agent connected")
+    );
+    // The last relay leaves, or events arrive coalesced: the latest value wins.
+    app.update(Message::Agent(AgentEvent::Relays(0)));
+    assert_eq!(status::line(&app).agents, None);
+}
+
+fn channel_error() -> hoprs_core::Error {
+    hoprs_core::Error::coded(
+        ErrorKind::Io,
+        "agent-channel-failed",
+        "Could not open the channel for agents",
+    )
+}
+
+/// An agent connecting, working or leaving changes nothing the user is doing.
+#[tokio::test]
+async fn agent_events_never_touch_tabs_or_focus() {
+    use crate::agent::AgentEvent;
+
+    let a = site("Shop prod", "203.0.113.4", "deploy", Protocol::Ftp);
+    let fake = Arc::new(FakeBackend::new().with_site(a.clone()));
+    let mut app = loaded(&fake).await;
+    app.update(Message::ConnectSite(a.id.clone()));
+    let before = (app.tabs.len(), app.active_tab, app.dialogs.is_open());
+    let form = format!("{:?}", app.form);
+    let events = [
+        AgentEvent::Relays(2),
+        AgentEvent::Sites(vec![a.id.clone()]),
+        AgentEvent::Connected(a.id.clone(), SessionId(40)),
+        AgentEvent::Channel(Some(channel_error())),
+        AgentEvent::Channel(None),
+        AgentEvent::Sites(Vec::new()),
+        AgentEvent::Relays(0),
+    ];
+    for event in events {
+        let effects = app.update(Message::Agent(event.clone()));
+        assert!(effects.is_empty(), "{event:?}: {effects:?}");
+        assert_eq!(
+            (app.tabs.len(), app.active_tab, app.dialogs.is_open()),
+            before
+        );
+        assert_eq!(format!("{:?}", app.form), form);
+    }
+    assert!(app.agents.error.is_none());
+    assert!(app.agents.sites.is_empty());
+    // Only the channel's error is kept, and cleared by `None`.
+    app.update(Message::Agent(AgentEvent::Channel(Some(channel_error()))));
+    assert!(app.agents.error.is_some());
+}
+
+/// The window is closing: an agent event still lands (it is a result).
+#[tokio::test]
+async fn agent_events_land_while_closing() {
+    use crate::agent::AgentEvent;
+
+    let mut app = App::new();
+    app.closing = true;
+    let effects = app.update(Message::Agent(AgentEvent::Relays(2)));
+    assert!(effects.is_empty());
+    assert_eq!(app.agents.relays, 2);
+}

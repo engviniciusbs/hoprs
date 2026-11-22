@@ -66,8 +66,6 @@ pub struct PromptRequest {
     pub key: String,
     pub kind: PromptKind,
     /// The session was started by an agent's call (the dialog says so).
-    // TODO(Task 14): remove
-    #[allow(dead_code)]
     pub by_agent: bool,
 }
 

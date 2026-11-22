@@ -293,6 +293,9 @@ fn app_subscription(state: &Hoprs) -> iced::Subscription<Message> {
         iced::Subscription::run_with(PromptFeed(Arc::clone(&state.backend)), |feed| {
             effects::prompt_feed(feed.0.as_ref())
         }),
+        iced::Subscription::run_with(AgentFeed(Arc::clone(&state.backend)), |feed| {
+            effects::agent_feed(feed.0.as_ref())
+        }),
         iced::Subscription::run_with(EditFeed(Arc::clone(&state.backend)), |feed| {
             effects::edit_feed(feed.0.as_ref())
         }),
@@ -368,6 +371,16 @@ struct PromptFeed(Arc<dyn BackendApi>);
 impl std::hash::Hash for PromptFeed {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         "prompt-feed".hash(state);
+    }
+}
+
+/// The backend, as the identity of the agent side's events (one for the whole run: the
+/// backend hands its channel out once).
+struct AgentFeed(Arc<dyn BackendApi>);
+
+impl std::hash::Hash for AgentFeed {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        "agent-feed".hash(state);
     }
 }
 

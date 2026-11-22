@@ -488,15 +488,23 @@ fn copyable<'a>(value: &str, copy: SettingsMsg) -> Element<'a, Message> {
     .into()
 }
 
+/// Why the channel for agents could not open, as the line under the checkbox.
+fn agents_error(app: &App) -> Option<String> {
+    app.agents.error.as_ref().map(strings::error)
+}
+
 fn agents(app: &App) -> Element<'_, Message> {
     let (read, all) = agent_levels(&app.sites);
     let command = agent_command(app.agent_exe.as_deref());
     let json = agent_json(app.agent_exe.as_deref());
+    let channel_error =
+        agents_error(app).map(|error| text(error).size(theme::TEXT_SM).color(palette().error));
     column![
         checkbox(app.settings.agents_enabled)
             .label(strings::agents_allow())
             .on_toggle(|on| msg(SettingsMsg::Agents(on)))
             .style(theme::checkbox),
+        channel_error,
         muted(strings::agents_allow_hint()),
         field(
             strings::agents_claude_code(),
@@ -896,6 +904,23 @@ fn restore_report(report: &BackupImportReport) -> Element<'_, Message> {
 mod tests {
     use super::*;
     use crate::i18n::{Language, set_language};
+
+    #[test]
+    fn agents_section_shows_the_channel_error() {
+        use hoprs_core::{Error, ErrorKind};
+
+        let mut app = App::new();
+        assert_eq!(agents_error(&app), None);
+        app.agents.error = Some(Error::coded(
+            ErrorKind::Io,
+            "agent-channel-failed",
+            "Could not open the channel for agents",
+        ));
+        assert_eq!(
+            agents_error(&app).as_deref(),
+            Some("Could not open the channel for agents")
+        );
+    }
 
     #[test]
     fn every_section_has_title_description_and_icon() {

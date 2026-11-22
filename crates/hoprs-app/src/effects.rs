@@ -1025,6 +1025,18 @@ pub fn prompt_feed(backend: &dyn BackendApi) -> impl Stream<Item = Message> + Se
     })
 }
 
+/// What the agent side reports, for the UI's subscription: each event as
+/// [`Message::Agent`]. The backend hands its channel out once; without it (a second
+/// subscription) the stream is empty.
+pub fn agent_feed(backend: &dyn BackendApi) -> impl Stream<Item = Message> + Send + use<> {
+    let events = backend.agent_events();
+    stream::unfold(events, |events| async move {
+        let mut events = events?;
+        let event = events.recv().await?;
+        Some((Message::Agent(event), Some(events)))
+    })
+}
+
 /// Queues each transfer in order; stops at the first failure.
 pub async fn enqueue_all(
     backend: Arc<dyn BackendApi>,

@@ -29,6 +29,7 @@ use hoprs_ssh::HostKeyChange;
 use secrecy::SecretString;
 
 use super::{App, Effect, FileKey, Message, SiteConn, Tab, TabId, TabState};
+use crate::agent::AgentEvent;
 use crate::backend::broker::{PromptKind, PromptRequest};
 use crate::backend::{BrokerEvent, KnownHostEntry, PromptAnswer, SessionId};
 
@@ -188,11 +189,27 @@ impl SiteConn {
 }
 
 impl App {
+    /// What the agent side reports: the numbers the status bar and the sidebar read, the
+    /// channel's error, and the end of a connect the user answered with "save". Nothing
+    /// else changes: no tab, no focus, no dialog.
+    pub(super) fn agent_event(&mut self, event: AgentEvent) -> Vec<Effect> {
+        match event {
+            AgentEvent::Relays(relays) => self.agents.relays = relays,
+            AgentEvent::Sites(sites) => self.agents.sites = sites.into_iter().collect(),
+            AgentEvent::Connected(_, session) => return self.settle_saving(session, true),
+            AgentEvent::Channel(error) => self.agents.error = error,
+        }
+        Vec::new()
+    }
+
     /// A request or withdrawal from the broker.
     pub(super) fn prompt_event(&mut self, event: BrokerEvent) -> Vec<Effect> {
         match event {
             BrokerEvent::Request(request) => {
-                if self.dialogs.abandoned.contains(&request.site) {
+                // A request of an agent's session is not a tab's: closing the last tab of
+                // the site while it connected does not abandon it (the user may still
+                // answer or cancel it).
+                if !request.by_agent && self.dialogs.abandoned.contains(&request.site) {
                     // Its tab is gone: closing the session withdraws the dialog.
                     self.forget_session(request.session);
                     return vec![Effect::CloseSession(request.session)];
@@ -421,11 +438,12 @@ impl App {
     /// Not answered Cancel: a host key refusal would be shared with other sessions
     /// waiting on the same `host:port`, while a withdrawal makes them ask again. Until
     /// the connect's result lands, a new dialog of the site is dropped the same way.
+    /// A request of an agent's session (`by_agent`) is neither dropped nor closed here.
     pub(super) fn abandon_site_prompts(&mut self, site: &SiteId) -> Vec<Effect> {
         self.dialogs.abandoned.insert(site.clone());
         let mut sessions = BTreeSet::new();
         self.dialogs.queue.retain(|r| {
-            let mine = &r.site == site;
+            let mine = &r.site == site && !r.by_agent;
             if mine {
                 sessions.insert(r.session);
             }
@@ -439,7 +457,11 @@ impl App {
             !mine
         });
         let mut effects = Vec::new();
-        if let Some(dialog) = self.dialogs.current.take_if(|d| &d.request.site == site) {
+        if let Some(dialog) = self
+            .dialogs
+            .current
+            .take_if(|d| &d.request.site == site && !d.request.by_agent)
+        {
             sessions.insert(dialog.request.session);
             effects.extend(self.show_next());
         }
