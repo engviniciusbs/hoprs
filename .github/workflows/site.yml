@@ -116,4 +116,6 @@ jobs:
           curl -fsS https://hoprs.online/pt-br/ -o "$RUNNER_TEMP/pt-br.html"
           grep -q 'lang="pt-BR"' "$RUNNER_TEMP/pt-br.html"
           curl -fsS https://hoprs.online/privacy/ -o "$RUNNER_TEMP/privacy.html"
-          grep -q 'privacy@hoprs.online' "$RUNNER_TEMP/privacy.html"
+          # Not the contact address: Cloudflare's email obfuscation rewrites it in the
+          # served HTML (the build's own tests check the address in dist/).
+          grep -q 'data-page="privacy"' "$RUNNER_TEMP/privacy.html"
