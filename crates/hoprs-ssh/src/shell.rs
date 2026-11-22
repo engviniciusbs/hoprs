@@ -90,6 +90,10 @@ pub(crate) trait ShellWriter: Send + Sync + 'static {
     async fn data(&self, data: Vec<u8>) -> std::result::Result<(), russh::Error>;
     async fn window_change(&self, cols: u32, rows: u32) -> std::result::Result<(), russh::Error>;
     async fn close(&self) -> std::result::Result<(), russh::Error>;
+    /// Best-effort `signal KILL` request (no reply wanted). Only exec channels use it.
+    async fn kill(&self) -> std::result::Result<(), russh::Error> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -104,6 +108,10 @@ impl ShellWriter for ChannelWriteHalf<Msg> {
 
     async fn close(&self) -> std::result::Result<(), russh::Error> {
         ChannelWriteHalf::close(self).await
+    }
+
+    async fn kill(&self) -> std::result::Result<(), russh::Error> {
+        self.signal(russh::Sig::KILL).await
     }
 }
 
@@ -279,7 +287,7 @@ fn map_send(e: russh::Error) -> Error {
 
 /// Asks the server to close the channel without waiting for the request to be queued: the
 /// handle-to-session channel can be full while the session task is busy delivering data.
-pub(crate) fn close_detached(writer: &Arc<dyn ShellWriter>) {
+fn close_detached(writer: &Arc<dyn ShellWriter>) {
     if let Ok(runtime) = tokio::runtime::Handle::try_current() {
         let writer = writer.clone();
         runtime.spawn(async move {

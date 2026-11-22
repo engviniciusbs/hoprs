@@ -15,13 +15,14 @@ use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use hoprs_core::{Error, ErrorKind, Result};
 use russh::{ChannelMsg, Sig};
 use tokio::time::Instant;
 
 use crate::channels::ChannelSlot;
 use crate::session::{SshSession, map_russh_error};
-use crate::shell::{ShellReader, ShellWriter, close_detached, expect_reply};
+use crate::shell::{ShellReader, ShellWriter, expect_reply};
 
 /// The `ExtendedData` type code of stderr (RFC 4254 section 5.2).
 const STDERR: u32 = 1;
@@ -43,7 +44,8 @@ pub enum ExecEnd {
     Exit(u32),
     /// Killed by this signal (its name without `SIG`, as the server sent it).
     Signal(String),
-    /// The time limit ran out; the channel was closed.
+    /// The time limit ran out before any exit status arrived; the channel was closed after a
+    /// best-effort KILL, but the process **may still be running** on the server.
     TimedOut,
     /// The channel closed without a status: the connection was lost, or the server closed it.
     Lost,
@@ -87,101 +89,150 @@ fn signal_name(sig: &Sig) -> String {
     }
 }
 
-/// Reads the channel until it closes, or until `deadline` (then the end is `TimedOut`).
-/// Nothing but the capped streams is kept, so the memory held is at most `2 * stream_bytes`
-/// however much the command prints.
+/// Ready messages looked at after the deadline, without waiting, before the end is decided.
+const DRAIN_AT_DEADLINE: usize = 64;
+
+/// What has been read so far.
+struct Collector {
+    out: ExecOutput,
+    status: Option<ExecEnd>,
+    stream_bytes: usize,
+}
+
+impl Collector {
+    fn new(stream_bytes: usize) -> Self {
+        Self {
+            out: ExecOutput {
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+                end: ExecEnd::Lost,
+            },
+            status: None,
+            stream_bytes,
+        }
+    }
+
+    /// Takes one message; true when the channel is over (`Close`, or the reader is gone).
+    fn feed(&mut self, msg: Option<ChannelMsg>) -> bool {
+        match msg {
+            Some(ChannelMsg::Data { data }) => {
+                self.out.stdout_truncated |= keep(&mut self.out.stdout, &data, self.stream_bytes);
+            }
+            Some(ChannelMsg::ExtendedData { data, ext }) if ext == STDERR => {
+                self.out.stderr_truncated |= keep(&mut self.out.stderr, &data, self.stream_bytes);
+            }
+            Some(ChannelMsg::ExitStatus { exit_status }) => {
+                self.status.get_or_insert(ExecEnd::Exit(exit_status));
+            }
+            Some(ChannelMsg::ExitSignal {
+                signal_name: sig, ..
+            }) => {
+                self.status
+                    .get_or_insert(ExecEnd::Signal(signal_name(&sig)));
+            }
+            Some(ChannelMsg::Close) | None => {
+                self.out.end = self.status.take().unwrap_or(ExecEnd::Lost);
+                return true;
+            }
+            Some(_) => {}
+        }
+        false
+    }
+
+    /// The deadline was reached: what is already buffered still counts, so a status that
+    /// was queued is not lost to the race. A command whose status was seen ended (a
+    /// background child may hold the pipes); one without a status timed out.
+    async fn at_deadline(mut self, reader: &mut dyn ShellReader) -> ExecOutput {
+        for _ in 0..DRAIN_AT_DEADLINE {
+            match reader.wait().now_or_never() {
+                Some(msg) => {
+                    if self.feed(msg) {
+                        return self.out;
+                    }
+                }
+                None => break,
+            }
+        }
+        self.out.end = self.status.take().unwrap_or(ExecEnd::TimedOut);
+        self.out
+    }
+}
+
+/// Reads the channel until it closes, or until `deadline`. Nothing but the capped streams
+/// is kept, so the memory held is at most `2 * stream_bytes` however much the command prints.
 async fn collect_until(
     reader: &mut dyn ShellReader,
     stream_bytes: usize,
     deadline: Option<Instant>,
 ) -> ExecOutput {
-    let mut out = ExecOutput {
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        stdout_truncated: false,
-        stderr_truncated: false,
-        end: ExecEnd::Lost,
-    };
-    let mut status: Option<ExecEnd> = None;
+    let mut c = Collector::new(stream_bytes);
     loop {
         let msg = match deadline {
             // A reader that is always ready never lets the timer fire: check the clock too.
-            Some(at) if Instant::now() >= at => {
-                out.end = ExecEnd::TimedOut;
-                return out;
-            }
+            Some(at) if Instant::now() >= at => return c.at_deadline(reader).await,
             Some(at) => match tokio::time::timeout_at(at, reader.wait()).await {
                 Ok(msg) => msg,
-                Err(_) => {
-                    out.end = ExecEnd::TimedOut;
-                    return out;
-                }
+                Err(_) => return c.at_deadline(reader).await,
             },
             None => reader.wait().await,
         };
-        match msg {
-            Some(ChannelMsg::Data { data }) => {
-                out.stdout_truncated |= keep(&mut out.stdout, &data, stream_bytes);
-            }
-            Some(ChannelMsg::ExtendedData { data, ext }) if ext == STDERR => {
-                out.stderr_truncated |= keep(&mut out.stderr, &data, stream_bytes);
-            }
-            Some(ChannelMsg::ExitStatus { exit_status }) => {
-                status.get_or_insert(ExecEnd::Exit(exit_status));
-            }
-            Some(ChannelMsg::ExitSignal {
-                signal_name: sig, ..
-            }) => {
-                status.get_or_insert(ExecEnd::Signal(signal_name(&sig)));
-            }
-            Some(ChannelMsg::Close) | None => {
-                out.end = status.unwrap_or(ExecEnd::Lost);
-                return out;
-            }
-            Some(_) => {}
+        if c.feed(msg) {
+            return c.out;
         }
     }
 }
 
-/// [`collect_until`] without a time limit.
-#[cfg_attr(not(test), allow(dead_code))] // exec uses collect_until; this is the unbounded form
-pub(crate) async fn collect(reader: &mut dyn ShellReader, stream_bytes: usize) -> ExecOutput {
-    collect_until(reader, stream_bytes, None).await
-}
-
 /// Closes the channel and gives the budget slot back when dropped: when the call ends, and
-/// when its future is dropped half way. The close is sent in the background.
+/// when its future is dropped half way. Unless the command was seen to end, a `signal KILL`
+/// goes first (best effort, no reply wanted), so a timed-out or cancelled command does not
+/// keep running on the server. Both are sent from one background task, in that order, and
+/// neither is waited for.
 struct CloseOnDrop {
     writer: Arc<dyn ShellWriter>,
     _slot: ChannelSlot,
+    kill: bool,
 }
 
 impl Drop for CloseOnDrop {
     fn drop(&mut self) {
-        close_detached(&self.writer);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let writer = self.writer.clone();
+            let kill = self.kill;
+            runtime.spawn(async move {
+                if kill {
+                    let _ = writer.kill().await;
+                }
+                let _ = writer.close().await;
+            });
+        }
     }
 }
 
-fn timed_out() -> ExecOutput {
-    ExecOutput {
-        stdout: Vec::new(),
-        stderr: Vec::new(),
-        stdout_truncated: false,
-        stderr_truncated: false,
-        end: ExecEnd::TimedOut,
-    }
+fn empty(end: ExecEnd) -> ExecOutput {
+    let mut c = Collector::new(0);
+    c.out.end = end;
+    c.out
 }
 
 impl SshSession {
     /// Runs `command` on a new exec channel of this connection and returns what it printed
     /// and how it ended; see the module docs for the limits. There is no stdin (the channel
-    /// is half-closed at once) and no PTY.
+    /// is half-closed at once) and no PTY. The channel takes a slot of the channel budget
+    /// like a PTY; other users of the connection are not affected.
     ///
-    /// The channel takes a slot of the channel budget like a PTY. While the session is not
-    /// connected this fails at once with `Network`, "Not connected"; past the budget, or
-    /// when the server refuses the channel, with `Protocol`, "Too many channels on this
-    /// connection (limit N)"; when the server refuses the command, with `Protocol`,
-    /// "Server refused the command". Other users of the connection are not affected.
+    /// At the time limit the result is [`ExecEnd::TimedOut`] with what was read, unless an
+    /// exit status had already arrived. A command that did not end, or whose call is
+    /// dropped, gets a best-effort `KILL` signal and a channel close; the process **may
+    /// still be running** on the server (OpenSSH signals only the session's direct child).
+    ///
+    /// A connection lost before the command ended is `Ok` with [`ExecEnd::Lost`]. Errors:
+    /// `Network`, "Not connected" (at once, while the session is not connected);
+    /// `Protocol`, "Too many channels on this connection (limit N)" (past the budget, or
+    /// the server refused the channel); `Network`, "Timed out opening a channel for the
+    /// command" (the open outlasted the limit); `Protocol`, "Server refused the command";
+    /// other `Network` errors from the transport.
     pub async fn exec(&self, command: &str, limits: ExecLimits) -> Result<ExecOutput> {
         let deadline = Instant::now() + limits.timeout;
         let opened = tokio::time::timeout_at(deadline, self.open_pty_channel())
@@ -195,19 +246,46 @@ impl SshSession {
         let (channel, slot) = opened.into_parts();
         let (mut reader, writer) = channel.split();
         let writer = Arc::new(writer);
-        let _guard = CloseOnDrop {
+        let mut guard = CloseOnDrop {
             writer: writer.clone(),
             _slot: slot,
+            kill: true,
         };
-        writer.exec(true, command).await.map_err(map_russh_error)?;
-        let refused = Error::new(ErrorKind::Protocol, "Server refused the command");
-        match tokio::time::timeout_at(deadline, expect_reply(&mut reader, "exec", refused)).await {
-            Ok(reply) => reply?,
-            Err(_) => return Ok(timed_out()),
+        // Every await up to the first read is under the deadline: the queue to the session
+        // task is bounded and may be full while the session task delivers data.
+        let setup = tokio::time::timeout_at(deadline, async {
+            match writer.exec(true, command).await {
+                Ok(()) => {}
+                Err(russh::Error::SendError) => return Ok(false),
+                Err(e) => return Err(map_russh_error(e)),
+            }
+            let refused = Error::new(ErrorKind::Protocol, "Server refused the command");
+            match expect_reply(&mut reader, "exec", refused).await {
+                Ok(()) => {}
+                Err(e) if e.code == Some("ssh-closed-during-request") => return Ok(false),
+                Err(e) => return Err(e),
+            }
+            // No stdin: the command sees end of input at once.
+            match writer.eof().await {
+                Ok(()) => Ok(true),
+                Err(russh::Error::SendError) => Ok(false),
+                Err(e) => Err(map_russh_error(e)),
+            }
+        })
+        .await;
+        match setup {
+            Err(_) => Ok(empty(ExecEnd::TimedOut)),
+            Ok(Err(e)) => Err(e),
+            Ok(Ok(false)) => {
+                guard.kill = false;
+                Ok(empty(ExecEnd::Lost))
+            }
+            Ok(Ok(true)) => {
+                let out = collect_until(&mut reader, limits.stream_bytes, Some(deadline)).await;
+                guard.kill = out.end == ExecEnd::TimedOut;
+                Ok(out)
+            }
         }
-        // No stdin: the command sees end of input at once.
-        writer.eof().await.map_err(map_russh_error)?;
-        Ok(collect_until(&mut reader, limits.stream_bytes, Some(deadline)).await)
     }
 }
 
@@ -255,7 +333,7 @@ mod tests {
             ChannelMsg::Eof,
             ChannelMsg::Close,
         ]);
-        let out = collect(&mut r, 1024).await;
+        let out = collect_until(&mut r, 1024, None).await;
         assert_eq!(out.stdout, b"out");
         assert_eq!(out.stderr, b"err");
         assert_eq!(out.end, ExecEnd::Exit(3));
@@ -270,7 +348,7 @@ mod tests {
         msgs.push(data(&[b'x'; 12 * 1024]));
         msgs.push(ChannelMsg::ExitStatus { exit_status: 0 });
         let mut r = script(msgs);
-        let out = collect(&mut r, cap).await;
+        let out = collect_until(&mut r, cap, None).await;
         assert_eq!(out.stdout.len(), 262_144);
         assert!(out.stdout_truncated);
         assert_eq!(out.end, ExecEnd::Exit(0));
@@ -289,16 +367,16 @@ mod tests {
             ChannelMsg::Close,
         ]);
         assert_eq!(
-            collect(&mut r, 8).await.end,
+            collect_until(&mut r, 8, None).await.end,
             ExecEnd::Signal("KILL".to_owned())
         );
         let mut r = script(vec![data(b"partial"), ChannelMsg::Close]);
-        let out = collect(&mut r, 8).await;
+        let out = collect_until(&mut r, 8, None).await;
         assert_eq!(out.end, ExecEnd::Lost);
         assert_eq!(out.stdout, b"partial");
         // The reader vanishing (connection gone) is the same.
         let mut r = script(vec![]);
-        assert_eq!(collect(&mut r, 8).await.end, ExecEnd::Lost);
+        assert_eq!(collect_until(&mut r, 8, None).await.end, ExecEnd::Lost);
     }
 
     #[tokio::test]
@@ -309,7 +387,7 @@ mod tests {
             ChannelMsg::ExitStatus { exit_status: 0 },
             ChannelMsg::Close,
         ]);
-        let out = collect(&mut r, 1024).await;
+        let out = collect_until(&mut r, 1024, None).await;
         assert_eq!(out.stderr, b"err");
         assert!(out.stdout.is_empty());
     }
@@ -363,5 +441,47 @@ mod tests {
         let out = collect_until(&mut Silent, 1000, Some(at)).await;
         assert_eq!(out.end, ExecEnd::TimedOut);
         assert!(out.stdout.is_empty());
+    }
+
+    /// Yields the scripted messages, then nothing for ever (a command whose pipes stay open).
+    struct ThenSilence(VecDeque<ChannelMsg>);
+
+    #[async_trait]
+    impl ShellReader for ThenSilence {
+        async fn wait(&mut self) -> Option<ChannelMsg> {
+            match self.0.pop_front() {
+                Some(msg) => Some(msg),
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_status_seen_before_the_deadline_wins_over_the_time_out() {
+        let mut r =
+            ThenSilence(vec![data(b"hi"), ChannelMsg::ExitStatus { exit_status: 4 }].into());
+        let at = Instant::now() + Duration::from_millis(100);
+        let out = collect_until(&mut r, 8, Some(at)).await;
+        assert_eq!(out.end, ExecEnd::Exit(4));
+        assert_eq!(out.stdout, b"hi");
+    }
+
+    #[tokio::test]
+    async fn a_status_queued_at_the_deadline_is_not_lost() {
+        // The deadline has passed before the first read, and the status is already buffered.
+        let mut r = ThenSilence(vec![data(b"a"), ChannelMsg::ExitStatus { exit_status: 0 }].into());
+        let at = Instant::now();
+        let out = collect_until(&mut r, 8, Some(at)).await;
+        assert_eq!(out.end, ExecEnd::Exit(0));
+        assert_eq!(out.stdout, b"a");
+    }
+
+    #[tokio::test]
+    async fn no_status_at_the_deadline_is_a_time_out() {
+        let mut r = ThenSilence(vec![data(b"partial")].into());
+        let at = Instant::now() + Duration::from_millis(50);
+        let out = collect_until(&mut r, 8, Some(at)).await;
+        assert_eq!(out.end, ExecEnd::TimedOut);
+        assert_eq!(out.stdout, b"partial");
     }
 }

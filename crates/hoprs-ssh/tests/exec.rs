@@ -174,3 +174,82 @@ async fn dropping_exec_frees_the_channel() {
     let out = session.exec("echo ok", LIMITS).await.unwrap();
     assert_eq!(out.stdout, b"ok\n");
 }
+
+/// How many processes of this user have `marker` in their command line. The pattern's first
+/// letter is bracketed so the checking shell's own command line never matches.
+async fn process_count(session: &SshSession, marker: &str) -> usize {
+    let pattern = format!("[{}]{}", &marker[..1], &marker[1..]);
+    let out = session
+        .exec(&format!("pgrep -fc '{pattern}'; true"), LIMITS)
+        .await
+        .unwrap();
+    String::from_utf8_lossy(&out.stdout).trim().parse().unwrap()
+}
+
+/// A compound command, so the shell stays the session's direct child (the one OpenSSH
+/// signals) and carries `marker` in its command line.
+fn silent_command(marker: &str) -> String {
+    format!("sleep 300; true # {marker}")
+}
+
+async fn wait_gone(session: &SshSession, marker: &str) {
+    for _ in 0..25 {
+        if process_count(session, marker).await == 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    panic!("the remote process is still running");
+}
+
+fn marker(name: &str) -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("hoprs{name}{nanos}")
+}
+
+#[tokio::test]
+#[ignore = "needs docker: docker compose -f docker/compose.yml up -d"]
+async fn exec_time_limit_kills_the_remote_process() {
+    let dir = TempDir::new().unwrap();
+    let session = connect(alice(&dir)).await;
+    let marker = marker("timeout");
+    let limits = ExecLimits {
+        timeout: Duration::from_secs(1),
+        ..LIMITS
+    };
+    let out = session
+        .exec(&silent_command(&marker), limits)
+        .await
+        .unwrap();
+    assert_eq!(out.end, ExecEnd::TimedOut);
+    wait_gone(&session, &marker).await;
+}
+
+#[tokio::test]
+#[ignore = "needs docker: docker compose -f docker/compose.yml up -d"]
+async fn dropping_exec_kills_the_remote_process() {
+    let dir = TempDir::new().unwrap();
+    let session = connect(alice(&dir)).await;
+    let marker = marker("drop");
+    let call = tokio::spawn({
+        let session = session.clone();
+        let command = silent_command(&marker);
+        async move { session.exec(&command, LIMITS).await }
+    });
+    // The control: the command is running (this also proves the pgrep check works).
+    let mut seen = 0;
+    for _ in 0..25 {
+        seen = process_count(&session, &marker).await;
+        if seen > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(seen > 0, "the command never showed up");
+    call.abort();
+    let _ = call.await;
+    wait_gone(&session, &marker).await;
+}
