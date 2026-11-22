@@ -114,6 +114,30 @@ pub fn drive_outcome(app: &App) -> DriveOutcome {
     }
 }
 
+/// The export succeeded (to the file, or to or from Google Drive): the primary button is
+/// Done.
+pub fn export_finished(app: &App) -> bool {
+    let Some(flow) = app.export.as_ref() else {
+        return false;
+    };
+    match flow.destination {
+        Destination::File => matches!(flow.state, BackupState::Done(_)),
+        Destination::Drive => matches!(
+            drive_outcome(app),
+            DriveOutcome::Uploaded { .. } | DriveOutcome::Saved(_)
+        ),
+    }
+}
+
+/// Whether Export can be pressed: the model's rule and, for Google Drive, a connection.
+pub fn export_enabled(app: &App) -> bool {
+    let drive = app
+        .export
+        .as_ref()
+        .is_some_and(|flow| flow.destination == Destination::Drive);
+    app.export_ready() && (!drive || matches!(app.drive_link, DriveLink::Connected(_)))
+}
+
 fn muted(label: &str) -> Element<'_, Message> {
     text(label)
         .size(theme::TEXT_SM)
@@ -248,31 +272,25 @@ pub fn view(app: &App) -> Element<'_, Message> {
     {
         content = content.push(failure(Some(error)));
     }
-    if !matches!(
-        drive_row,
-        Some(DriveRow::Reading | DriveRow::Connect | DriveRow::Waiting { .. })
-    ) {
-        content = content
-            .push(
-                row![
-                    field(
-                        strings::backup_password(),
-                        password(&flow.password.0, |v| msg(ExportMsg::Password(Password(v))))
-                            .into(),
-                        None,
-                    ),
-                    field(
-                        strings::backup_password_confirm(),
-                        password(&flow.confirm.0, |v| msg(ExportMsg::Confirm(Password(v))))
-                            .on_submit(msg(ExportMsg::Submit))
-                            .into(),
-                        None,
-                    ),
-                ]
-                .spacing(theme::SPACE_SM),
-            )
-            .push(muted(strings::export_password_hint()));
-    }
+    content = content
+        .push(
+            row![
+                field(
+                    strings::backup_password(),
+                    password(&flow.password.0, |v| msg(ExportMsg::Password(Password(v)))).into(),
+                    None,
+                ),
+                field(
+                    strings::backup_password_confirm(),
+                    password(&flow.confirm.0, |v| msg(ExportMsg::Confirm(Password(v))))
+                        .on_submit(msg(ExportMsg::Submit))
+                        .into(),
+                    None,
+                ),
+            ]
+            .spacing(theme::SPACE_SM),
+        )
+        .push(muted(strings::export_password_hint()));
     if let Some(error) = flow.field_error {
         content = content.push(text(error).size(theme::TEXT_XS).color(palette().error));
     }
@@ -312,23 +330,14 @@ fn actions<'a>(app: &App, flow: &ExportFlow) -> Element<'a, Message> {
             msg(ExportMsg::CancelOverwrite),
         );
     }
-    let drive = flow.destination == Destination::Drive;
-    let finished = if drive {
-        matches!(
-            drive_outcome(app),
-            DriveOutcome::Uploaded { .. } | DriveOutcome::Saved(_)
-        )
-    } else {
-        matches!(flow.state, BackupState::Done(_))
-    };
-    if finished {
+    if export_finished(app) {
         return primary(strings::done(), Some(msg(ExportMsg::Close)));
     }
-    // Google Drive needs a connection (and the form it comes with).
-    let ready =
-        app.export_ready() && (!drive || matches!(drive_row(app), Some(DriveRow::Account { .. })));
     row![
-        primary(strings::export(), ready.then(|| msg(ExportMsg::Submit))),
+        primary(
+            strings::export(),
+            export_enabled(app).then(|| msg(ExportMsg::Submit))
+        ),
         plain(strings::cancel(), msg(ExportMsg::Close)),
     ]
     .spacing(theme::SPACE_XS)
@@ -705,5 +714,47 @@ mod tests {
         assert_eq!(drive_outcome(&app), DriveOutcome::None);
         app.export.as_mut().unwrap().destination = Destination::Drive;
         assert!(matches!(drive_outcome(&app), DriveOutcome::Failed { .. }));
+    }
+
+    #[test]
+    fn export_enabled_follows_the_destination_and_the_link() {
+        let links = [
+            (DriveLink::Unknown, false),
+            (DriveLink::Reading, false),
+            (DriveLink::Disconnected, false),
+            (DriveLink::Waiting { url: None }, false),
+            (connected(), true),
+        ];
+        for (link, on_drive) in links {
+            let file = app_on(Destination::File, link.clone());
+            assert!(export_enabled(&file), "file {link:?}");
+            let drive = app_on(Destination::Drive, link.clone());
+            assert_eq!(export_enabled(&drive), on_drive, "drive {link:?}");
+        }
+        let mut busy = drive_app(connected(), DriveExport::Uploading, true);
+        assert!(!export_enabled(&busy));
+        busy.export.as_mut().unwrap().drive = DriveExport::Idle;
+        assert!(export_enabled(&busy));
+        assert!(!export_enabled(&App::new()));
+    }
+
+    #[test]
+    fn export_finished_per_destination() {
+        let uploaded = DriveExport::Uploaded {
+            report: report(),
+            file: DriveFile {
+                name: "a.hoprs".into(),
+                link: None,
+            },
+        };
+        let mut app = drive_app(connected(), uploaded, false);
+        assert!(export_finished(&app));
+        app.export.as_mut().unwrap().destination = Destination::File;
+        assert!(!export_finished(&app));
+        app.export.as_mut().unwrap().state = BackupState::Done(report());
+        assert!(export_finished(&app));
+        let failed = drive_app(connected(), DriveExport::Failed(error()), true);
+        assert!(!export_finished(&failed));
+        assert!(!export_finished(&App::new()));
     }
 }

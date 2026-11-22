@@ -571,6 +571,12 @@ pub fn drive_line(app: &App) -> Option<&'static str> {
     (app.drive_available && app.settings.google_drive).then(strings::drive_settings_line)
 }
 
+/// The last Google Drive failure, in a build that offers Google Drive: shown whether or
+/// not the marker is still there (a failed Disconnect clears it).
+pub fn drive_error(app: &App) -> Option<&hoprs_core::Error> {
+    app.drive_available.then_some(app.drive_error.as_ref())?
+}
+
 fn backup_view(app: &App) -> Element<'_, Message> {
     let backup = &app.backup;
     // One at a time: an export and a restore both lock the vault.
@@ -599,9 +605,9 @@ fn backup_view(app: &App) -> Element<'_, Message> {
             .spacing(theme::SPACE_XS)
             .align_y(Alignment::Center),
         );
-        if let Some(error) = &app.drive_error {
-            col = col.push(failure(Some(error)));
-        }
+    }
+    if let Some(error) = drive_error(app) {
+        col = col.push(failure(Some(error)));
     }
 
     // The running restore and its outcome, above the panel (in view without scrolling).
@@ -884,5 +890,23 @@ mod tests {
             app.settings.google_drive = marker;
             assert_eq!(drive_line(&app), line, "{available} {marker}");
         }
+    }
+
+    #[test]
+    fn drive_error_shows_without_the_marker_but_only_in_a_drive_build() {
+        let mut app = App::new();
+        app.drive_error = Some(hoprs_core::Error::new(
+            hoprs_core::ErrorKind::Network,
+            "keyring",
+        ));
+        app.settings.google_drive = false;
+        app.drive_available = true;
+        assert_eq!(drive_line(&app), None);
+        assert!(drive_error(&app).is_some());
+        app.drive_available = false;
+        assert!(drive_error(&app).is_none());
+        app.drive_available = true;
+        app.drive_error = None;
+        assert!(drive_error(&app).is_none());
     }
 }
