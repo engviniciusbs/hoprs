@@ -100,7 +100,7 @@ impl Service {
             EntryKind::Symlink => {
                 return Err(Failure::new(
                     format!(
-                        "{path} is a symbolic link, and read_file does not follow a link at the end of a path. Read the file it points to by that file's own path (on an SSH site that allows everything, run_command with readlink -f {path} shows it). A link in the middle of a path is followed."
+                        "{path} is a symbolic link, and read_file does not follow a link at the end of a path: stat on it, or listing its folder, shows that it is a link. Read the file it points to by that file's own path. A link in the middle of a path is followed."
                     ),
                     "a symbolic link",
                 ));
@@ -159,7 +159,9 @@ impl Service {
         })?;
         let start = offset.saturating_add(skipped as u64);
         let returned = text.len() as u64;
-        let size = known.or(eof.then_some(end));
+        // Without a size from `stat`, the end is known only where bytes stopped: past
+        // it (an offset and nothing read) the size is not known.
+        let size = known.or((eof && (got > 0 || offset == 0)).then_some(end));
         let header = json!({
             "path": path.as_str(),
             "size": size,

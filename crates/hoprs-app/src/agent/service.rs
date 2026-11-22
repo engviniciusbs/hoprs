@@ -34,6 +34,7 @@
 mod files;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
@@ -68,13 +69,77 @@ pub struct Service {
     /// The calls running on each site and when the last one ended (for the reaper).
     activity: Mutex<Activity>,
     /// The connection attempts under way, shared by the calls that wait on them.
-    connecting: Mutex<HashMap<SiteId, Attempt>>,
+    connecting: Mutex<HashMap<SiteId, Pending>>,
+    /// Numbers the attempts, so a waiter knows its own.
+    next_attempt: AtomicU64,
     /// The last [`AgentEvent::Sites`] sent.
     sites_sent: Mutex<Option<Vec<SiteId>>>,
 }
 
 /// One connection attempt, awaited by every call that needs its site meanwhile.
-type Attempt = Shared<BoxFuture<'static, Result<SessionId, Error>>>;
+type Attempt = Shared<BoxFuture<'static, AttemptEnd>>;
+
+/// How an attempt ended, the same for all its waiters.
+#[derive(Clone)]
+enum AttemptEnd {
+    Up(SessionId),
+    Failed(Error),
+    /// Its time ran out; `asked` if a dialog was open then.
+    TimedOut {
+        asked: bool,
+    },
+}
+
+/// An attempt and the calls waiting on it.
+struct Pending {
+    id: u64,
+    attempt: Attempt,
+    waiters: usize,
+}
+
+/// One call waiting on an attempt. When the last waiter goes away before the attempt
+/// ended (its calls were cancelled), the attempt goes with it: the map's handle is
+/// dropped here and the waiter's own right after, so the connect future is dropped,
+/// which releases the host's connect lock and the site's secrets (nothing of it is in
+/// the user's way); and an agent-only session it left is closed, withdrawing its
+/// dialog: nobody asks any more.
+struct Waiter<'a> {
+    service: &'a Service,
+    site: SiteId,
+    id: u64,
+    attempt: Attempt,
+    ended: bool,
+}
+
+impl Drop for Waiter<'_> {
+    fn drop(&mut self) {
+        let abandoned = {
+            let mut connecting = self.service.connecting();
+            match connecting.get_mut(&self.site) {
+                Some(pending) if pending.id == self.id => {
+                    pending.waiters = pending.waiters.saturating_sub(1);
+                    if pending.waiters == 0 && !self.ended {
+                        connecting.remove(&self.site)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            }
+        };
+        if abandoned.is_none() {
+            return;
+        }
+        drop(abandoned);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let host = self.service.host.clone();
+            let site = self.site.clone();
+            runtime.spawn(async move {
+                host.close_agent_session(&site).await;
+            });
+        }
+    }
+}
 
 #[derive(Default)]
 struct Activity {
@@ -241,6 +306,7 @@ impl Service {
             events,
             activity: Mutex::default(),
             connecting: Mutex::default(),
+            next_attempt: AtomicU64::new(0),
             sites_sent: Mutex::default(),
         })
     }
@@ -293,6 +359,9 @@ impl Service {
         self.activity()
             .ended
             .retain(|_, at| now.duration_since(*at) < self.limits.idle_close);
+        // An attempt no call waits on is never kept (its waiters retire it; this is
+        // only a second guard).
+        self.connecting().retain(|_, pending| pending.waiters > 0);
         self.send_sites();
     }
 
@@ -477,77 +546,88 @@ impl Service {
         })
     }
 
-    /// The site's session: the one that is up, or a new attempt that may wait up to
-    /// `limits.prompt_wait` for the user to answer a dialog.
+    /// The site's session: the one that is up, or the end of the site's connection
+    /// attempt (joined if one is under way), which lasts at most `limits.prompt_wait`
+    /// from its start, the time the user may take to answer a dialog.
     async fn session(&self, site: &Site) -> Result<SessionId, Failure> {
         if let Some(session) = self.host.connected(&site.id) {
             return Ok(session);
         }
-        let attempt = self.attempt(&site.id);
-        let outcome = tokio::time::timeout(self.limits.prompt_wait, attempt.clone()).await;
-        // The first waiter to come back retires the attempt: a later call starts anew.
+        let mut waiter = self.join_attempt(&site.id);
+        let end = waiter.attempt.clone().await;
+        waiter.ended = true;
+        // The first waiter back retires the attempt: a later call starts anew.
         let first = {
             let mut connecting = self.connecting();
             let ours = connecting
                 .get(&site.id)
-                .is_some_and(|current| current.ptr_eq(&attempt));
+                .is_some_and(|pending| pending.id == waiter.id);
             if ours {
                 connecting.remove(&site.id);
             }
             ours
         };
-        match outcome {
-            Ok(Ok(session)) => {
-                if first {
-                    self.send(AgentEvent::Connected(session));
-                }
-                self.send_sites();
-                Ok(session)
+        drop(waiter);
+        if let (AttemptEnd::Up(session), true) = (&end, first) {
+            self.send(AgentEvent::Connected(*session));
+        }
+        self.send_sites();
+        match end {
+            AttemptEnd::Up(session) => Ok(session),
+            AttemptEnd::Failed(error) => Err(connect_failure(site, &error)),
+            AttemptEnd::TimedOut { asked: true } => {
+                Err(Failure::new(WAITING_FOR_USER, "waiting for the user"))
             }
-            Ok(Err(error)) => {
-                self.close_agent_session(&site.id).await;
-                Err(connect_failure(site, &error))
-            }
-            Err(_) => {
-                // Read before the close, which withdraws the dialog.
-                let asked = self.host.prompt_open(&site.id);
-                self.close_agent_session(&site.id).await;
-                if asked {
-                    Err(Failure::new(WAITING_FOR_USER, "waiting for the user"))
-                } else {
-                    Err(Failure::new(
-                        format!(
-                            "Connecting to \"{}\" ({}:{}) took more than {}. Call the tool again later; if it keeps happening, ask the user to check the site in hoprs.",
-                            site.name,
-                            site.host,
-                            site.port,
-                            span(self.limits.prompt_wait)
-                        ),
-                        "the connection timed out",
-                    ))
-                }
-            }
+            AttemptEnd::TimedOut { asked: false } => Err(Failure::new(
+                format!(
+                    "Connecting to \"{}\" ({}:{}) took more than {}. Call the tool again later; if it keeps happening, ask the user to check the site in hoprs.",
+                    site.name,
+                    site.host,
+                    site.port,
+                    span(self.limits.prompt_wait)
+                ),
+                "the connection timed out",
+            )),
         }
     }
 
-    /// The attempt under way for the site, or a new one (started when first awaited).
-    fn attempt(&self, site: &SiteId) -> Attempt {
-        self.connecting()
-            .entry(site.clone())
-            .or_insert_with(|| {
-                let host = self.host.clone();
-                let site = site.clone();
-                async move { host.connect(&site).await.map_err(|failure| failure.error) }
-                    .boxed()
-                    .shared()
-            })
-            .clone()
-    }
-
-    /// Closes the site's session if only an agent uses it (a tab's is left alone).
-    async fn close_agent_session(&self, site: &SiteId) {
-        if self.host.close_agent_session(site).await {
-            self.send_sites();
+    /// Joins the site's attempt under way, or starts one. The attempt holds the
+    /// connect, its time limit and, when it does not come up, the close of an
+    /// agent-only session (which withdraws its dialog): every waiter gets the same end.
+    fn join_attempt(&self, site: &SiteId) -> Waiter<'_> {
+        let mut connecting = self.connecting();
+        let pending = connecting.entry(site.clone()).or_insert_with(|| {
+            let host = self.host.clone();
+            let id = site.clone();
+            let wait = self.limits.prompt_wait;
+            let attempt = async move {
+                match tokio::time::timeout(wait, host.connect(&id)).await {
+                    Ok(Ok(session)) => AttemptEnd::Up(session),
+                    Ok(Err(failure)) => {
+                        host.close_agent_session(&id).await;
+                        AttemptEnd::Failed(failure.error)
+                    }
+                    Err(_) => {
+                        // Read before the close, which withdraws the dialog.
+                        let asked = host.prompt_open(&id);
+                        host.close_agent_session(&id).await;
+                        AttemptEnd::TimedOut { asked }
+                    }
+                }
+            };
+            Pending {
+                id: self.next_attempt.fetch_add(1, Ordering::Relaxed),
+                attempt: attempt.boxed().shared(),
+                waiters: 0,
+            }
+        });
+        pending.waiters += 1;
+        Waiter {
+            service: self,
+            site: site.clone(),
+            id: pending.id,
+            attempt: pending.attempt.clone(),
+            ended: false,
         }
     }
 
@@ -565,7 +645,7 @@ impl Service {
         lock(&self.activity)
     }
 
-    fn connecting(&self) -> MutexGuard<'_, HashMap<SiteId, Attempt>> {
+    fn connecting(&self) -> MutexGuard<'_, HashMap<SiteId, Pending>> {
         lock(&self.connecting)
     }
 

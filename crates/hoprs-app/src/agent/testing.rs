@@ -4,7 +4,9 @@
 //! Sessions: [`connect`](AgentHost::connect) gives a site a connected session that only an
 //! agent uses (as the real host does for a new session) and reuses one the site already
 //! has; [`connect_user`](FakeHost::connect_user) stands for a tab's session, which
-//! [`close_agent_session`](AgentHost::close_agent_session) leaves alone. A connect can be
+//! [`close_agent_session`](AgentHost::close_agent_session) leaves alone. Like the real
+//! host, a connect holds its site's connect lock until it ends or is dropped (holds and
+//! hangs included), and `connect_user` takes the same lock. A connect can be
 //! made to fail ([`fail_connect`](FakeHost::fail_connect)) or never end
 //! ([`hang_connect`](FakeHost::hang_connect)); both leave an agent-only session that is
 //! not connected, like a real attempt that failed or waits on a dialog.
@@ -159,6 +161,8 @@ struct State {
     exec_hold: Option<Weak<HoldState>>,
     holds: HashMap<(SiteId, FsOp), Weak<HoldState>>,
     connect_holds: HashMap<SiteId, Weak<HoldState>>,
+    /// Each site's connect lock (the real host's per-site turn).
+    turns: HashMap<SiteId, Arc<tokio::sync::Mutex<()>>>,
     /// Files whose `stat` says size 0 whatever they hold (see [`FakeHost::stat_zero_size`]).
     zero_size: HashSet<(SiteId, RemotePath)>,
     /// Why a tab's session that is not connected failed (see
@@ -241,6 +245,7 @@ impl FakeHost {
                     exec_hold: None,
                     holds: HashMap::new(),
                     connect_holds: HashMap::new(),
+                    turns: HashMap::new(),
                     zero_size: HashSet::new(),
                     tab_errors: HashMap::new(),
                     calls: HashMap::new(),
@@ -327,8 +332,15 @@ impl FakeHost {
         }
     }
 
-    /// Gives the site a connected session a tab uses (the user's); returns it.
-    pub fn connect_user(&self, site: &SiteId) -> SessionId {
+    /// The site's connect lock.
+    fn turn(&self, site: &SiteId) -> Arc<tokio::sync::Mutex<()>> {
+        self.state().turns.entry(site.clone()).or_default().clone()
+    }
+
+    /// Gives the site a connected session a tab uses (the user's), after taking the
+    /// site's connect lock as the real host does; returns it.
+    pub async fn connect_user(&self, site: &SiteId) -> SessionId {
+        let _turn = self.turn(site).lock_owned().await;
         let mut state = self.state();
         let id = SessionId(state.next_session);
         let session = state.sessions.entry(site.clone()).or_insert(FakeSession {
@@ -349,8 +361,8 @@ impl FakeHost {
     /// Gives the site a session a tab uses that is not connected (its connection ended
     /// with `error`); returns it. An agent's `connect` answers `error` and leaves it
     /// as it is, like the real host (the user retries a tab's session, not the agent).
-    pub fn disconnect_user(&self, site: &SiteId, error: Error) -> SessionId {
-        let id = self.connect_user(site);
+    pub async fn disconnect_user(&self, site: &SiteId, error: Error) -> SessionId {
+        let id = self.connect_user(site).await;
         let mut state = self.state();
         if let Some(session) = state.sessions.get_mut(site) {
             session.connected = false;
@@ -474,6 +486,8 @@ impl AgentHost for FakeHost {
             *state.connects.entry(site.clone()).or_default() += 1;
             state.connect_holds.get(site).cloned()
         };
+        // Held until this connect ends or is dropped.
+        let _turn = self.turn(site).lock_owned().await;
         if let Some(hold) = hold {
             pass(&hold).await;
         }
@@ -744,7 +758,7 @@ mod tests {
         assert_eq!(host.closed(), std::slice::from_ref(&ssh.id));
         assert_eq!(host.connected(&ssh.id), None);
 
-        let tab = host.connect_user(&ssh.id);
+        let tab = host.connect_user(&ssh.id).await;
         assert_eq!(host.connect(&ssh.id).await.unwrap(), tab);
         assert!(host.agent_sites().is_empty());
         assert!(!host.close_agent_session(&ssh.id).await);
@@ -834,7 +848,9 @@ mod tests {
         let host = FakeHost::new();
         let ftp = site("ftp", Protocol::Ftp);
         host.add_site(ftp.clone());
-        let tab = host.disconnect_user(&ftp.id, Error::new(ErrorKind::Network, "gone"));
+        let tab = host
+            .disconnect_user(&ftp.id, Error::new(ErrorKind::Network, "gone"))
+            .await;
         for _ in 0..2 {
             let failure = host.connect(&ftp.id).await.unwrap_err();
             assert_eq!(failure.error.kind, ErrorKind::Network);
@@ -844,7 +860,7 @@ mod tests {
         assert!(host.agent_sites().is_empty());
         assert!(!host.close_agent_session(&ftp.id).await);
         // The user reconnects it: the agent reuses it.
-        assert_eq!(host.connect_user(&ftp.id), tab);
+        assert_eq!(host.connect_user(&ftp.id).await, tab);
         assert_eq!(host.connect(&ftp.id).await.unwrap(), tab);
     }
 

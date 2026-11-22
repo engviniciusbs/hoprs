@@ -532,7 +532,8 @@ async fn failed_agent_connect_closes_its_session() {
 
     // A tab's session that is down is the user's: answered, never closed.
     fx.host
-        .disconnect_user(&fx.ftp.id, Error::new(ErrorKind::Network, "gone"));
+        .disconnect_user(&fx.ftp.id, Error::new(ErrorKind::Network, "gone"))
+        .await;
     err(fx
         .call("list_directory", json!({"site": fx.ftp.id.0, "path": "/"}))
         .await);
@@ -864,7 +865,7 @@ async fn idle_sessions_close_after_ten_minutes() {
     let mut sites = vec![fx.ssh.clone(), fx.ftp.clone(), fx.ro.clone(), tab.clone()];
     sites.push(fx.closed.clone());
     fx.host.set_sites(sites);
-    fx.host.connect_user(&tab.id);
+    fx.host.connect_user(&tab.id).await;
     fx.events();
 
     tokio::time::advance(9 * minute).await;
@@ -1205,6 +1206,20 @@ async fn zero_size_files_are_read_by_content() {
     assert_eq!(text, "");
     assert_eq!(h["size"], 0);
     assert_eq!(h["eof"], true);
+
+    // More than the cap behind a size of 0: the too-long answer, after at most one
+    // byte past the cap was read.
+    fx.ssh_fs
+        .add_file("/proc/big", &vec![b'a'; 1_048_576 + 10], EPOCH);
+    fx.host.stat_zero_size(&fx.ssh.id, "/proc/big");
+    let before = fx.host.streamed(&fx.ssh.id);
+    let text = err(fx
+        .call("read_file", json!({"site": site, "path": "/proc/big"}))
+        .await);
+    for word in ["more than 1048576 bytes", "offset", "length", "download"] {
+        assert!(text.contains(word), "{word} in {text}");
+    }
+    assert_eq!(fx.host.streamed(&fx.ssh.id) - before, 1_048_577);
 }
 
 /// A link at the end of the path is refused before anything is opened: `RemoteFs`
@@ -1223,7 +1238,12 @@ async fn links_are_refused_up_front() {
         )
         .await);
     assert!(text.contains("symbolic link"), "{text}");
-    assert!(text.contains("readlink"), "{text}");
+    assert!(text.contains("stat"), "{text}");
+    // Nothing the agent could paste into run_command.
+    assert!(
+        !text.contains("readlink") && !text.contains("run_command"),
+        "{text}"
+    );
     assert!(text.contains("/etc/nginx/sites-enabled/app"), "{text}");
     assert_eq!(fx.host.calls(&fx.ssh.id, FsOp::Read), 0, "never opened");
 }
@@ -1247,6 +1267,31 @@ async fn numbers_at_u64_max_do_not_panic() {
         assert_eq!(h["offset"], max, "{path}");
         assert_eq!(h["next_offset"], max, "{path}");
     }
+    // The size from `stat`; none for a size-0 file read past its end.
+    let (h, _) = read(
+        &fx,
+        json!({"site": site, "path": "/var/www/a.txt", "offset": max}),
+    )
+    .await;
+    assert_eq!(h["size"], 5);
+    let (h, _) = read(
+        &fx,
+        json!({"site": site, "path": "/proc/stat", "offset": max}),
+    )
+    .await;
+    assert_eq!(h["size"], Value::Null);
+    let (h, _) = read(
+        &fx,
+        json!({"site": site, "path": "/proc/stat", "offset": 3}),
+    )
+    .await;
+    assert_eq!(h["size"], 10, "read to the end: known");
+    let (h, _) = read(
+        &fx,
+        json!({"site": site, "path": "/proc/stat", "offset": 50}),
+    )
+    .await;
+    assert_eq!(h["size"], Value::Null, "past the end: not known");
     let listing = list(
         &fx,
         json!({"site": site, "path": "/var/www", "offset": max, "limit": max}),
@@ -1308,4 +1353,93 @@ async fn sites_events_only_when_the_list_changes() {
     assert_eq!(events[1], AgentEvent::Sites(vec![fx.ssh.id.clone()]));
     fx.service.reap().await;
     assert!(fx.events().is_empty(), "nothing changed");
+}
+
+/// One agent call waits on a connect with a dialog open and is cancelled: the attempt
+/// goes at once (its connect dropped, the site's connect lock free), the agent-only
+/// session is closed, and the user's own connect proceeds.
+#[tokio::test(start_paused = true)]
+async fn an_abandoned_attempt_is_out_of_the_users_way() {
+    let fx = fixture();
+    fx.host.hang_connect(&fx.ssh.id);
+    fx.host.set_prompt_open(&fx.ssh.id, true);
+    let call = tokio::spawn({
+        let service = fx.service.clone();
+        let args = json!({"site": fx.ssh.id.0, "path": "/var/www"});
+        async move { service.call("list_directory", args).await }
+    });
+    tokio::time::sleep(Duration::from_secs(10)).await;
+    assert_eq!(fx.host.connects(&fx.ssh.id), 1);
+    assert!(fx.host.prompt_open(&fx.ssh.id), "a dialog waits");
+    call.abort();
+    let _ = call.await;
+    assert!(fx.service.connecting().is_empty(), "the attempt is gone");
+    assert!(fx.service.activity().running.is_empty());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        // Sleeps, not yields: paused time must move for the bound to fire.
+        while fx.host.closed().is_empty() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the agent-only session is closed");
+    assert_eq!(fx.host.closed(), std::slice::from_ref(&fx.ssh.id));
+    let tab = tokio::time::timeout(Duration::from_secs(5), fx.host.connect_user(&fx.ssh.id))
+        .await
+        .expect("the user's connect waits on nothing the agent left");
+    assert_eq!(fx.host.connected(&fx.ssh.id), Some(tab));
+}
+
+/// Two calls wait on one attempt; one is cancelled: the other still gets its answer.
+#[tokio::test]
+async fn a_cancelled_waiter_leaves_the_others_their_answer() {
+    let fx = fixture();
+    let hold = fx.host.hold_connect(&fx.ssh.id);
+    let spawn = |fx: &Fx| {
+        let service = fx.service.clone();
+        let args = json!({"site": fx.ssh.id.0, "path": "/var/www"});
+        tokio::spawn(async move { service.call("list_directory", args).await })
+    };
+    let first = spawn(&fx);
+    let second = spawn(&fx);
+    hold.entered().await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    first.abort();
+    let _ = first.await;
+    assert!(!hold.dropped(), "the attempt still has a waiter");
+    hold.release();
+    assert_eq!(names(&head(second.await.unwrap())), ["a.txt"]);
+    assert_eq!(fx.host.connects(&fx.ssh.id), 1);
+    assert!(fx.service.connecting().is_empty());
+}
+
+/// The two minutes belong to the attempt: a call that joins 90 s in is answered 30 s
+/// later with the first; the next call after the time-out starts a fresh attempt.
+#[tokio::test(start_paused = true)]
+async fn the_limit_is_the_attempts() {
+    let fx = fixture();
+    fx.host.hang_connect(&fx.ssh.id);
+    fx.host.set_prompt_open(&fx.ssh.id, true);
+    let spawn = |fx: &Fx| {
+        let service = fx.service.clone();
+        let args = json!({"site": fx.ssh.id.0, "path": "/var/www"});
+        tokio::spawn(async move { service.call("list_directory", args).await })
+    };
+    let first = spawn(&fx);
+    tokio::time::sleep(Duration::from_secs(90)).await;
+    let joined = Instant::now();
+    let second = spawn(&fx);
+    assert_eq!(err(first.await.unwrap()), WAITING_FOR_USER);
+    assert_eq!(err(second.await.unwrap()), WAITING_FOR_USER);
+    assert_eq!(joined.elapsed(), Duration::from_secs(30));
+    assert_eq!(fx.host.connects(&fx.ssh.id), 1);
+    assert_eq!(fx.host.closed(), std::slice::from_ref(&fx.ssh.id));
+    assert!(fx.service.connecting().is_empty());
+
+    let started = Instant::now();
+    assert_eq!(err(spawn(&fx).await.unwrap()), WAITING_FOR_USER);
+    assert_eq!(started.elapsed(), Duration::from_secs(120));
+    assert_eq!(fx.host.connects(&fx.ssh.id), 2, "a fresh attempt");
 }
