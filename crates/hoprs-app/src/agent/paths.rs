@@ -57,7 +57,7 @@ const BAD_NAME: &str = "The local path has a name Windows does not allow (with :
 /// The local paths an agent's transfer may not touch.
 ///
 /// `Debug` prints only the number of roots (they include key files' paths).
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Protected {
     roots: Vec<PathBuf>,
 }
@@ -73,8 +73,6 @@ impl fmt::Debug for Protected {
 impl Protected {
     /// Protects `roots` (files or directories; they need not exist). An empty path is
     /// ignored, a relative one is read from the current folder at each check.
-    // TODO(Task 8): remove
-    #[allow(dead_code)]
     pub fn new(roots: impl IntoIterator<Item = PathBuf>) -> Protected {
         Protected {
             roots: roots
@@ -86,23 +84,62 @@ impl Protected {
 
     /// `Err(path)` (as given) when `path` is a protected root, is inside one, or, with
     /// `tree` (a folder transfer), contains one. The roots are resolved again at each
-    /// call, so a root created or linked since counts. Touches the disk: run it on the
-    /// blocking pool.
-    // TODO(Task 8): remove
+    /// call, so a root created or linked since counts (about a hundred system calls with
+    /// ten roots; for many checks in a row, [`prepare`](Self::prepare) once). Touches the
+    /// disk: run it on the blocking pool.
+    // The engine's guard checks through `prepare`; the service's own checks come in Task 11.
+    // TODO(Task 11): remove
     #[allow(dead_code)]
+    pub fn check(&self, path: &Path, tree: bool) -> Result<(), PathBuf> {
+        self.prepare().check(path, tree)
+    }
+
+    /// The roots resolved now (their forms and, on Unix, their identities), for checks
+    /// that follow one another closely. Touches the disk: run it on the blocking pool.
+    pub fn prepare(&self) -> Prepared {
+        Prepared {
+            forms: self.roots.iter().flat_map(|root| forms(root)).collect(),
+            #[cfg(unix)]
+            ids: identity::Roots::new(&self.roots),
+        }
+    }
+}
+
+/// [`Protected`]'s roots as they resolved when [`Protected::prepare`] ran. Its checks see
+/// the roots as they were then: a root created, linked or replaced since counts only by
+/// its path (its plain absolute form), not by where it now resolves or by its identity.
+/// Prepare again for a later check.
+///
+/// `Debug` prints only how many forms it holds (they are the roots' paths).
+pub struct Prepared {
+    /// Every form of every root, as compared.
+    forms: Vec<Vec<OsString>>,
+    #[cfg(unix)]
+    ids: identity::Roots,
+}
+
+impl fmt::Debug for Prepared {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Prepared")
+            .field("forms", &self.forms.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Prepared {
+    /// [`Protected::check`] against the roots as prepared. Resolves `path` (touches the
+    /// disk: run it on the blocking pool).
     pub fn check(&self, path: &Path, tree: bool) -> Result<(), PathBuf> {
         let candidate = forms(path);
         // A path with no form at all (empty) is not one hoprs can tell apart: refused.
         let by_path = candidate.is_empty()
-            || self.roots.iter().any(|root| {
-                forms(root).iter().any(|root| {
-                    candidate
-                        .iter()
-                        .any(|form| form.starts_with(root) || (tree && root.starts_with(form)))
-                })
+            || self.forms.iter().any(|root| {
+                candidate
+                    .iter()
+                    .any(|form| form.starts_with(root) || (tree && root.starts_with(form)))
             });
         #[cfg(unix)]
-        let refused = by_path || identity::Roots::new(&self.roots).refuses(&resolved(path), tree);
+        let refused = by_path || self.ids.refuses(&resolved(path), tree);
         #[cfg(not(unix))]
         let refused = by_path;
         if refused {
@@ -117,8 +154,6 @@ impl Protected {
 /// ancestor, the missing rest appended with `.` and `..` folded. A dangling link on the
 /// way is followed to where writing through it would land. Never fails: when nothing
 /// resolves, the absolute path with `.` and `..` folded.
-// TODO(Task 8): remove
-#[allow(dead_code)]
 pub fn resolved(path: &Path) -> PathBuf {
     resolve(path, 0)
 }
@@ -402,8 +437,6 @@ mod identity {
 /// `<base>/hoprs` for each standard base this system has (configuration, data, cache,
 /// runtime, temporary), `<home>/.ssh`, `known_hosts` and `own` (the backend's own
 /// directories).
-// TODO(Task 8): remove
-#[allow(dead_code)]
 pub fn fixed_roots(own: &[PathBuf], known_hosts: &Path) -> Vec<PathBuf> {
     let bases = [
         dirs::config_dir(),
@@ -798,6 +831,34 @@ mod tests {
         let text = format!("{:?}", t.protected);
         assert_eq!(text, "Protected { roots: 3 }");
         assert!(!text.contains("deploy"), "{text}");
+        let text = format!("{:?}", t.protected.prepare());
+        assert!(text.starts_with("Prepared { forms: "), "{text}");
+        assert!(!text.contains("deploy"), "{text}");
+    }
+
+    /// A prepared set answers like `check` for many paths in a row.
+    #[test]
+    fn prepared_checks_agree_with_check() {
+        let t = Tree::new();
+        let prepared = t.protected.prepare();
+        for rel in [
+            "conf/hoprs/sites.toml",
+            "home/.ssh",
+            "keys/deploy.pem",
+            "keys/other.pem",
+            "work/a/new.txt",
+            "conf",
+        ] {
+            for tree in [false, true] {
+                let path = t.at(rel);
+                assert_eq!(
+                    prepared.check(&path, tree),
+                    t.protected.check(&path, tree),
+                    "{rel}, tree {tree}"
+                );
+            }
+        }
+        assert!(prepared.check(Path::new(""), false).is_err());
     }
 
     #[test]

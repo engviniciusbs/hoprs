@@ -874,6 +874,7 @@ error-app-site-endpoint-changed = O host ou a porta do site mudou: esta sessão 
 error-session-closed = Sessão encerrada
 error-session-shell-closed = Shell encerrado
 error-session-terminal-needs-ssh = Terminais exigem um site SSH
+error-agent-protected-path = Caminho protegido: { $path }
 error-fs-already-exists = Já existe
 error-edit-unknown = Edição inexistente
 error-edit-only-files = Só é possível editar arquivos

@@ -2,6 +2,7 @@
 //! manager (with the sessions' terminal shells), the remote edits and the prompt broker,
 //! behind [`BackendApi`].
 
+pub mod agent;
 pub mod broker;
 pub mod edit;
 #[cfg(test)]
@@ -510,6 +511,9 @@ pub struct BackendConfig {
     /// The user's versions saved when a remote edit takes the server's (see
     /// [`edit::default_recovered_dir`]).
     pub recovered_dir: PathBuf,
+    /// The directory of the agent channel, protected from agents' transfers like the
+    /// others; `None` until the run knows it.
+    pub agent_dir: Option<PathBuf>,
 }
 
 impl BackendConfig {
@@ -523,7 +527,24 @@ impl BackendConfig {
             backup_params: ExportParams::default(),
             edit_dir: edit::default_edit_dir(),
             recovered_dir: edit::default_recovered_dir(),
+            agent_dir: None,
         })
+    }
+
+    /// hoprs's own directories: the profiles, the queue's directory, the remote edits'
+    /// copies, the recovered versions and the agent channel's directory.
+    fn own_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = vec![self.profile_dir.clone()];
+        dirs.extend(
+            self.queue_path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf),
+        );
+        dirs.push(self.edit_dir.clone());
+        dirs.push(self.recovered_dir.clone());
+        dirs.extend(self.agent_dir.clone());
+        dirs
     }
 }
 
@@ -549,6 +570,10 @@ pub struct Backend {
     /// The master switch for agents, started from `settings.toml`; the agent channel
     /// follows it.
     agents: tokio::sync::watch::Sender<bool>,
+    /// What the agent service works through (see [`agent`]).
+    // TODO(Task 12): remove
+    #[allow(dead_code)]
+    agent: Arc<agent::RealHost>,
 }
 
 impl Backend {
@@ -571,10 +596,16 @@ impl Backend {
         if let Some(error) = &loaded.error {
             tracing::warn!(%error, "settings.toml is unusable; this run uses the defaults");
         }
+        // Before the engine starts: its guard of agent items needs them.
+        let fixed = crate::agent::paths::fixed_roots(
+            &config.own_dirs(),
+            &config.sessions.known_hosts_path(),
+        );
         let (engine, queue_error) = start_engine(
             config.queue_path.as_deref(),
             EngineConfig {
                 default_policy: loaded.settings.default_policy,
+                agent_guard: Some(agent::guard(vault.clone(), fixed.clone())),
                 ..EngineConfig::default()
             },
         );
@@ -588,6 +619,14 @@ impl Backend {
             broker.clone(),
             config.sessions,
         );
+        let agent = Arc::new(agent::RealHost::new(
+            vault.clone(),
+            engine.clone(),
+            sessions.clone(),
+            broker.clone(),
+            agents.subscribe(),
+            fixed,
+        ));
         Ok(Backend {
             edits: EditManager::new(config.edit_dir, config.recovered_dir),
             profile_dir: config.profile_dir,
@@ -603,7 +642,15 @@ impl Backend {
             downloading: Downloading::default(),
             drive: Arc::new(Drive::new(Arc::new(MemoryStore::new()))),
             agents,
+            agent,
         })
+    }
+
+    /// The agent service's host over this backend.
+    // TODO(Task 12): remove
+    #[allow(dead_code)]
+    pub fn agent_host(&self) -> Arc<agent::RealHost> {
+        self.agent.clone()
     }
 
     /// Where the app's own secrets (the Google Drive connection) are kept; by default in
@@ -1198,6 +1245,7 @@ mod tests {
             backup_params: CHEAP_BACKUP,
             edit_dir: dir.join("edit"),
             recovered_dir: dir.join("recovered"),
+            agent_dir: None,
         };
         Backend::open(config, Arc::new(MemoryStore::new())).unwrap()
     }
@@ -1597,6 +1645,7 @@ mod tests {
             backup_params: CHEAP_BACKUP,
             edit_dir: dir.path().join("edit"),
             recovered_dir: dir.path().join("recovered"),
+            agent_dir: None,
         };
         let backend = Backend::open(config, Arc::new(MemoryStore::new())).unwrap();
         let key = "AAAAC3NzaC1lZDI1NTE5AAAAIGrhflDkrs18RwIFvHFCsoXLdUL+0cVr81616Tzk8aBj";
@@ -1756,6 +1805,7 @@ mod tests {
             backup_params: CHEAP_BACKUP,
             edit_dir: dir.path().join("edit"),
             recovered_dir: dir.path().join("recovered"),
+            agent_dir: None,
         };
         let backend = Backend::open(config, Arc::new(MemoryStore::new())).unwrap();
         assert!(backend.engine.snapshot().await.is_empty());
@@ -2264,6 +2314,7 @@ mod tests {
             backup_params: CHEAP_BACKUP,
             edit_dir: dir.path().join("edit"),
             recovered_dir: dir.path().join("recovered"),
+            agent_dir: None,
         };
         let backend = Arc::new(Backend::open(config, Arc::new(MemoryStore::new())).unwrap());
         let mut prompts = backend.prompt_events().unwrap();

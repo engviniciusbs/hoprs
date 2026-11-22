@@ -830,6 +830,7 @@ error-app-site-endpoint-changed = Sitenin host veya port ayarı değişti: bu ot
 error-session-closed = Oturum kapandı
 error-session-shell-closed = Kabuk kapandı
 error-session-terminal-needs-ssh = Terminaller için bir SSH sitesi gerekir
+error-agent-protected-path = Korumalı yol: { $path }
 error-fs-already-exists = Zaten var
 error-edit-unknown = Böyle bir düzenleme yok
 error-edit-only-files = Yalnızca dosyalar düzenlenebilir

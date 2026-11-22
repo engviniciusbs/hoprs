@@ -1407,6 +1407,33 @@ async fn write_remote(fs: &dyn RemoteFs, remote: &RemotePath, data: &[u8]) -> Re
     Ok(())
 }
 
+/// Writes `data` to `remote` the way a remote edit uploads (see the module docs): by
+/// `mode`, keeping the mode bits of the file it replaces. An agent's `write_file`. A
+/// temporary file a cut upload leaves behind is removed (best effort).
+// TODO(Task 10): remove
+#[allow(dead_code)]
+pub(crate) async fn put(
+    fs: &dyn RemoteFs,
+    remote: &RemotePath,
+    mode: UploadMode,
+    data: &[u8],
+) -> Result<()> {
+    let mode_bits = match fs.stat(remote).await {
+        Ok(entry) => entry.mode,
+        Err(error) if error.kind == ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    match upload(fs, remote, mode, data, mode_bits).await {
+        Ok(()) => Ok(()),
+        Err(cut) => {
+            if let Some(orphan) = cut.orphan {
+                let _ = fs.remove_file(&orphan).await;
+            }
+            Err(cut.error)
+        }
+    }
+}
+
 /// Why an upload did not finish.
 struct Cut {
     error: Error,

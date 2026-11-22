@@ -2,8 +2,11 @@
 //! the limits on it. Nothing here imports iced: the window only shows what this module
 //! reports.
 
+pub mod host;
 pub mod paths;
 pub mod proto;
+#[cfg(test)]
+pub mod testing;
 pub mod tools;
 
 use std::time::Duration;

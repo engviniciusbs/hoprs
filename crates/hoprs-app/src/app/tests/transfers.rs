@@ -1344,6 +1344,7 @@ async fn upload_through_the_queue_end_to_end() {
         backup_params: hoprs_vault::ExportParams::default(),
         edit_dir: dir.path().join("edit"),
         recovered_dir: dir.path().join("recovered"),
+        agent_dir: None,
     };
     let backend = Backend::open(config, Arc::new(hoprs_vault::MemoryStore::new())).unwrap();
     let backend: Arc<dyn BackendApi> = Arc::new(backend);

@@ -127,6 +127,17 @@ pub struct SessionConfig {
     pub reconnect: Option<ReconnectPolicy>,
 }
 
+impl SessionConfig {
+    /// The `known_hosts` file SSH sessions check: the configured one, else
+    /// `~/.ssh/known_hosts`.
+    pub fn known_hosts_path(&self) -> PathBuf {
+        match &self.known_hosts {
+            Some(path) => path.clone(),
+            None => hoprs_ssh::SshConfig::new("", 22, "").known_hosts,
+        }
+    }
+}
+
 impl Default for SessionConfig {
     fn default() -> Self {
         Self {
@@ -943,10 +954,7 @@ impl SessionManager {
     /// The `known_hosts` file SSH sessions check: the configured one, else
     /// `~/.ssh/known_hosts`.
     pub fn known_hosts_path(&self) -> PathBuf {
-        match &self.inner.config.known_hosts {
-            Some(path) => path.clone(),
-            None => hoprs_ssh::SshConfig::new("", 22, "").known_hosts,
-        }
+        self.inner.config.known_hosts_path()
     }
 
     /// The local filesystem every session transfers with.
@@ -1057,7 +1065,7 @@ impl SessionManager {
 
     /// The prompter of a session (tests answer its prompts directly).
     #[cfg(test)]
-    fn prompter(&self, id: SessionId) -> Option<SessionPrompter> {
+    pub(crate) fn prompter(&self, id: SessionId) -> Option<SessionPrompter> {
         lock(&self.inner.sessions)
             .get(&id)
             .map(|entry| entry.prompter.clone())
