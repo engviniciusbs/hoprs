@@ -426,6 +426,15 @@ async fn one_export_at_a_time_and_not_during_a_restore() {
         "{effects:?}"
     );
     assert_eq!(f.app.backup.restore, BackupState::Idle);
+    // Replace asks nothing while the export runs: a confirmed Replace could not start.
+    restore(
+        &mut f.app,
+        BackupMsg::RestoreMode(hoprs_vault::ImportMode::Replace),
+    );
+    let effects = restore(&mut f.app, BackupMsg::Restore);
+    assert!(effects.is_empty(), "{effects:?}");
+    assert!(!f.app.backup.confirm_replace);
+    assert_eq!(f.app.backup.restore, BackupState::Idle);
 
     // An export does not start while a restore runs.
     let mut f = fixture().await;

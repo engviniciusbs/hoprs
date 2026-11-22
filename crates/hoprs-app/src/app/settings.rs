@@ -449,6 +449,8 @@ impl App {
     }
 
     fn backup_msg(&mut self, msg: BackupMsg) -> Vec<Effect> {
+        // One at a time: an export and a restore both lock the vault.
+        let exporting = self.export_running();
         let backup = &mut self.backup;
         match msg {
             BackupMsg::OpenRestore => {
@@ -475,7 +477,7 @@ impl App {
                 backup.confirm_replace = false;
             }
             BackupMsg::Restore => {
-                if backup.restore.running() {
+                if exporting || backup.restore.running() {
                     return Vec::new();
                 }
                 if let Err(why) = path_of(&backup.restore_path) {
