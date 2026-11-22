@@ -46,16 +46,26 @@ pub struct DriveAccount {
 
 /// What [`Drive::connect`] reports: `Waiting` once the browser can be sent to `url`, then
 /// exactly one `Done`, last.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 // TODO(task 11): the export flow reads the events; remove this allow then.
 #[allow(dead_code)]
 pub enum ConnectEvent {
-    /// The authorisation URL (it holds the `state` and the PKCE challenge, which are not
-    /// secret on their own; never log it).
+    /// The authorisation URL, to open in the browser and to copy. It holds the `state`
+    /// and the PKCE challenge: its `Debug` is redacted, never log it.
     Waiting {
         url: String,
     },
     Done(Result<DriveAccount, Error>),
+}
+
+/// Never shows the URL (it holds the `state`).
+impl fmt::Debug for ConnectEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Waiting { .. } => f.write_str("Waiting { url: <redacted> }"),
+            Self::Done(result) => f.debug_tuple("Done").field(result).finish(),
+        }
+    }
 }
 
 /// A sealed (encrypted) export file in memory, shared without copies.
@@ -215,14 +225,10 @@ impl Drive {
     }
 
     /// The stored connection: one keyring read. A value that is not an entry is deleted.
-    /// An unreachable keyring reads as "not connected".
+    /// A keyring that cannot be read (unreachable, or its unlock refused) is an error:
+    /// the entry may well be there.
     fn read_entry(&self) -> Result<Option<Link>, Error> {
-        let value = match self.store.get_app(AppSecret::GoogleDrive) {
-            Ok(value) => value,
-            Err(err) if is_keyring_unavailable(&err) => return Ok(None),
-            Err(err) => return Err(err),
-        };
-        let Some(value) = value else {
+        let Some(value) = self.store.get_app(AppSecret::GoogleDrive)? else {
             return Ok(None);
         };
         match parse_entry(&value) {
@@ -242,7 +248,8 @@ impl Drive {
         }
     }
 
-    /// Fills `known` from the keyring if it was not read yet.
+    /// Fills `known` from the keyring if it was not read yet; on an error it stays unread,
+    /// so the next call asks the keyring again.
     fn load(&self, known: &mut Known) -> Result<(), Error> {
         if matches!(known, Known::Unread) {
             *known = match self.read_entry()? {
@@ -360,6 +367,7 @@ impl Drive {
     pub fn disconnect(&self) -> Result<(), Error> {
         let client = self.client()?;
         let held = std::mem::replace(&mut *self.known(), Known::None);
+        let from_memory = matches!(held, Known::Linked(_));
         let link = match held {
             Known::Linked(link) => Some(link),
             Known::Unread | Known::None => match self.read_entry() {
@@ -380,7 +388,13 @@ impl Drive {
             Ok(()) => {}
             // Nothing was stored, and the keyring is still out of reach.
             Err(err) if session_only && is_keyring_unavailable(&err) => {}
-            Err(err) => return Err(err),
+            Err(err) => {
+                // The entry may still be there: the next call reads the keyring again.
+                if !from_memory {
+                    *self.known() = Known::Unread;
+                }
+                return Err(err);
+            }
         }
         tracing::info!("Google Drive: disconnected");
         Ok(())
@@ -777,8 +791,67 @@ mod tests {
         let file = drive.upload("backup.hoprs", b"sealed").unwrap();
         assert_eq!(file.name, "backup.hoprs");
         assert_eq!(count(&seen, "post", "/upload/drive/v3/files"), 1);
+        // A new `Drive` cannot read the keyring: an error, not "not connected".
         let again = Drive::with_client(Some(client), store);
-        assert_eq!(again.status().unwrap(), None);
+        let err = again.status().unwrap_err();
+        assert!(hoprs_vault::is_keyring_unavailable(&err), "{err:?}");
+    }
+
+    /// A keyring that fails as unavailable for its first `failures` reads, then works.
+    #[derive(Default)]
+    struct Flaky {
+        inner: MemoryStore,
+        failures: AtomicU32,
+    }
+
+    impl AppSecretStore for Flaky {
+        fn get_app(&self, which: AppSecret) -> CoreResult<Option<SecretString>> {
+            let failing = self
+                .failures
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if failing {
+                return Err(down());
+            }
+            self.inner.get_app(which)
+        }
+        fn set_app(&self, which: AppSecret, value: &SecretString) -> CoreResult<()> {
+            self.inner.set_app(which, value)
+        }
+        fn delete_app(&self, which: AppSecret) -> CoreResult<()> {
+            self.inner.delete_app(which)
+        }
+    }
+
+    #[test]
+    fn unreadable_keyring_is_an_error_and_is_asked_again() {
+        let (client, _, seen) = google();
+        let store = Arc::new(Flaky::default());
+        store_entry(&store.inner);
+        store.failures.store(1, Ordering::SeqCst);
+        let drive = Drive::with_client(Some(client.clone()), store.clone());
+        let err = drive.status().unwrap_err();
+        assert!(hoprs_vault::is_keyring_unavailable(&err), "{err:?}");
+        assert_eq!(
+            drive.status().unwrap(),
+            Some(DriveAccount {
+                email: Some(EMAIL.into()),
+                stored: true
+            })
+        );
+
+        // The upload path: the same error, nothing remembered, then it works.
+        store.failures.store(1, Ordering::SeqCst);
+        let drive = Drive::with_client(Some(client), store.clone());
+        let err = drive.upload("backup.hoprs", b"sealed").unwrap_err();
+        assert!(hoprs_vault::is_keyring_unavailable(&err), "{err:?}");
+        assert_eq!(count(&seen, "post", "/token"), 0);
+        drive.upload("backup.hoprs", b"sealed").unwrap();
+        assert_eq!(count(&seen, "post", "/upload/drive/v3/files"), 1);
+        assert!(
+            entry(store.as_ref()).is_some(),
+            "the entry was never touched"
+        );
     }
 
     #[test]
@@ -1001,7 +1074,19 @@ mod tests {
         // Every access token is stale at once: each upload refreshes.
         script.lock().unwrap().expires_in = 0;
         let mut shown = Vec::new();
+        // The `state` and challenge of every attempt are secret in output too.
+        let mut attempts: Vec<String> = Vec::new();
+        let mut keep = |events: &[ConnectEvent]| {
+            for event in events {
+                if let ConnectEvent::Waiting { url } = event {
+                    attempts.push(param(url, "state").0.unwrap());
+                    attempts.push(param(url, "code_challenge").0.unwrap());
+                    assert_eq!(format!("{event:?}"), "Waiting { url: <redacted> }");
+                }
+            }
+        };
         let events = connect(&drive);
+        keep(&events);
         shown.push(format!("{events:?}"));
         shown.push(format!("{drive:?}"));
         shown.push(format!("{client:?}"));
@@ -1019,7 +1104,9 @@ mod tests {
         shown.push(format!("{refused:?}"));
         let first = waiting(&drive);
         drive.cancel();
-        shown.push(format!("{:?}", first.join().unwrap()));
+        let cancelled = first.join().unwrap();
+        keep(&cancelled);
+        shown.push(format!("{cancelled:?}"));
         let mut events = Vec::new();
         let mut browser = None;
         drive.connect(&pages(), &mut |event| {
@@ -1031,11 +1118,16 @@ mod tests {
         });
         browser.unwrap().join().unwrap();
         assert!(matches!(events.last(), Some(ConnectEvent::Done(Err(_)))));
+        keep(&events);
         shown.push(format!("{events:?}"));
         shown.push(format!("{drive:?}"));
         shown.push(format!("{:?}", Sealed::new(REFRESH.as_bytes().to_vec())));
+        assert_eq!(attempts.len(), 6);
         for text in &shown {
             hidden(text);
+            for value in &attempts {
+                assert!(!text.contains(value.as_str()), "{value} in {text}");
+            }
         }
     }
 }
