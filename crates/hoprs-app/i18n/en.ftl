@@ -814,6 +814,7 @@ error-backup-cannot-build = Cannot build the backup
 error-backup-invalid-content = Invalid backup content
 error-backup-password-empty = Backup password is empty
 error-backup-cannot-read-secret = Cannot read a secret for the backup
+error-backup-partial-no-replace = This file holds only part of a backup. Restore it with Merge.
 error-vault-keyring-error = System keyring error
 error-vault-keyring-unavailable = System keyring unavailable
 error-vault-unknown-site = Unknown site

@@ -729,6 +729,7 @@ error-backup-cannot-build = Yedek oluşturulamıyor
 error-backup-invalid-content = Geçersiz yedek içeriği
 error-backup-password-empty = Yedek parolası boş
 error-backup-cannot-read-secret = Yedek için bir gizli bilgi okunamıyor
+error-backup-partial-no-replace = Bu dosya bir yedeğin yalnızca bir kısmını içeriyor. Birleştir ile geri yükleyin.
 error-vault-keyring-error = Sistem anahtarlığı hatası
 error-vault-keyring-unavailable = Sistem anahtarlığı kullanılamıyor
 error-vault-unknown-site = Bilinmeyen site

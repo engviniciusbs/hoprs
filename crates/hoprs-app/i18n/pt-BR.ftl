@@ -773,6 +773,7 @@ error-backup-cannot-build = Não foi possível montar o backup
 error-backup-invalid-content = Conteúdo do backup inválido
 error-backup-password-empty = A senha do backup está vazia
 error-backup-cannot-read-secret = Não foi possível ler um segredo para o backup
+error-backup-partial-no-replace = Este arquivo tem só uma parte de um backup. Restaure com Mesclar.
 error-vault-keyring-error = Erro no keyring do sistema
 error-vault-keyring-unavailable = Keyring do sistema indisponível
 error-vault-unknown-site = Site desconhecido

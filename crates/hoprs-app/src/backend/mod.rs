@@ -31,7 +31,9 @@ use hoprs_transfer::{
     ConflictPolicy, EngineConfig, Event, QueueStore, Resolution, TransferEngine, TransferId,
     TransferItem, TransferSpec,
 };
-use hoprs_vault::{BackupImportReport, ExportParams, ExportReport, ImportMode, SecretStore, Vault};
+use hoprs_vault::{
+    BackupImportReport, ExportParams, ExportReport, ExportScope, ImportMode, SecretStore, Vault,
+};
 use secrecy::SecretString;
 use tokio::sync::{broadcast, mpsc, watch};
 
@@ -928,7 +930,7 @@ impl BackendApi for Backend {
     async fn export_backup(&self, path: PathBuf, password: SecretString) -> Result<ExportReport> {
         let params = self.backup_params;
         self.vault
-            .call(move |vault| vault.export(&path, &password, params))
+            .call(move |vault| vault.export(&path, &ExportScope::All, &password, params))
             .await
     }
 
