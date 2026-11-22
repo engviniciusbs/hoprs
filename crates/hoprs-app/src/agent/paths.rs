@@ -13,6 +13,13 @@
 //! ([`CASE_INSENSITIVE`]); on a case-sensitive macOS volume that refuses a few paths
 //! that are in fact different, the safe side. Elsewhere names compare exactly.
 //!
+//! On Unix the check also compares file identities (device and inode, one `stat` each),
+//! which no path comparison can: a hard link to a key file, a bind mount, the macOS
+//! firmlink `/System/Volumes/Data/Users/…` beside `/Users/…`, a case-insensitive mount
+//! on Linux. An identity can only add a refusal, never lift one. On Windows `canonicalize`
+//! (`GetFinalPathNameByHandle`) already unifies junctions and mount points, and std's
+//! file-index API is unstable, so Windows compares paths only.
+//!
 //! Nothing here prints a root: the roots include every saved site's key file, so
 //! [`Protected`]'s `Debug` shows only how many there are, and a refusal names only the
 //! path the agent gave.
@@ -86,7 +93,7 @@ impl Protected {
     pub fn check(&self, path: &Path, tree: bool) -> Result<(), PathBuf> {
         let candidate = forms(path);
         // A path with no form at all (empty) is not one hoprs can tell apart: refused.
-        let hit = candidate.is_empty()
+        let by_path = candidate.is_empty()
             || self.roots.iter().any(|root| {
                 forms(root).iter().any(|root| {
                     candidate
@@ -94,7 +101,15 @@ impl Protected {
                         .any(|form| form.starts_with(root) || (tree && root.starts_with(form)))
                 })
             });
-        if hit { Err(path.to_path_buf()) } else { Ok(()) }
+        #[cfg(unix)]
+        let refused = by_path || identity::Roots::new(&self.roots).refuses(&resolved(path), tree);
+        #[cfg(not(unix))]
+        let refused = by_path;
+        if refused {
+            Err(path.to_path_buf())
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -115,7 +130,14 @@ fn resolve(path: &Path, hops: usize) -> PathBuf {
         let head: PathBuf = comps[..end].iter().collect();
         let rest = &comps[end..];
         if let Ok(canonical) = fs::canonicalize(&head) {
-            return folded_onto(canonical, rest);
+            let out = folded_onto(canonical, rest);
+            // A `..` after a missing name (`missing/../link/x`) folds lexically, which
+            // leaves the links after it unresolved: resolve the folded path again. It has
+            // no `..` left, so this goes one step deeper at most.
+            if rest.contains(&Component::ParentDir) {
+                return resolve(&out, hops);
+            }
+            return out;
         }
         // `canonicalize` refuses a dangling link, but a download through it would
         // create its target.
@@ -235,6 +257,147 @@ fn prefix_key(prefix: std::path::PrefixComponent<'_>) -> OsString {
     prefix.as_os_str().to_os_string()
 }
 
+/// File identities (device and inode) on Unix: what a path comparison cannot see.
+#[cfg(unix)]
+mod identity {
+    use std::fs;
+    use std::os::unix::fs::MetadataExt;
+    use std::path::{Path, PathBuf};
+
+    /// Device and inode. Never printed: a root's identity says as much as its path.
+    type Id = (u64, u64);
+
+    /// The identity of what `path` names, links followed; `None` when it cannot be
+    /// read (missing, no permission): then only the path rules speak for it.
+    fn of(path: &Path) -> Option<Id> {
+        fs::metadata(path).ok().map(|meta| (meta.dev(), meta.ino()))
+    }
+
+    /// The roots' identities: each existing root's own, and those of its existing
+    /// ancestors (for `tree`).
+    pub(super) struct Roots {
+        own: Vec<Id>,
+        above: Vec<Id>,
+    }
+
+    impl Roots {
+        /// One `stat` for each root and each of its ancestors (after resolving it).
+        pub(super) fn new(roots: &[PathBuf]) -> Roots {
+            let mut own = Vec::new();
+            let mut above = Vec::new();
+            for root in roots {
+                let root = super::resolved(root);
+                let mut chain = root.ancestors();
+                if let Some(id) = chain.next().and_then(of) {
+                    own.push(id);
+                }
+                above.extend(chain.filter_map(of));
+            }
+            Roots { own, above }
+        }
+
+        /// Whether `path` (taken as given: the caller resolves it) is a root or inside
+        /// one by identity (itself or any existing ancestor has a root's identity), or,
+        /// with `tree`, contains one (its own identity is a root's ancestor's). One
+        /// `stat` per component of `path`.
+        pub(super) fn refuses(&self, path: &Path, tree: bool) -> bool {
+            let mut chain = path.ancestors();
+            if let Some(id) = chain.next().and_then(of)
+                && (self.own.contains(&id) || (tree && self.above.contains(&id)))
+            {
+                return true;
+            }
+            chain.filter_map(of).any(|id| self.own.contains(&id))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use std::os::unix::fs::symlink;
+
+        use super::super::tests::Tree;
+        use super::*;
+
+        fn roots(t: &Tree) -> Roots {
+            Roots::new(&[
+                t.at("conf/hoprs"),
+                t.at("home/.ssh"),
+                t.at("keys/deploy.pem"),
+            ])
+        }
+
+        #[test]
+        fn a_hard_link_to_a_key_file_is_the_key_file() {
+            let t = Tree::new();
+            fs::hard_link(t.at("keys/deploy.pem"), t.at("work/a/notes.txt")).unwrap();
+            // The path rules see a neighbour...
+            let candidate = super::super::forms(&t.at("work/a/notes.txt"));
+            let by_path = ["conf/hoprs", "home/.ssh", "keys/deploy.pem"]
+                .iter()
+                .any(|rel| {
+                    super::super::forms(&t.at(rel))
+                        .iter()
+                        .any(|root| candidate.iter().any(|form| form.starts_with(root)))
+                });
+            assert!(!by_path);
+            let ids = roots(&t);
+            assert!(ids.refuses(&t.at("work/a/notes.txt"), false));
+            // ...and the whole check refuses it.
+            assert!(t.protected.check(&t.at("work/a/notes.txt"), false).is_err());
+            assert!(t.protected.check(&t.at("work/a/notes.txt"), true).is_err());
+            // A neighbour with another inode stays open.
+            fs::write(t.at("work/a/other.txt"), b"x").unwrap();
+            assert!(!ids.refuses(&t.at("work/a/other.txt"), false));
+            assert!(t.protected.check(&t.at("work/a/other.txt"), true).is_ok());
+            assert!(!ids.refuses(&t.at("keys/other.pem"), true));
+        }
+
+        /// An alias that resolving does not rewrite (a bind mount, a macOS firmlink),
+        /// simulated with a link handed over unresolved: only the identity sees it.
+        #[test]
+        fn an_alias_of_a_protected_folder_is_that_folder() {
+            let t = Tree::new();
+            symlink(t.at("home/.ssh"), t.at("work/alias")).unwrap();
+            let ids = roots(&t);
+            for (rel, tree) in [
+                ("work/alias", false),
+                ("work/alias/known_hosts", false),
+                ("work/alias/not/yet/there", false),
+                ("work/alias", true),
+            ] {
+                assert!(ids.refuses(&t.at(rel), tree), "{rel}, tree {tree}");
+            }
+            symlink(t.at("conf"), t.at("work/conf-alias")).unwrap();
+            assert!(ids.refuses(&t.at("work/conf-alias/hoprs/new"), false));
+            // Containing a root by identity counts only for a folder transfer.
+            assert!(ids.refuses(&t.at("work/conf-alias"), true));
+            assert!(!ids.refuses(&t.at("work/conf-alias"), false));
+            assert!(!ids.refuses(&t.at("work/conf-alias/hoprs-notes"), false));
+        }
+
+        #[test]
+        fn an_ancestor_of_a_root_refuses_only_a_folder_transfer() {
+            let t = Tree::new();
+            fs::write(t.at("home/notes.txt"), b"x").unwrap();
+            let ids = roots(&t);
+            assert!(!ids.refuses(&t.at("home/notes.txt"), false));
+            assert!(!ids.refuses(&t.at("home/notes.txt"), true));
+            assert!(!ids.refuses(&t.at("home/new.txt"), false));
+            assert!(!ids.refuses(&t.at("home"), false));
+            assert!(ids.refuses(&t.at("home"), true));
+            assert!(!ids.refuses(Path::new("/"), false));
+            assert!(ids.refuses(Path::new("/"), true));
+            assert!(!ids.refuses(&t.at("work/a"), true));
+            // A root that does not exist has no identity; the path rules cover it.
+            let missing = Roots::new(&[t.at("nothing/here")]);
+            assert!(missing.own.is_empty());
+            assert!(!missing.refuses(&t.at("work"), false));
+            // Nothing readable on the candidate side is no refusal (and no panic).
+            assert!(!ids.refuses(Path::new(""), true));
+        }
+    }
+}
+
 /// The roots every check protects, before the saved sites' key files (ruling 16):
 /// `<base>/hoprs` for each standard base this system has (configuration, data, cache,
 /// runtime, temporary), `<home>/.ssh`, `known_hosts` and `own` (the backend's own
@@ -341,7 +504,6 @@ pub fn local_os_path(path: &RemotePath) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
     use std::fs;
     use std::path::MAIN_SEPARATOR;
 
@@ -350,13 +512,13 @@ mod tests {
     /// A tempdir holding `conf/hoprs/sites.toml`, `home/.ssh/known_hosts`,
     /// `keys/deploy.pem`, `keys/other.pem` and `work/a/`, with `conf/hoprs`, `home/.ssh`
     /// and `keys/deploy.pem` protected.
-    struct Tree {
-        dir: tempfile::TempDir,
-        protected: Protected,
+    pub(super) struct Tree {
+        pub(super) dir: tempfile::TempDir,
+        pub(super) protected: Protected,
     }
 
     impl Tree {
-        fn new() -> Tree {
+        pub(super) fn new() -> Tree {
             let dir = tempfile::tempdir().unwrap();
             let base = dir.path();
             for folder in ["conf/hoprs", "home/.ssh", "keys", "work/a"] {
@@ -379,7 +541,7 @@ mod tests {
         }
 
         /// `rel` (written with `/`) under the tempdir, built with `Path::join`.
-        fn at(&self, rel: &str) -> PathBuf {
+        pub(super) fn at(&self, rel: &str) -> PathBuf {
             rel.split('/')
                 .filter(|s| !s.is_empty())
                 .fold(self.dir.path().to_path_buf(), |path, comp| path.join(comp))
@@ -541,6 +703,28 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn a_dotdot_after_a_missing_name_still_resolves_the_links_after_it() {
+        use std::os::unix::fs::symlink;
+
+        let t = Tree::new();
+        symlink(t.at("home/.ssh"), t.at("work/link2")).unwrap();
+        let path = t.at("work/missing").join("..").join("link2").join("x");
+        let ssh = fs::canonicalize(t.at("home/.ssh")).unwrap();
+        // The path rules alone (identity would refuse it too, through `work/link2`).
+        assert_eq!(resolved(&path), ssh.join("x"));
+        assert!(t.refused(&path, false));
+        let deeper = t
+            .at("work/missing/deeper")
+            .join("..")
+            .join("..")
+            .join("link2")
+            .join("new")
+            .join("x");
+        assert_eq!(resolved(&deeper), ssh.join("new").join("x"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn a_dangling_link_is_followed_to_where_it_would_write() {
         use std::os::unix::fs::symlink;
 
@@ -618,30 +802,61 @@ mod tests {
 
     #[test]
     fn fixed_roots_cover_every_hoprs_directory() {
-        let own = vec![
-            PathBuf::from("/own/profile"),
-            PathBuf::from("/own/queue"),
-            PathBuf::from("/own/edit"),
-        ];
+        let own = vec![PathBuf::from("/own/profile"), PathBuf::from("/own/queue")];
         let known_hosts = PathBuf::from("/elsewhere/known_hosts");
-        let roots: BTreeSet<PathBuf> = fixed_roots(&own, &known_hosts).into_iter().collect();
-
-        let mut expected: BTreeSet<PathBuf> = [
-            dirs::config_dir(),
-            dirs::data_dir(),
-            dirs::cache_dir(),
-            dirs::runtime_dir(),
-            Some(std::env::temp_dir()),
-        ]
-        .into_iter()
-        .flatten()
-        .map(|base| base.join("hoprs"))
-        .collect();
-        expected.extend(dirs::home_dir().map(|home| home.join(".ssh")));
-        expected.insert(known_hosts.clone());
-        expected.extend(own.iter().cloned());
-        assert_eq!(roots, expected);
+        let roots = fixed_roots(&own, &known_hosts);
+        assert!(roots.contains(&known_hosts));
+        assert!(own.iter().all(|dir| roots.contains(dir)));
+        let home = dirs::home_dir().expect("a home directory");
+        assert!(roots.contains(&home.join(".ssh")));
         assert!(roots.contains(&std::env::temp_dir().join("hoprs")));
+
+        // Every place the app itself writes, as the app computes it, is refused.
+        let protected = Protected::new(roots);
+        let mut written: Vec<PathBuf> = vec![
+            home.join(".ssh").join("id_ed25519"),
+            crate::backend::edit::default_edit_dir()
+                .join("1")
+                .join("index.php"),
+            crate::backend::edit::default_recovered_dir().join("a.txt"),
+        ];
+        written.extend(crate::instance_lock_paths());
+        if let Some(config) = crate::backend::BackendConfig::standard() {
+            written.push(config.profile_dir.join("sites.toml"));
+            written.push(config.profile_dir.join("settings.toml"));
+            written.extend(config.queue_path);
+        }
+        written.extend(hoprs_vault::default_dir().map(|dir| dir.join("workspaces.toml")));
+        for path in &written {
+            assert!(protected.check(path, false).is_err(), "{path:?}");
+        }
+        // On Linux with the XDG defaults: the concrete folders of the spec.
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("XDG_CONFIG_HOME").is_none() {
+            assert!(
+                protected
+                    .check(
+                        &home.join(".config").join("hoprs").join("sites.toml"),
+                        false
+                    )
+                    .is_err()
+            );
+        }
+        #[cfg(target_os = "linux")]
+        if std::env::var_os("XDG_DATA_HOME").is_none() {
+            let queue = home
+                .join(".local")
+                .join("share")
+                .join("hoprs")
+                .join("queue.db");
+            assert!(protected.check(&queue, false).is_err());
+        }
+        // And the rest of the home directory is open.
+        assert!(
+            protected
+                .check(&home.join("Documents").join("x.txt"), false)
+                .is_ok()
+        );
     }
 
     #[test]
