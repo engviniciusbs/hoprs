@@ -875,6 +875,7 @@ error-session-closed = Sessão encerrada
 error-session-shell-closed = Shell encerrado
 error-session-terminal-needs-ssh = Terminais exigem um site SSH
 error-agent-protected-path = Caminho protegido: { $path }
+error-agent-channel-failed = Não foi possível abrir o canal para agentes
 error-fs-already-exists = Já existe
 error-edit-unknown = Edição inexistente
 error-edit-only-files = Só é possível editar arquivos

@@ -641,8 +641,6 @@ fn octal_mode(text: &str) -> Option<u32> {
 }
 
 impl Service {
-    // TODO(Task 12): remove
-    #[allow(dead_code)]
     pub fn new(
         host: Arc<dyn AgentHost>,
         limits: Limits,
@@ -662,8 +660,6 @@ impl Service {
 
     /// Answers one call. Every problem is a `Reply::Err` with a text for the agent; the
     /// call's log line is written when it ends.
-    // TODO(Task 12): remove
-    #[allow(dead_code)]
     pub async fn call(&self, tool: &str, args: Value) -> Reply {
         let (reply, line) = self.run(tool, args).await;
         log(&line);
@@ -674,8 +670,6 @@ impl Service {
     /// whose last call ended `limits.idle_close` ago (or that never had one), except
     /// while the site has a call running or an unfinished transfer; then tells which
     /// sites still hold one (when that changed).
-    // TODO(Task 12): remove
-    #[allow(dead_code)]
     pub async fn reap(&self) {
         // A vault that cannot be read opens no site.
         let sites = self.host.sites().await.unwrap_or_default();

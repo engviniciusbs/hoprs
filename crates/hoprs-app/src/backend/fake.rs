@@ -96,6 +96,7 @@ use super::{
     ProfileSnapshot, PromptAnswer, PromptId, SessionId, ShellId, ShellOutput, Side,
     TransferSnapshot, WorkspaceTabs,
 };
+use crate::agent::AgentEvent;
 use crate::drive::{ConnectEvent, DriveAccount, DriveFile, Pages, Sealed};
 use crate::settings::{Settings, SettingsLoad};
 use crate::update::Release;
@@ -214,6 +215,8 @@ pub struct FakeBackend {
     next_transfer: AtomicI64,
     events: mpsc::UnboundedSender<BrokerEvent>,
     receiver: Mutex<Option<mpsc::UnboundedReceiver<BrokerEvent>>>,
+    agent_events: mpsc::UnboundedSender<AgentEvent>,
+    agent_receiver: Mutex<Option<mpsc::UnboundedReceiver<AgentEvent>>>,
     /// Engine events the test sends with [`FakeBackend::send_transfer_event`].
     transfer_events: broadcast::Sender<Event>,
     shells: Shells,
@@ -326,12 +329,15 @@ impl Default for FakeBackend {
 impl FakeBackend {
     pub fn new() -> Self {
         let (events, receiver) = mpsc::unbounded_channel();
+        let (agent_events, agent_receiver) = mpsc::unbounded_channel();
         Self {
             state: Arc::new(Mutex::new(State::default())),
             next_session: AtomicU64::new(1),
             next_transfer: AtomicI64::new(1),
             events,
             receiver: Mutex::new(Some(receiver)),
+            agent_events,
+            agent_receiver: Mutex::new(Some(agent_receiver)),
             transfer_events: broadcast::channel(16).0,
             shells: Shells::default(),
             edits: OnceLock::new(),
@@ -559,6 +565,11 @@ impl FakeBackend {
     /// The local side (shared with the backend).
     pub fn local_fs(&self) -> MemFs {
         self.state().local.clone()
+    }
+
+    /// Sends an agent event to the UI's subscription.
+    pub fn push_agent_event(&self, event: AgentEvent) {
+        let _ = self.agent_events.send(event);
     }
 
     /// Sends a broker event to the UI's subscription.
@@ -1516,6 +1527,13 @@ impl BackendApi for FakeBackend {
 
     async fn set_agents_enabled(&self, on: bool) {
         self.record(BackupCall::SetAgents(on));
+    }
+
+    fn agent_events(&self) -> Option<mpsc::UnboundedReceiver<AgentEvent>> {
+        self.agent_receiver
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     fn set_keepalive(&self, secs: u64) {

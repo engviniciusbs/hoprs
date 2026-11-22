@@ -405,8 +405,6 @@ impl SessionManager {
     /// [`connect_batch`](Self::connect_batch). A session it starts is `agent_only` and its
     /// dialogs say an agent asked; a session the site already has is reused as it is (see
     /// the module docs). Opens no tab and takes no focus.
-    // TODO(Task 12): remove
-    #[allow(dead_code)]
     pub async fn connect_for_agent(&self, site: SiteId) -> ConnectResult {
         let (_, result) =
             futures_util::future::join_all(self.site_connects(vec![site], Caller::Agent).await)
@@ -747,8 +745,6 @@ impl SessionManager {
 
     /// Closes the session of `site` if it is `agent_only` (no tab uses it); a tab's
     /// session is left alone. Whether a session was closed.
-    // TODO(Task 12): remove
-    #[allow(dead_code)]
     pub async fn close_agent_session(&self, site: &SiteId) -> bool {
         let Some(id) = self.session_of(site) else {
             return false;
@@ -796,8 +792,6 @@ impl SessionManager {
     }
 
     /// The sites whose session only an agent uses, sorted.
-    // TODO(Task 12): remove
-    #[allow(dead_code)]
     pub fn agent_sites(&self) -> Vec<SiteId> {
         let mut sites: Vec<SiteId> = lock(&self.inner.sessions)
             .values()
@@ -810,8 +804,6 @@ impl SessionManager {
     }
 
     /// The session of `site`, in any state.
-    // TODO(Task 12): remove
-    #[allow(dead_code)]
     pub(crate) fn session_of(&self, site: &SiteId) -> Option<SessionId> {
         lock(&self.inner.sessions)
             .iter()
@@ -820,8 +812,6 @@ impl SessionManager {
     }
 
     /// The session of `site` while it is connected and its remote filesystem is built.
-    // TODO(Task 12): remove
-    #[allow(dead_code)]
     pub fn connected_session(&self, site: &SiteId) -> Option<SessionId> {
         lock(&self.inner.sessions)
             .iter()
@@ -835,8 +825,6 @@ impl SessionManager {
 
     /// Runs `command` on its own exec channel of the SSH session `id` (see
     /// [`SshSession::exec`]); the session counts as used. Not for FTP sessions.
-    // TODO(Task 12): remove
-    #[allow(dead_code)]
     pub async fn exec(
         &self,
         id: SessionId,

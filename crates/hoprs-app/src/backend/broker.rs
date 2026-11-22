@@ -232,8 +232,6 @@ impl PromptBroker {
 
     /// Whether a dialog of `session` is open in the UI, or `session` waits on another
     /// session's host key or certificate dialog: the session is waiting on the user.
-    // TODO(Task 12): remove
-    #[allow(dead_code)]
     pub fn has_open(&self, session: SessionId) -> bool {
         self.state().open.contains_key(&session)
     }

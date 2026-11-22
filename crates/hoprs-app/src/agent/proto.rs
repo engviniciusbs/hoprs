@@ -18,17 +18,11 @@ use std::io::{Error, ErrorKind, Result};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 /// The channel's version number, in the relay's hello.
-// TODO(Task 12): remove
-#[allow(dead_code)]
 pub const PROTOCOL: u32 = 1;
 /// The longest line either side accepts or writes, newline excluded (8 MiB).
-// TODO(Task 12): remove
-#[allow(dead_code)]
 pub const MAX_LINE: usize = 8 * 1024 * 1024;
 
 /// The relay's first line.
-// TODO(Task 12): remove
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Hello {
     pub hoprs_agent: u32,
@@ -36,8 +30,6 @@ pub struct Hello {
 }
 
 /// The app's answer to the [`Hello`]. `version` is the app's own.
-// TODO(Task 12): remove
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "hello", rename_all = "lowercase")]
 pub enum HelloReply {
@@ -46,8 +38,6 @@ pub enum HelloReply {
 }
 
 /// What the relay sends after the hello.
-// TODO(Task 12): remove
-#[allow(dead_code)]
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ToApp {
@@ -69,8 +59,6 @@ pub enum Reply {
 }
 
 /// What the app sends: the answer to a call, or a goodbye before it closes.
-// TODO(Task 12): remove
-#[allow(dead_code)]
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ToRelay {
@@ -88,8 +76,6 @@ pub enum ToRelay {
 }
 
 /// Why the app is closing the connection.
-// TODO(Task 12): remove
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ByeReason {
@@ -101,8 +87,6 @@ pub enum ByeReason {
 
 impl ToRelay {
     /// The line that answers call `id`.
-    // TODO(Task 12): remove
-    #[allow(dead_code)]
     pub fn answer(id: u64, reply: Reply) -> ToRelay {
         match reply {
             Reply::Ok(blocks) => ToRelay::Answer {
@@ -146,8 +130,6 @@ impl ToRelay {
 /// How the app answers a relay's hello: the same channel number and the same version
 /// string is `Ok`. Relay and app are one binary, so a different version means the
 /// running window is older (or newer) than the program the agent started.
-// TODO(Task 12): remove
-#[allow(dead_code)]
 pub fn hello_reply(theirs: &Hello) -> HelloReply {
     let version = env!("CARGO_PKG_VERSION").to_string();
     if theirs.hoprs_agent == PROTOCOL && theirs.version == version {
@@ -160,8 +142,6 @@ pub fn hello_reply(theirs: &Hello) -> HelloReply {
 /// Reads one line, without its `\n` (or `\r\n`). `None` at end-of-file; a last line
 /// without a newline is returned. A line over [`MAX_LINE`] bytes, or one that is not
 /// UTF-8, is `InvalidData`; the reader never holds more than [`MAX_LINE`] bytes of it.
-// TODO(Task 12): remove
-#[allow(dead_code)]
 pub async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<String>> {
     read_line_within(reader, MAX_LINE).await
 }
@@ -216,8 +196,6 @@ fn too_long() -> Error {
 
 /// Reads one line and parses it as one JSON object of type `T`. A line that is not an
 /// object, or not a `T`, is `InvalidData`. The error text never carries the line.
-// TODO(Task 12): remove
-#[allow(dead_code)]
 pub async fn read_message<R: AsyncBufRead + Unpin, T: DeserializeOwned>(
     reader: &mut R,
 ) -> Result<Option<T>> {
@@ -246,8 +224,6 @@ pub async fn read_message<R: AsyncBufRead + Unpin, T: DeserializeOwned>(
 
 /// Writes `message` as one line and flushes. A message over [`MAX_LINE`] bytes is
 /// `InvalidInput` and nothing is written.
-// TODO(Task 12): remove
-#[allow(dead_code)]
 pub async fn write_line<W: AsyncWrite + Unpin, T: Serialize>(
     writer: &mut W,
     message: &T,

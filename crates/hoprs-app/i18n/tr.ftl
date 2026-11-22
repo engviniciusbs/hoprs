@@ -831,6 +831,7 @@ error-session-closed = Oturum kapandı
 error-session-shell-closed = Kabuk kapandı
 error-session-terminal-needs-ssh = Terminaller için bir SSH sitesi gerekir
 error-agent-protected-path = Korumalı yol: { $path }
+error-agent-channel-failed = Ajanlar için kanal açılamadı
 error-fs-already-exists = Zaten var
 error-edit-unknown = Böyle bir düzenleme yok
 error-edit-only-files = Yalnızca dosyalar düzenlenebilir

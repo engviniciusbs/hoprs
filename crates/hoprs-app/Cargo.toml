@@ -17,7 +17,8 @@ iced = { workspace = true, features = ["image-without-codecs"] }
 # laid out and drawn without a window.
 iced_runtime = "0.14"
 iced_tiny_skia = "0.14"
-tokio = { workspace = true, features = ["rt", "sync", "macros", "time", "io-util", "fs"] }
+# `net`: the agent channel (a Unix domain socket, or a named pipe on Windows).
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time", "io-util", "fs", "net"] }
 tokio-util = { workspace = true }
 futures-util = { workspace = true }
 async-trait = { workspace = true }
@@ -93,6 +94,10 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Com",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
+    # The agent channel's pipe: its security descriptor from SDDL, SIDs as text, the pipe's owner.
+    "Win32_Security_Authorization",
+    # The agent channel's pipe: the process token, for the user's SID.
+    "Win32_System_Threading",
 ] }
 
 # Windows: the icon and version info embedded into hoprs.exe (build.rs).

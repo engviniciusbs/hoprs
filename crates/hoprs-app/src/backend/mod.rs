@@ -51,6 +51,9 @@ pub use sessions::{
 pub use shells::ShellId;
 pub use vault::{LazyKeyringStore, ProfileSnapshot, VaultHandle};
 
+use crate::agent::server::AgentServer;
+use crate::agent::service::Service;
+use crate::agent::{AgentEvent, Limits};
 use crate::drive::{ConnectEvent, Drive, DriveAccount, DriveFile, Pages, Sealed};
 use crate::settings::{self, Settings, SettingsLoad};
 use crate::update::Release;
@@ -321,8 +324,14 @@ pub trait BackendApi: Send + Sync {
     fn set_workers(&self, workers: usize);
     /// Keepalive (seconds, `10..=300`) of the SSH and FTP connections made from now on.
     fn set_keepalive(&self, secs: u64);
-    /// The master switch of Settings › Agents (MCP): whether agents may connect.
+    /// The master switch of Settings › Agents (MCP): whether agents may connect. A
+    /// `settings.toml` saved afterwards sets it too (the stored setting wins).
     async fn set_agents_enabled(&self, on: bool);
+    /// What the agent side reports (relays connected, the channel's state, the sites an
+    /// agent holds), for the UI's subscription. Only the first call gets it.
+    // TODO(Task 14): remove
+    #[allow(dead_code)]
+    fn agent_events(&self) -> Option<mpsc::UnboundedReceiver<AgentEvent>>;
 
     /// The latest stable release (the update check). `update-dev-build` in a debug build
     /// without `HOPRS_UPDATE_URL` (see [`http::api_url`]).
@@ -571,9 +580,11 @@ pub struct Backend {
     /// follows it.
     agents: tokio::sync::watch::Sender<bool>,
     /// What the agent service works through (see [`agent`]).
-    // TODO(Task 12): remove
-    #[allow(dead_code)]
     agent: Arc<agent::RealHost>,
+    /// The agent channel's server; `None` only while [`Backend::open`] builds it.
+    agent_server: Option<AgentServer>,
+    /// The agent side's events, until the UI takes them.
+    agent_events: Mutex<Option<mpsc::UnboundedReceiver<AgentEvent>>>,
 }
 
 impl Backend {
@@ -627,7 +638,12 @@ impl Backend {
             agents.subscribe(),
             fixed,
         ));
-        Ok(Backend {
+        let channel = config
+            .agent_dir
+            .as_deref()
+            .map(crate::agent::channel::endpoint_in);
+        let (agent_tx, agent_rx) = mpsc::unbounded_channel();
+        let mut backend = Backend {
             edits: EditManager::new(config.edit_dir, config.recovered_dir),
             profile_dir: config.profile_dir,
             settings_path,
@@ -643,12 +659,22 @@ impl Backend {
             drive: Arc::new(Drive::new(Arc::new(MemoryStore::new()))),
             agents,
             agent,
-        })
+            agent_server: None,
+            agent_events: Mutex::new(Some(agent_rx)),
+        };
+        // Its own task: the channel is opened there (never on this thread) when the
+        // switch is on.
+        let service = Service::new(backend.agent_host(), Limits::default(), agent_tx.clone());
+        backend.agent_server = Some(AgentServer::start(
+            service,
+            channel,
+            backend.agents.subscribe(),
+            agent_tx,
+        ));
+        Ok(backend)
     }
 
     /// The agent service's host over this backend.
-    // TODO(Task 12): remove
-    #[allow(dead_code)]
     pub fn agent_host(&self) -> Arc<agent::RealHost> {
         self.agent.clone()
     }
@@ -775,6 +801,11 @@ impl BackendApi for Backend {
     async fn shutdown(&self) {
         // Local and fast first: whatever is unsent is safe before any slow step.
         self.edits.preserve_unsent().await;
+        // The relays are told hoprs quits and their calls dropped, so nothing of an
+        // agent holds a session or a connection attempt when they close.
+        if let Some(server) = &self.agent_server {
+            server.shutdown().await;
+        }
         self.engine.clone().shutdown().await;
         self.sessions.close_all().await;
         // The close flow settled the edits it knew of; anything unsent since is kept as a
@@ -1088,9 +1119,16 @@ impl BackendApi for Backend {
         self.queue_error.clone()
     }
 
+    /// Once the file is written, its `agents_enabled` is the master switch: the stored
+    /// setting wins over a [`set_agents_enabled`](BackendApi::set_agents_enabled) that
+    /// reached the backend out of order.
     async fn save_settings(&self, settings: Settings) -> Result<()> {
         let path = self.settings_path.clone();
-        blocking(move || settings::save(&path, &settings)).await
+        let agents = settings.agents_enabled;
+        blocking(move || settings::save(&path, &settings)).await?;
+        self.agents
+            .send_if_modified(|on| std::mem::replace(on, agents) != agents);
+        Ok(())
     }
 
     async fn set_policy(&self, policy: ConflictPolicy) {
@@ -1099,6 +1137,13 @@ impl BackendApi for Backend {
 
     async fn set_agents_enabled(&self, on: bool) {
         self.agents.send_replace(on);
+    }
+
+    fn agent_events(&self) -> Option<mpsc::UnboundedReceiver<AgentEvent>> {
+        self.agent_events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     fn set_workers(&self, workers: usize) {
@@ -1238,6 +1283,10 @@ mod tests {
     }
 
     fn open(dir: &Path) -> Backend {
+        open_with_agents(dir, None)
+    }
+
+    fn open_with_agents(dir: &Path, agent_dir: Option<PathBuf>) -> Backend {
         let config = BackendConfig {
             profile_dir: dir.join("profiles"),
             queue_path: Some(dir.join("data").join("queue.db")),
@@ -1245,7 +1294,7 @@ mod tests {
             backup_params: CHEAP_BACKUP,
             edit_dir: dir.join("edit"),
             recovered_dir: dir.join("recovered"),
-            agent_dir: None,
+            agent_dir,
         };
         Backend::open(config, Arc::new(MemoryStore::new())).unwrap()
     }
@@ -1268,6 +1317,127 @@ mod tests {
         // No file: off.
         let other = tempfile::tempdir().unwrap();
         assert!(!*open(other.path()).agents.borrow());
+    }
+
+    /// A relay of the real backend, its channel in a temporary directory.
+    struct Relay {
+        reader: tokio::io::BufReader<tokio::io::ReadHalf<crate::agent::channel::Stream>>,
+        writer: tokio::io::WriteHalf<crate::agent::channel::Stream>,
+    }
+
+    impl Relay {
+        /// Connects (waiting for the channel: `Backend::open` returns before it exists)
+        /// and says its hello.
+        async fn connect(endpoint: &crate::agent::channel::Endpoint) -> Relay {
+            let start = tokio::time::Instant::now();
+            let stream = loop {
+                match crate::agent::channel::connect(endpoint).await {
+                    Ok(stream) => break stream,
+                    Err(err) => {
+                        assert!(start.elapsed() < LINE_WAIT, "no channel: {err}");
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            };
+            let (read, writer) = tokio::io::split(stream);
+            let mut relay = Relay {
+                reader: tokio::io::BufReader::new(read),
+                writer,
+            };
+            let version = env!("CARGO_PKG_VERSION");
+            relay
+                .send(&format!(r#"{{"hoprs_agent":1,"version":"{version}"}}"#))
+                .await;
+            assert_eq!(
+                relay.line().await.as_deref(),
+                Some(format!(r#"{{"hello":"ok","version":"{version}"}}"#).as_str())
+            );
+            relay
+        }
+
+        async fn send(&mut self, line: &str) {
+            use tokio::io::AsyncWriteExt;
+            self.writer
+                .write_all(format!("{line}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+
+        /// The next line; `None` at the end.
+        async fn line(&mut self) -> Option<String> {
+            tokio::time::timeout(LINE_WAIT, crate::agent::proto::read_line(&mut self.reader))
+                .await
+                .expect("a line in time")
+                .ok()
+                .flatten()
+        }
+    }
+
+    const LINE_WAIT: Duration = Duration::from_secs(10);
+
+    /// The master switch from `settings.toml` opens the channel, a relay's call goes
+    /// through the real host, turning it off says so; a saved settings file is the
+    /// switch too, and quitting says goodbye.
+    #[tokio::test]
+    async fn agent_channel_follows_the_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = dir.path().join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(
+            profiles.join(settings::FILE_NAME),
+            "agents_enabled = true\n",
+        )
+        .unwrap();
+        let agent_dir = dir.path().join("run");
+        let backend = open_with_agents(dir.path(), Some(agent_dir.clone()));
+        let mut events = backend.agent_events().unwrap();
+        let endpoint = crate::agent::channel::endpoint_in(&agent_dir);
+
+        let mut relay = Relay::connect(&endpoint).await;
+        relay
+            .send(r#"{"call":1,"tool":"list_sites","args":{}}"#)
+            .await;
+        assert_eq!(
+            relay.line().await.as_deref(),
+            Some(r#"{"reply":1,"ok":true,"blocks":["{\"sites\":[]}"]}"#)
+        );
+        backend.set_agents_enabled(false).await;
+        assert_eq!(relay.line().await.as_deref(), Some(r#"{"bye":"off"}"#));
+        assert_eq!(relay.line().await, None);
+        let mut seen = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(200), events.recv()).await
+        {
+            seen.push(event);
+        }
+        assert!(seen.contains(&AgentEvent::Channel(None)), "{seen:?}");
+        assert!(seen.contains(&AgentEvent::Relays(1)), "{seen:?}");
+        assert_eq!(seen.last(), Some(&AgentEvent::Relays(0)), "{seen:?}");
+
+        // The stored setting is the switch: saved on, the channel opens again.
+        let on = Settings {
+            agents_enabled: true,
+            ..Settings::default()
+        };
+        backend.save_settings(on).await.unwrap();
+        let mut relay = Relay::connect(&endpoint).await;
+        backend.shutdown().await;
+        assert_eq!(relay.line().await.as_deref(), Some(r#"{"bye":"quit"}"#));
+        assert_eq!(relay.line().await, None);
+    }
+
+    #[tokio::test]
+    async fn agent_events_are_handed_out_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = open(dir.path());
+        assert!(backend.agent_events().is_some());
+        assert!(backend.agent_events().is_none());
+
+        let fake = fake::FakeBackend::new();
+        let mut events = fake.agent_events().unwrap();
+        assert!(fake.agent_events().is_none());
+        fake.push_agent_event(AgentEvent::Relays(2));
+        assert_eq!(events.recv().await, Some(AgentEvent::Relays(2)));
     }
 
     /// A debug build without `HOPRS_UPDATE_URL` never reaches the network: both update

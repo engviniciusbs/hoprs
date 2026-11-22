@@ -2,9 +2,11 @@
 //! the limits on it. Nothing here imports iced: the window only shows what this module
 //! reports.
 
+pub mod channel;
 pub mod host;
 pub mod paths;
 pub mod proto;
+pub mod server;
 pub mod service;
 #[cfg(test)]
 pub mod testing;
@@ -20,16 +22,12 @@ use crate::backend::SessionId;
 #[derive(Clone, Debug, PartialEq)]
 pub enum AgentEvent {
     /// How many relays (`hoprs mcp` processes) are connected now.
-    // TODO(Task 12): remove
-    #[allow(dead_code)]
     Relays(usize),
     /// The sites whose session only an agent uses, sorted.
     Sites(Vec<SiteId>),
     /// A session an agent asked for is up.
     Connected(SessionId),
     /// The channel could not start (`Some`), or started after a failure (`None`).
-    // TODO(Task 12): remove
-    #[allow(dead_code)]
     Channel(Option<Error>),
 }
 
@@ -52,22 +50,14 @@ pub const PROMPT_WAIT: Duration = Duration::from_secs(120);
 /// An agent-only session closes after this long without a call.
 pub const IDLE_CLOSE: Duration = Duration::from_secs(10 * 60);
 /// How often the idle sessions are looked for.
-// TODO(Task 12): remove
-#[allow(dead_code)]
 pub const REAP_EVERY: Duration = Duration::from_secs(30);
 /// The most failed items a transfer summary names.
 pub const FAILED_LISTED: usize = 20;
 /// Calls in flight per relay; the next ones wait.
-// TODO(Task 12): remove
-#[allow(dead_code)]
 pub const MAX_IN_FLIGHT: usize = 8;
 /// Relays connected at once; one more is refused at the hello.
-// TODO(Task 12): remove
-#[allow(dead_code)]
 pub const MAX_RELAYS: usize = 16;
 /// A relay's hello must arrive within this.
-// TODO(Task 12): remove
-#[allow(dead_code)]
 pub const HELLO_WAIT: Duration = Duration::from_secs(5);
 
 /// The limits the agent service applies, as a value so tests can shorten them.

@@ -918,6 +918,7 @@ error-session-closed = Session closed
 error-session-shell-closed = Shell closed
 error-session-terminal-needs-ssh = Terminals need an SSH site
 error-agent-protected-path = Protected path: { $path }
+error-agent-channel-failed = Could not open the channel for agents
 error-fs-already-exists = Already exists
 error-edit-unknown = No such edit
 error-edit-only-files = Only files can be edited

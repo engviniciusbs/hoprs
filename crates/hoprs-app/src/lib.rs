@@ -71,20 +71,25 @@ pub fn run() -> iced::Result {
     init_logging(&filter, log.clone());
     tracing::info!("{}", renderer.0);
 
-    let _instance = match acquire_first_instance_lock(&instance_lock_paths()) {
-        Ok(Some(lock)) => Some(lock),
+    let (_instance, lock_dir) = match acquire_first_instance_lock(&instance_lock_paths()) {
+        Ok(Some((lock, dir))) => (Some(lock), Some(dir)),
         Ok(None) => {
             println!("{}", ui::strings::already_running());
             std::process::exit(0);
         }
         Err(err) => {
-            // No usable location at all: start anyway, unprotected.
+            // No usable location at all: start anyway, unprotected (and without the
+            // agent channel, which lives beside the lock).
             tracing::warn!(%err, "could not take the single-instance lock anywhere");
-            None
+            (None, None)
         }
     };
+    // The agent channel's directory: the one this run locked (a debug build may name
+    // another with HOPRS_AGENT_DIR).
+    let agent_dir = agent::channel::override_dir().or(lock_dir);
 
-    iced::application(move || boot(log.clone(), probe), update, view)
+    let start = move || boot(log.clone(), probe, agent_dir.clone());
+    iced::application(start, update, view)
         .subscription(subscription)
         .title(ui::strings::app_title())
         .theme(|_: &Hoprs| ui::theme::theme())
@@ -142,8 +147,12 @@ enum Root {
     Probe(probe::Step),
 }
 
-fn boot(log: logbuf::LogBuffer, probe: Option<probe::Probe>) -> (Hoprs, Task<Root>) {
-    let backend = match open_backend() {
+fn boot(
+    log: logbuf::LogBuffer,
+    probe: Option<probe::Probe>,
+    agent_dir: Option<PathBuf>,
+) -> (Hoprs, Task<Root>) {
+    let backend = match open_backend(agent_dir) {
         Ok(backend) => backend,
         Err(err) => {
             // No profiles, no app: there is nothing to show yet without them.
@@ -170,15 +179,17 @@ fn boot(log: logbuf::LogBuffer, probe: Option<probe::Probe>) -> (Hoprs, Task<Roo
     )
 }
 
-/// The real backend at the standard locations, secrets in the system keyring.
-fn open_backend() -> hoprs_core::Result<Backend> {
-    let config = BackendConfig::standard().ok_or_else(|| {
+/// The real backend at the standard locations, secrets in the system keyring, the agent
+/// channel in `agent_dir` (none without it).
+fn open_backend(agent_dir: Option<PathBuf>) -> hoprs_core::Result<Backend> {
+    let mut config = BackendConfig::standard().ok_or_else(|| {
         hoprs_core::Error::coded(
             hoprs_core::ErrorKind::Io,
             "app-no-config-dir",
             "No configuration directory",
         )
     })?;
+    config.agent_dir = agent_dir;
     let keyring = Arc::new(LazyKeyringStore::new());
     Ok(Backend::open(config, keyring.clone())?.with_app_secrets(keyring))
 }
@@ -336,8 +347,8 @@ impl std::hash::Hash for TransferFeed {
 }
 
 /// Where the lock may live, in order: `$XDG_RUNTIME_DIR/hoprs/`, the
-/// config directory, the temp directory.
-fn instance_lock_paths() -> Vec<PathBuf> {
+/// config directory, the temp directory. The agent channel lives beside it.
+pub(crate) fn instance_lock_paths() -> Vec<PathBuf> {
     [
         dirs::runtime_dir(),
         dirs::config_dir(),
@@ -349,14 +360,17 @@ fn instance_lock_paths() -> Vec<PathBuf> {
     .collect()
 }
 
-/// Takes the lock at the first location that works. A location that fails
-/// (can't be created, opened or locked) falls through to the next one;
-/// one held by another instance stops the search with `Ok(None)`.
-fn acquire_first_instance_lock(paths: &[PathBuf]) -> io::Result<Option<File>> {
+/// Takes the lock at the first location that works, and says in which directory. A
+/// location that fails (can't be created, opened or locked) falls through to the next
+/// one; one held by another instance stops the search with `Ok(None)`.
+fn acquire_first_instance_lock(paths: &[PathBuf]) -> io::Result<Option<(File, PathBuf)>> {
     let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no lock location");
     for path in paths {
         match acquire_instance_lock(path) {
-            Ok(lock) => return Ok(lock),
+            Ok(lock) => {
+                let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+                return Ok(lock.map(|file| (file, dir)));
+            }
             Err(err) => {
                 tracing::warn!(%err, path = %path.display(), "lock location unusable; trying the next");
                 last_err = err;
@@ -722,6 +736,21 @@ mod tests {
 
         // Every location broken: the error is reported.
         assert!(acquire_first_instance_lock(&candidates[..1]).is_err());
+    }
+
+    #[test]
+    fn the_lock_reports_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        fs::write(&blocker, b"").unwrap();
+        let usable = dir.path().join("config").join("hoprs");
+        let candidates = [
+            blocker.join("hoprs").join("instance.lock"),
+            usable.join("instance.lock"),
+            dir.path().join("later").join("hoprs").join("instance.lock"),
+        ];
+        let (_lock, locked_in) = acquire_first_instance_lock(&candidates).unwrap().unwrap();
+        assert_eq!(locked_in, usable, "the directory of the first usable path");
     }
 
     #[test]
