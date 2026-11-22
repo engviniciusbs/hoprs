@@ -28,3 +28,11 @@ Out of scope: vulnerabilities in the servers you connect to, and the known, docu
 choices (plain FTP is allowed and labelled unencrypted; the macOS and Windows builds are
 not code-signed yet). The test keys and certificates under `docker/fixtures/` and
 `crates/*/tests/fixtures/` exist only for the test servers and protect nothing.
+
+## The channel for agents
+
+With Settings › Agents (MCP) on, hoprs listens on a local socket (`agent.sock`; a named pipe
+on Windows) that admits the same user only. Any program running as that user can connect and
+use the sites whose level allows it, which is the bar the app accepts: such a program can
+already read `sites.toml` and ask the keyring. That is why the switch is off by default and
+why each site starts at "No access". Nothing listens on the network.

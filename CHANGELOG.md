@@ -8,6 +8,16 @@ You can export one site or one workspace, not only everything.
 - One export screen for all three: a title that names what is exported, a File field that starts as `hoprs-<name>-<date>.hoprs` (`hoprs-backup-<date>.hoprs` for everything), the password typed twice, and a question before overwriting a file you typed the path of.
 - A file of one site or one workspace holds that site or workspace, the sites in it and their passwords. It restores with **Merge** only; Replace is refused with "This file holds only part of a backup. Restore it with Merge." hoprs 1.5.0 and older answer "Unsupported backup version" to it. A file of everything is unchanged and restores on every version.
 
+Coding agents can work on your saved sites.
+
+- `hoprs mcp` is an MCP server that Claude Code and any other MCP client can start. Settings › Agents (MCP) turns it on (off by default) and shows the command to register it, `claude mcp add hoprs -- "<path to hoprs>" mcp`, and a JSON snippet for other clients. hoprs must be open: the program talks to the running window, which keeps the passwords.
+- Each site has a level in its form: **No access** (the default for every site, existing ones included), **Allow reading** (list, stat, read a text file, download) or **Allow everything** (also write, make folders, rename, change permissions, upload, delete, and run a command on SSH sites). An agent cannot see a site with no access, or tell it exists. A backup, a partial export and the FileZilla import never carry or set the level.
+- Agents cannot see passwords, passphrases or key files, answer a host-key, certificate or password question (it appears in the hoprs window, marked "An agent asked for this connection."), change their own access, manage sites or settings, or transfer to or from hoprs's own files, `~/.ssh` or a site's key file.
+- What you see: an "Agent connected" indicator in the status bar, an "agent" tag on its transfers in the queue, "Connected (by an agent)" on the site in the sidebar, and one line in the log per action (the command line included; never file content or command output). Turning the switch off closes agent sessions at once.
+- The channel is local: a socket (`agent.sock`) or, on Windows, a named pipe, open to your user only and only while the switch is on. Nothing listens on the network.
+- An agent can be misled by what it reads, and hoprs does not review its actions: keep production sites on "Allow reading" unless the agent really must change them.
+- A queue file written by this version is refused by hoprs 1.5.0 and older, which then run on an empty in-memory queue.
+
 ## 1.5.0 — 2026-11-18
 
 hoprs speaks Turkish.

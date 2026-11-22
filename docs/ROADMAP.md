@@ -4,7 +4,8 @@ What is planned, roughly in order, and where help is most welcome. Plans change;
 [issues](https://github.com/engviniciusbs/hoprs/issues) and
 [discussions](https://github.com/engviniciusbs/hoprs/discussions) are where they get decided.
 Released work is in the [CHANGELOG](../CHANGELOG.md): 1.6.0 (coming) adds the export of one
-site or one workspace, as a partial file that restores with Merge; 1.5.0 (2026-11-18) added the app in
+site or one workspace, as a partial file that restores with Merge, and an MCP server so coding
+agents can work on the sites you allow (`hoprs mcp`, a level per site); 1.5.0 (2026-11-18) added the app in
 Turkish (a contributed translation); 1.4.0 (2026-11-17) added the update
 notice (a card and a footer line when a new version is out; Update downloads, verifies and
 opens the system installer); 1.3.1 (2026-11-16) made workspaces
@@ -21,6 +22,8 @@ or missing on each side and transfers only the difference).
 
 ## Later
 
+- **More for agents:** an interactive terminal and folder compare for agents; finer limits than
+  the site (folders, commands); a headless mode that works without the window.
 - **Export to one of your own sites** (upload the encrypted file over SFTP or FTP).
 - **Import `~/.ssh/config`:** hosts, users, ports, identity files.
 - **Jump hosts (`ProxyJump`)** for servers behind a bastion.
