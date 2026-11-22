@@ -68,6 +68,12 @@ impl Service {
     /// The text of `offset .. offset + length` (ruling 10): `stat` first, then at most
     /// the range is read (a large file is never loaded whole). Bytes of a character cut
     /// by either end of the range are left out, and the header says what was returned.
+    ///
+    /// A regular file whose size is 0 may not be empty (`/proc` and `/sys` files say 0
+    /// over SFTP): it is read up to the cap, and the end is where the bytes stop. A
+    /// symbolic link at the end of the path is refused: `RemoteFs` has no way to find
+    /// its target, and SFTP's `open_read` refuses anything but a regular file. A link in
+    /// the middle of the path is the server's to follow.
     pub(super) async fn read_file(
         &self,
         site: &Site,
@@ -81,7 +87,7 @@ impl Service {
             .await
             .map_err(|e| failed(&format!("Could not read {path}"), &e))?;
         let max = self.limits.file_max as u64;
-        // A link's own size says nothing of its target's: read up to the cap and see.
+        // The size, when the `stat` can be trusted with it.
         let known = match found.kind {
             EntryKind::Dir => {
                 return Err(Failure::new(
@@ -91,10 +97,18 @@ impl Service {
                     "a folder",
                 ));
             }
+            EntryKind::Symlink => {
+                return Err(Failure::new(
+                    format!(
+                        "{path} is a symbolic link, and read_file does not follow a link at the end of a path. Read the file it points to by that file's own path (on an SSH site that allows everything, run_command with readlink -f {path} shows it). A link in the middle of a path is followed."
+                    ),
+                    "a symbolic link",
+                ));
+            }
+            EntryKind::File if found.size == 0 => None,
             EntryKind::File => Some(found.size),
-            EntryKind::Symlink => None,
         };
-        // How many bytes to ask for, and whether that is the end of the file.
+        // How many bytes to ask for.
         let want = match known {
             Some(size) if offset >= size => 0,
             Some(size) => {
@@ -106,7 +120,7 @@ impl Service {
                 want
             }
             // One byte over the cap tells a range that is too long.
-            None => length.unwrap_or(u64::MAX).min(max + 1),
+            None => length.unwrap_or(u64::MAX).min(max.saturating_add(1)),
         };
         let mut bytes = Vec::new();
         if want > 0 {
@@ -129,8 +143,8 @@ impl Service {
             ));
         }
         let got = bytes.len() as u64;
-        let end = offset + got;
-        // The end of the file: past the known size, or fewer bytes than asked for.
+        let end = offset.saturating_add(got);
+        // The end of the file: the known size reached, or fewer bytes than asked for.
         let eof = match known {
             Some(size) => end >= size,
             None => got < length.unwrap_or(u64::MAX),
@@ -143,7 +157,7 @@ impl Service {
                 "not UTF-8 text",
             )
         })?;
-        let start = offset + skipped as u64;
+        let start = offset.saturating_add(skipped as u64);
         let returned = text.len() as u64;
         let size = known.or(eof.then_some(end));
         let header = json!({
@@ -151,7 +165,7 @@ impl Service {
             "size": size,
             "offset": start,
             "length": returned,
-            "next_offset": start + returned,
+            "next_offset": start.saturating_add(returned),
             // A cut at the end happens only before the end of the file.
             "eof": eof,
         });

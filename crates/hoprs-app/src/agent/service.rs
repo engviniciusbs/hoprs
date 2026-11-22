@@ -12,19 +12,22 @@
 //!
 //! **Connections.** A site whose session is not up is connected through the host, for
 //! at most [`Limits::prompt_wait`]: the user may have to answer a dialog, the agent never
-//! does. A failed or timed-out attempt closes the session if only an agent used it
+//! does. Calls that need the same site at the same time wait on one attempt. A failed or timed-out attempt closes the session if only an agent used it
 //! (which withdraws its dialogs), and the agent gets a fixed sentence per kind of
 //! failure, never the error's own text (an authentication error can name a key file).
 //!
 //! **Idle sessions.** [`Service::reap`] closes an agent-only session whose site is no
-//! longer open to agents, or that had no call for [`Limits::idle_close`], unless the site
-//! has an unfinished transfer.
+//! longer open to agents, or whose last call ended more than [`Limits::idle_close`] ago,
+//! unless the site has a call running (calls already running finish) or an unfinished
+//! transfer.
 //!
 //! **The log.** One INFO line per call under the target `agent`, written when the call
 //! ends: the action, the path, the site's name and the outcome. Never file content, an
 //! error's detail, or anything about a site the call could not use. Control characters
-//! become spaces, so one call is one line. A call whose task is dropped (the agent
-//! cancelled it) writes no line.
+//! become spaces (so do line separators and bidirectional controls), so one call is one
+//! line that reads in order. A call dropped after its access check (the agent cancelled
+//! it) writes its line then, ending in `(cancelled)`: whatever it already did is on
+//! record.
 //!
 //! All the work goes through [`AgentHost`], and no lock is held across an await.
 
@@ -34,6 +37,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
+use futures_util::FutureExt;
+use futures_util::future::{BoxFuture, Shared};
 use hoprs_core::{AgentAccess, Error, ErrorKind, PathError, Protocol, RemotePath, Site, SiteId};
 use hoprs_remote::RemoteFs;
 use serde::Deserialize;
@@ -60,8 +65,62 @@ pub struct Service {
     host: Arc<dyn AgentHost>,
     limits: Limits,
     events: mpsc::UnboundedSender<AgentEvent>,
-    /// When each site last had a call that passed its access check (for the reaper).
-    last_call: Mutex<HashMap<SiteId, Instant>>,
+    /// The calls running on each site and when the last one ended (for the reaper).
+    activity: Mutex<Activity>,
+    /// The connection attempts under way, shared by the calls that wait on them.
+    connecting: Mutex<HashMap<SiteId, Attempt>>,
+    /// The last [`AgentEvent::Sites`] sent.
+    sites_sent: Mutex<Option<Vec<SiteId>>>,
+}
+
+/// One connection attempt, awaited by every call that needs its site meanwhile.
+type Attempt = Shared<BoxFuture<'static, Result<SessionId, Error>>>;
+
+#[derive(Default)]
+struct Activity {
+    /// Calls past their access check and not ended, per site.
+    running: HashMap<SiteId, usize>,
+    /// When the site's last call ended.
+    ended: HashMap<SiteId, Instant>,
+}
+
+/// A call admitted on a site, from its check until it ends or is dropped. While one
+/// lives the reaper leaves the site alone; when it ends the site's idle time starts. If
+/// it is dropped while `pending` holds its log line (the call never ended), the line is
+/// written with `(cancelled)`.
+struct Running<'a> {
+    service: &'a Service,
+    site: SiteId,
+    pending: Option<String>,
+}
+
+impl<'a> Running<'a> {
+    fn start(service: &'a Service, site: &SiteId) -> Running<'a> {
+        *service.activity().running.entry(site.clone()).or_default() += 1;
+        Running {
+            service,
+            site: site.clone(),
+            pending: None,
+        }
+    }
+}
+
+impl Drop for Running<'_> {
+    fn drop(&mut self) {
+        {
+            let mut activity = self.service.activity();
+            if let Some(n) = activity.running.get_mut(&self.site) {
+                *n = n.saturating_sub(1);
+                if *n == 0 {
+                    activity.running.remove(&self.site);
+                }
+            }
+            activity.ended.insert(self.site.clone(), Instant::now());
+        }
+        if let Some(line) = self.pending.take() {
+            log(&format!("{line} (cancelled)"));
+        }
+    }
 }
 
 /// A call that failed after its access check: the agent's text, and the outcome the log
@@ -180,7 +239,9 @@ impl Service {
             host,
             limits,
             events,
-            last_call: Mutex::default(),
+            activity: Mutex::default(),
+            connecting: Mutex::default(),
+            sites_sent: Mutex::default(),
         })
     }
 
@@ -190,13 +251,14 @@ impl Service {
     #[allow(dead_code)]
     pub async fn call(&self, tool: &str, args: Value) -> Reply {
         let (reply, line) = self.run(tool, args).await;
-        tracing::info!(target: "agent", "{}", printable(&line));
+        log(&line);
         reply
     }
 
     /// Closes the agent-only sessions whose site is gone or no longer open to agents, or
-    /// that had no call for `limits.idle_close` (or never had one), except while the site
-    /// has an unfinished transfer; then tells which sites still hold one.
+    /// whose last call ended `limits.idle_close` ago (or that never had one), except
+    /// while the site has a call running or an unfinished transfer; then tells which
+    /// sites still hold one (when that changed).
     // TODO(Task 12): remove
     #[allow(dead_code)]
     pub async fn reap(&self) {
@@ -211,34 +273,43 @@ impl Service {
             {
                 continue;
             }
+            let idle = {
+                let activity = self.activity();
+                if activity.running.contains_key(&id) {
+                    continue;
+                }
+                activity
+                    .ended
+                    .get(&id)
+                    .is_none_or(|at| now.duration_since(*at) >= self.limits.idle_close)
+            };
             let open = sites
                 .iter()
                 .any(|s| s.id == id && s.agent_access != AgentAccess::None);
-            let idle = self
-                .last_call()
-                .get(&id)
-                .is_none_or(|at| now.duration_since(*at) >= self.limits.idle_close);
             if !open || idle {
                 self.host.close_agent_session(&id).await;
             }
         }
-        self.last_call()
+        self.activity()
+            .ended
             .retain(|_, at| now.duration_since(*at) < self.limits.idle_close);
-        self.send(AgentEvent::Sites(self.host.agent_sites()));
+        self.send_sites();
     }
 
     /// The call's reply and its log line (see the module docs for the order).
     async fn run(&self, tool: &str, args: Value) -> (Reply, String) {
-        let Some(spec) = tools::find(tool) else {
-            let name: String = tool.chars().take(64).collect();
-            return refused(
-                &name,
-                Refusal {
-                    text: format!("Unknown tool: {tool}"),
-                    reason: "unknown tool",
-                },
-            );
-        };
+        match tools::find(tool) {
+            Some(spec) => self.run_spec(spec, args).await,
+            // The line says nothing the agent chose.
+            None => (
+                Reply::Err(format!("Unknown tool: {tool}")),
+                "refused an unknown tool".to_owned(),
+            ),
+        }
+    }
+
+    /// A call of the tool `spec`.
+    async fn run_spec(&self, spec: &ToolSpec, args: Value) -> (Reply, String) {
         if !self.host.enabled() {
             return refused(
                 spec.name,
@@ -260,12 +331,18 @@ impl Service {
                 );
             }
         };
-        let site = match args.site() {
-            None => None,
-            Some(id) => match self.admit(spec, id).await {
+        // The table says whether the call needs a site, not the arguments: a tool that
+        // needs one and comes without it is refused like a site that is not open.
+        let site = if spec.need == Need::Nothing {
+            None
+        } else {
+            let Some(id) = args.site() else {
+                return refused(spec.name, unavailable());
+            };
+            match self.admit(spec, id).await {
                 Ok(site) => Some(site),
                 Err(refusal) => return refused(spec.name, refusal),
-            },
+            }
         };
         match (site, args) {
             (None, Args::ListSites) => self.list_sites().await,
@@ -288,10 +365,7 @@ impl Service {
             .into_iter()
             .find(|s| s.id.0 == id && s.agent_access != AgentAccess::None)
         else {
-            return Err(Refusal {
-                text: SITE_UNAVAILABLE.to_owned(),
-                reason: "site not available",
-            });
+            return Err(unavailable());
         };
         let needs_all = matches!(spec.need, Need::All | Need::AllSsh);
         if needs_all && !site.agent_access.allows(AgentAccess::All) {
@@ -324,27 +398,26 @@ impl Service {
                 );
             }
         };
-        self.touch(&site.id);
-        let (action, result) = match (args, path) {
-            (Args::List(a), Some(path)) => (
-                format!("listed {path}"),
-                self.list_directory(site, &path, a.offset, a.limit).await,
-            ),
-            (Args::Stat(_), Some(path)) => {
-                (format!("described {path}"), self.stat(site, &path).await)
-            }
-            (Args::Read(a), Some(path)) => (
-                format!("read {path}"),
-                self.read_file(site, &path, a.offset, a.length).await,
-            ),
-            _ => (
-                spec.name.to_owned(),
-                Err(Failure::new(not_yet(spec), "not available in this version")),
-            ),
+        let mut running = Running::start(self, &site.id);
+        let action = match (&args, &path) {
+            (Args::List(_), Some(path)) => format!("listed {path}"),
+            (Args::Stat(_), Some(path)) => format!("described {path}"),
+            (Args::Read(_), Some(path)) => format!("read {path}"),
+            _ => spec.name.to_owned(),
         };
-        // A long call is not idle while it runs.
-        self.touch(&site.id);
         let done = format!("{action} on \"{}\"", site.name);
+        running.pending = Some(done.clone());
+        let result = match (args, path) {
+            (Args::List(a), Some(path)) => {
+                self.list_directory(site, &path, a.offset, a.limit).await
+            }
+            (Args::Stat(_), Some(path)) => self.stat(site, &path).await,
+            (Args::Read(a), Some(path)) => self.read_file(site, &path, a.offset, a.length).await,
+            _ => Err(Failure::new(not_yet(spec), "not available in this version")),
+        };
+        // It ended: the caller writes its line.
+        running.pending = None;
+        drop(running);
         match result {
             Ok(blocks) => (Reply::Ok(blocks), done),
             Err(failure) => (
@@ -410,15 +483,30 @@ impl Service {
         if let Some(session) = self.host.connected(&site.id) {
             return Ok(session);
         }
-        match tokio::time::timeout(self.limits.prompt_wait, self.host.connect(&site.id)).await {
+        let attempt = self.attempt(&site.id);
+        let outcome = tokio::time::timeout(self.limits.prompt_wait, attempt.clone()).await;
+        // The first waiter to come back retires the attempt: a later call starts anew.
+        let first = {
+            let mut connecting = self.connecting();
+            let ours = connecting
+                .get(&site.id)
+                .is_some_and(|current| current.ptr_eq(&attempt));
+            if ours {
+                connecting.remove(&site.id);
+            }
+            ours
+        };
+        match outcome {
             Ok(Ok(session)) => {
-                self.send(AgentEvent::Connected(session));
-                self.send(AgentEvent::Sites(self.host.agent_sites()));
+                if first {
+                    self.send(AgentEvent::Connected(session));
+                }
+                self.send_sites();
                 Ok(session)
             }
-            Ok(Err(failure)) => {
+            Ok(Err(error)) => {
                 self.close_agent_session(&site.id).await;
-                Err(connect_failure(site, &failure.error))
+                Err(connect_failure(site, &error))
             }
             Err(_) => {
                 // Read before the close, which withdraws the dialog.
@@ -442,26 +530,65 @@ impl Service {
         }
     }
 
+    /// The attempt under way for the site, or a new one (started when first awaited).
+    fn attempt(&self, site: &SiteId) -> Attempt {
+        self.connecting()
+            .entry(site.clone())
+            .or_insert_with(|| {
+                let host = self.host.clone();
+                let site = site.clone();
+                async move { host.connect(&site).await.map_err(|failure| failure.error) }
+                    .boxed()
+                    .shared()
+            })
+            .clone()
+    }
+
     /// Closes the site's session if only an agent uses it (a tab's is left alone).
     async fn close_agent_session(&self, site: &SiteId) {
         if self.host.close_agent_session(site).await {
-            self.send(AgentEvent::Sites(self.host.agent_sites()));
+            self.send_sites();
         }
     }
 
-    fn touch(&self, site: &SiteId) {
-        self.last_call().insert(site.clone(), Instant::now());
+    /// [`AgentEvent::Sites`], when the list changed since the last one sent.
+    fn send_sites(&self) {
+        let now = self.host.agent_sites();
+        let mut sent = lock(&self.sites_sent);
+        if sent.as_ref() != Some(&now) {
+            *sent = Some(now.clone());
+            self.send(AgentEvent::Sites(now));
+        }
     }
 
-    fn last_call(&self) -> MutexGuard<'_, HashMap<SiteId, Instant>> {
-        self.last_call
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+    fn activity(&self) -> MutexGuard<'_, Activity> {
+        lock(&self.activity)
+    }
+
+    fn connecting(&self) -> MutexGuard<'_, HashMap<SiteId, Attempt>> {
+        lock(&self.connecting)
     }
 
     fn send(&self, event: AgentEvent) {
         // No receiver (the window is gone): nothing to tell.
         let _ = self.events.send(event);
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Writes a call's one line.
+fn log(line: &str) {
+    tracing::info!(target: "agent", "{}", printable(line));
+}
+
+/// No such site, or one at "No access": one refusal.
+fn unavailable() -> Refusal {
+    Refusal {
+        text: SITE_UNAVAILABLE.to_owned(),
+        reason: "site not available",
     }
 }
 
@@ -620,10 +747,22 @@ fn span(time: Duration) -> String {
     }
 }
 
-/// `text` with control characters (newlines included) as spaces: one line.
+/// `text` with control characters (newlines included), line and paragraph separators
+/// and bidirectional controls as spaces: one line, in the order it was written.
 fn printable(text: &str) -> String {
     text.chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        .map(|c| {
+            let breaks = matches!(
+                c,
+                '\u{2028}'
+                    | '\u{2029}'
+                    | '\u{200e}'
+                    | '\u{200f}'
+                    | '\u{202a}'..='\u{202e}'
+                    | '\u{2066}'..='\u{2069}'
+            );
+            if c.is_control() || breaks { ' ' } else { c }
+        })
         .collect()
 }
 

@@ -1023,3 +1023,289 @@ fn calls_are_send() {
     let reap = fx.service.reap();
     send(&reap);
 }
+
+/// A call in flight keeps its site's session through the reaper, idle or not, open to
+/// agents or not; the idle time counts from the end of the last call.
+#[tokio::test(start_paused = true)]
+async fn reap_leaves_sites_with_calls_in_flight() {
+    let fx = fixture();
+    let minute = Duration::from_secs(60);
+    let hold = fx.host.hold(&fx.ssh.id, FsOp::List);
+    let running = tokio::spawn({
+        let service = fx.service.clone();
+        let args = json!({"site": fx.ssh.id.0, "path": "/var/www"});
+        async move { service.call("list_directory", args).await }
+    });
+    hold.entered().await;
+    tokio::time::advance(11 * minute).await;
+    fx.service.reap().await;
+    assert!(fx.host.closed().is_empty(), "idle, but a call runs");
+    fx.set_level(&fx.ssh, AgentAccess::None);
+    fx.service.reap().await;
+    assert!(fx.host.closed().is_empty(), "calls already running finish");
+    hold.release();
+    assert_eq!(names(&head(running.await.unwrap())), ["a.txt"]);
+    fx.service.reap().await;
+    assert_eq!(fx.host.closed(), std::slice::from_ref(&fx.ssh.id));
+
+    // A call that ran 11 minutes ended just now: not idle.
+    let hold = fx.host.hold(&fx.ftp.id, FsOp::List);
+    let running = tokio::spawn({
+        let service = fx.service.clone();
+        let args = json!({"site": fx.ftp.id.0, "path": "/"});
+        async move { service.call("list_directory", args).await }
+    });
+    hold.entered().await;
+    tokio::time::advance(11 * minute).await;
+    hold.release();
+    ok(running.await.unwrap());
+    fx.service.reap().await;
+    assert_eq!(fx.host.closed(), std::slice::from_ref(&fx.ssh.id));
+    tokio::time::advance(10 * minute).await;
+    fx.service.reap().await;
+    assert_eq!(fx.host.closed(), [fx.ssh.id.clone(), fx.ftp.id.clone()]);
+}
+
+/// A call dropped after its check writes its line, ending in "(cancelled)", and no
+/// longer counts as running.
+#[tokio::test]
+async fn a_cancelled_call_is_logged() {
+    let (logs, _guard) = capture_logs();
+    let fx = fixture();
+    let hold = fx.host.hold(&fx.ssh.id, FsOp::List);
+    let running = tokio::spawn({
+        let service = fx.service.clone();
+        let args = json!({"site": fx.ssh.id.0, "path": "/var/www"});
+        async move { service.call("list_directory", args).await }
+    });
+    hold.entered().await;
+    assert!(logs.agent_lines().is_empty());
+    running.abort();
+    assert!(running.await.unwrap_err().is_cancelled());
+    assert!(hold.dropped());
+    let lines = logs.agent_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].ends_with("listed /var/www on \"Acme\" (cancelled)"),
+        "{lines:?}"
+    );
+    assert!(fx.service.activity().running.is_empty());
+}
+
+/// Two calls on a site that is not connected wait on one attempt.
+#[tokio::test]
+async fn concurrent_calls_share_one_connection() {
+    let mut fx = fixture();
+    let hold = fx.host.hold_connect(&fx.ssh.id);
+    let spawn = |fx: &Fx| {
+        let service = fx.service.clone();
+        let args = json!({"site": fx.ssh.id.0, "path": "/var/www"});
+        tokio::spawn(async move { service.call("list_directory", args).await })
+    };
+    let first = spawn(&fx);
+    let second = spawn(&fx);
+    hold.entered().await;
+    for _ in 0..10 {
+        tokio::task::yield_now().await;
+    }
+    hold.release();
+    ok(first.await.unwrap());
+    ok(second.await.unwrap());
+    assert_eq!(fx.host.connects(&fx.ssh.id), 1);
+    let session = fx.host.connected(&fx.ssh.id).unwrap();
+    assert_eq!(
+        fx.events(),
+        [
+            AgentEvent::Connected(session),
+            AgentEvent::Sites(vec![fx.ssh.id.clone()])
+        ]
+    );
+}
+
+/// The switch turned off while a call runs: that call finishes, the next is refused.
+#[tokio::test]
+async fn switch_off_lets_the_running_call_finish() {
+    let fx = fixture();
+    let hold = fx.host.hold(&fx.ssh.id, FsOp::List);
+    let args = json!({"site": fx.ssh.id.0, "path": "/var/www"});
+    let running = tokio::spawn({
+        let service = fx.service.clone();
+        let args = args.clone();
+        async move { service.call("list_directory", args).await }
+    });
+    hold.entered().await;
+    fx.host.set_enabled(false);
+    hold.release();
+    assert_eq!(names(&head(running.await.unwrap())), ["a.txt"]);
+    assert_eq!(err(fx.call("list_directory", args).await), TURNED_OFF);
+}
+
+fn schema_without_site() -> Value {
+    json!({"type": "object", "properties": {
+        "remote_path": {"type": "string", "description": "x"},
+        "local_path": {"type": "string", "description": "x"},
+    }, "required": [], "additionalProperties": false})
+}
+
+/// Whether a call is checked against a site comes from the tool's need: a tool that
+/// needs a site and arrives without one is refused, whatever its schema says.
+#[tokio::test]
+async fn admission_follows_the_need_not_the_arguments() {
+    let (logs, _guard) = capture_logs();
+    let fx = fixture();
+    for need in [Need::Read, Need::All, Need::AllSsh] {
+        let spec = tools::ToolSpec {
+            name: "download",
+            title: "t",
+            description: "d",
+            schema: schema_without_site,
+            need,
+            read_only: false,
+            destructive: true,
+            idempotent: true,
+            open_world: true,
+        };
+        let (reply, line) = fx
+            .service
+            .run_spec(&spec, json!({"remote_path": "/a", "local_path": "/b"}))
+            .await;
+        assert_eq!(err(reply), SITE_UNAVAILABLE, "{need:?}");
+        assert_eq!(line, "refused download: site not available");
+    }
+    assert!(logs.agent_lines().is_empty(), "run_spec does not log");
+    assert!(fx.host.agent_sites().is_empty());
+}
+
+/// `/proc` files say size 0 over SFTP: they are read for what they hold.
+#[tokio::test]
+async fn zero_size_files_are_read_by_content() {
+    let fx = fixture();
+    fx.ssh_fs
+        .add_file("/proc/loadavg", b"0.42 0.30 0.20\n", EPOCH);
+    fx.host.stat_zero_size(&fx.ssh.id, "/proc/loadavg");
+    fx.ssh_fs.add_file("/empty", b"", EPOCH);
+    let site = &fx.ssh.id.0;
+
+    let (h, text) = read(&fx, json!({"site": site, "path": "/proc/loadavg"})).await;
+    assert_eq!(text, "0.42 0.30 0.20\n");
+    assert_eq!(h["size"], 15);
+    assert_eq!(h["eof"], true);
+
+    let (h, text) = read(
+        &fx,
+        json!({"site": site, "path": "/proc/loadavg", "length": 4}),
+    )
+    .await;
+    assert_eq!(text, "0.42");
+    assert_eq!(h["eof"], false);
+    assert_eq!(h["size"], Value::Null, "not known before the end");
+    assert_eq!(h["next_offset"], 4);
+
+    let (h, text) = read(&fx, json!({"site": site, "path": "/empty"})).await;
+    assert_eq!(text, "");
+    assert_eq!(h["size"], 0);
+    assert_eq!(h["eof"], true);
+}
+
+/// A link at the end of the path is refused before anything is opened: `RemoteFs`
+/// cannot resolve it, and SFTP's `open_read` refuses it.
+#[tokio::test]
+async fn links_are_refused_up_front() {
+    let fx = fixture();
+    fx.ssh_fs.add_symlink(
+        "/etc/nginx/sites-enabled/app",
+        "/etc/nginx/sites-available/app",
+    );
+    let text = err(fx
+        .call(
+            "read_file",
+            json!({"site": fx.ssh.id.0, "path": "/etc/nginx/sites-enabled/app"}),
+        )
+        .await);
+    assert!(text.contains("symbolic link"), "{text}");
+    assert!(text.contains("readlink"), "{text}");
+    assert!(text.contains("/etc/nginx/sites-enabled/app"), "{text}");
+    assert_eq!(fx.host.calls(&fx.ssh.id, FsOp::Read), 0, "never opened");
+}
+
+/// Offsets and lengths at `u64::MAX`: answers, never a panic.
+#[tokio::test]
+async fn numbers_at_u64_max_do_not_panic() {
+    let fx = fixture();
+    fx.ssh_fs.add_file("/proc/stat", b"cpu 1 2 3\n", EPOCH);
+    fx.host.stat_zero_size(&fx.ssh.id, "/proc/stat");
+    let site = &fx.ssh.id.0;
+    let max = u64::MAX;
+    for path in ["/var/www/a.txt", "/proc/stat"] {
+        let (h, text) = read(
+            &fx,
+            json!({"site": site, "path": path, "offset": max, "length": max}),
+        )
+        .await;
+        assert_eq!(text, "", "{path}");
+        assert_eq!(h["eof"], true, "{path}");
+        assert_eq!(h["offset"], max, "{path}");
+        assert_eq!(h["next_offset"], max, "{path}");
+    }
+    let listing = list(
+        &fx,
+        json!({"site": site, "path": "/var/www", "offset": max, "limit": max}),
+    )
+    .await;
+    assert!(names(&listing).is_empty());
+    assert_eq!(listing["truncated"], false);
+}
+
+/// Line separators and bidirectional controls in a path cannot split or reorder a log
+/// line; an unknown tool's name never reaches the log.
+#[tokio::test]
+async fn log_lines_cannot_be_split_or_reordered() {
+    let (logs, _guard) = capture_logs();
+    let fx = fixture();
+    let odd = "/var/www/a\u{2028}b\u{2029}c\u{202e}d\u{2066}e\u{200f}f.txt";
+    fx.ssh_fs.add_file(odd, b"x", EPOCH);
+    ok(fx
+        .call("read_file", json!({"site": fx.ssh.id.0, "path": odd}))
+        .await);
+    let lines = logs.agent_lines();
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(
+        lines[0].contains("read /var/www/a b c d e f.txt on"),
+        "{lines:?}"
+    );
+    for c in ['\u{2028}', '\u{2029}', '\u{202e}', '\u{2066}', '\u{200f}'] {
+        assert!(!logs.text().contains(c), "{c:?}");
+    }
+    for c in [
+        '\u{200e}', '\u{202a}', '\u{202d}', '\u{2067}', '\u{2069}', '\u{85}',
+    ] {
+        assert_eq!(super::printable(&format!("a{c}b")), "a b", "{c:?}");
+    }
+
+    assert_eq!(
+        err(fx.call("evil\ntool", json!({})).await),
+        "Unknown tool: evil\ntool"
+    );
+    let lines = logs.agent_lines();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(lines[1].ends_with("refused an unknown tool"), "{lines:?}");
+    assert!(!logs.text().contains("evil"));
+}
+
+/// `Sites` is sent when the list changed, not on every look.
+#[tokio::test]
+async fn sites_events_only_when_the_list_changes() {
+    let mut fx = fixture();
+    fx.service.reap().await;
+    assert_eq!(fx.events(), [AgentEvent::Sites(vec![])], "the first one");
+    fx.service.reap().await;
+    assert!(fx.events().is_empty());
+    ok(fx
+        .call("list_directory", json!({"site": fx.ssh.id.0, "path": "/"}))
+        .await);
+    let events = fx.events();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(events[1], AgentEvent::Sites(vec![fx.ssh.id.clone()]));
+    fx.service.reap().await;
+    assert!(fx.events().is_empty(), "nothing changed");
+}

@@ -10,12 +10,13 @@
 //! not connected, like a real attempt that failed or waits on a dialog.
 //!
 //! Holds: [`hold`](FakeHost::hold) stops one kind of filesystem call of a site, and
-//! [`hold_exec`](FakeHost::hold_exec) every command, until the [`Hold`] is released or dropped; the
+//! [`hold_exec`](FakeHost::hold_exec) every command, [`hold_connect`](FakeHost::hold_connect)
+//! a site's connects, until the [`Hold`] is released or dropped; the
 //! hold tells when a call reached it and whether a held call was dropped (its caller went
 //! away). [`calls`](FakeHost::calls) counts the calls per site and kind, and
 //! [`streamed`](FakeHost::streamed) the bytes read from a site's files.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -157,6 +158,9 @@ struct State {
     execs: Vec<(SiteId, String, ExecLimits)>,
     exec_hold: Option<Weak<HoldState>>,
     holds: HashMap<(SiteId, FsOp), Weak<HoldState>>,
+    connect_holds: HashMap<SiteId, Weak<HoldState>>,
+    /// Files whose `stat` says size 0 whatever they hold (see [`FakeHost::stat_zero_size`]).
+    zero_size: HashSet<(SiteId, RemotePath)>,
     /// Why a tab's session that is not connected failed (see
     /// [`FakeHost::disconnect_user`]).
     tab_errors: HashMap<SiteId, Error>,
@@ -236,6 +240,8 @@ impl FakeHost {
                     execs: Vec::new(),
                     exec_hold: None,
                     holds: HashMap::new(),
+                    connect_holds: HashMap::new(),
+                    zero_size: HashSet::new(),
                     tab_errors: HashMap::new(),
                     calls: HashMap::new(),
                     streamed: HashMap::new(),
@@ -373,6 +379,21 @@ impl FakeHost {
         hold
     }
 
+    /// Holds the site's connects (after they are counted in [`connects`](Self::connects))
+    /// until the hold is released.
+    pub fn hold_connect(&self, site: &SiteId) -> Hold {
+        let hold = Hold::new();
+        self.state().connect_holds.insert(site.clone(), hold.weak());
+        hold
+    }
+
+    /// The file's `stat` says size 0 from now on, whatever it holds, as SFTP says of
+    /// `/proc` and `/sys` files.
+    pub fn stat_zero_size(&self, site: &SiteId, path: &str) {
+        let path = RemotePath::new(path).expect("an absolute path");
+        self.state().zero_size.insert((site.clone(), path));
+    }
+
     /// Holds the site's filesystem calls of kind `op` until the hold is released.
     pub fn hold(&self, site: &SiteId, op: FsOp) -> Hold {
         let hold = Hold::new();
@@ -448,9 +469,16 @@ impl AgentHost for FakeHost {
     }
 
     async fn connect(&self, site: &SiteId) -> std::result::Result<SessionId, ConnectFailure> {
-        let plan = {
+        let hold = {
             let mut state = self.state();
             *state.connects.entry(site.clone()).or_default() += 1;
+            state.connect_holds.get(site).cloned()
+        };
+        if let Some(hold) = hold {
+            pass(&hold).await;
+        }
+        let plan = {
+            let mut state = self.state();
             if !state.sites.iter().any(|s| s.id == *site) {
                 let error = Error::new(ErrorKind::NotFound, "No such site");
                 return Err(ConnectFailure { error });
@@ -609,7 +637,12 @@ impl RemoteFs for HeldFs {
 
     async fn stat(&self, path: &RemotePath) -> Result<RemoteEntry> {
         self.enter(FsOp::Stat).await;
-        self.inner.stat(path).await
+        let mut entry = self.inner.stat(path).await?;
+        let key = (self.site.clone(), path.clone());
+        if self.shared.state().zero_size.contains(&key) {
+            entry.size = 0;
+        }
+        Ok(entry)
     }
 
     async fn size(&self, path: &RemotePath) -> Result<u64> {
