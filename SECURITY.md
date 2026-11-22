@@ -39,3 +39,9 @@ why each site starts at "No access". Nothing listens on the network.
 
 An agent with access can read and change whatever the remote account can, and what it reads
 leaves through the agent (to wherever that agent sends it), not through hoprs.
+
+On this computer, `download` needs only "Allow reading" and can create or replace any file
+the user can write, except hoprs's own files (the program included), `~/.ssh` and the key
+files of saved sites. That includes files that run later (a shell start-up file, an
+autostart entry, the agent client's own settings), so a misled agent could run code as the
+user: the levels protect the servers, not this computer.

@@ -414,6 +414,10 @@ every site starts at "No access".
 | Write a file, make a folder, rename, change permissions, upload, delete | no | no | yes |
 | Run a command | no | no | SSH sites only |
 
+`download` needs only "Allow reading", and it writes on this computer: it creates files, and
+with `overwrite` it replaces an existing one. The level protects the server; it does not
+confine the agent on this computer (see the protected paths below).
+
 "No access" is the default for every site, existing ones included. A site with no access is
 not listed, and an agent that asks for it gets the same answer as for a site that does not
 exist. A change of level takes effect on the next call. A backup, a partial export or the
@@ -439,19 +443,30 @@ without a call (never while it has an unfinished transfer).
   marked "An agent asked for this connection."; the agent waits up to two minutes, then
   hears that the user has to answer. A changed host key is always an error for the agent.
 - Change its own access, manage sites or workspaces, change settings, or export backups.
-- Transfer to or from hoprs's own files and folders, `~/.ssh`, the `known_hosts` file hoprs
-  uses, or any key file a saved site names. This holds for a file, for a folder that
-  contains one, and through symbolic links. Every path an agent gives must be absolute and
-  contain no `..`.
+- Transfer to or from hoprs's own files and folders (the program itself included), `~/.ssh`,
+  the `known_hosts` file hoprs uses, or any key file a saved site names. This holds for a
+  file, for a folder that contains one, and through symbolic links. Every path an agent
+  gives must be absolute and contain no `..`.
+
+  Nothing else on this computer is protected. A `download` (at "Allow reading") may write
+  into any other place you can write, including files that run later: a shell start-up
+  file, an autostart entry, the settings of the agent's own client. An agent that is misled
+  could use that to run code as you. Give access only to agents you trust on this machine,
+  and keep the MCP client's own permission prompts on for hoprs's tools. The protected paths
+  cover only the local side of transfers: a saved site that points at this computer (SSH to
+  `localhost`) gives an agent with "Allow everything" the remote-side tools on this
+  machine's own files, `~/.ssh` and hoprs's files included.
 - Open an interactive terminal.
 
 **What you see.** "Agent connected" in the status bar while an agent is connected (the
-tooltip counts them); a small "agent" tag on its transfers in the queue (you can pause or
-cancel them there); "Connected (by an agent)" on its sites in the sidebar; and one line per
-action in the log, from `agent`, for example ``ran `systemctl status nginx` on "Acme"
-(exit 0)``. The log holds the command line and the paths, never file content or command
-output. Turning the switch off closes the channel and the agents' sessions at once, and the
-agent's next calls say so.
+tooltip counts them). It appears with the agent's first call, when `hoprs mcp` connects to
+hoprs, not when the MCP client starts it. A small "agent" tag on its transfers in the queue
+(you can pause or cancel them there); "Connected (by an agent)" on its sites in the
+sidebar; and one line per action in the log, from `agent`, for example
+``ran `systemctl status nginx` on "Acme" (exit 0)``. The log holds the command line and the paths, never file content or command
+output. Turning the switch off closes the channel and the agents' sessions at once, except a
+session an unfinished transfer still uses (it stays until the transfer ends; a paused
+transfer keeps it), and the agent's next calls say so.
 
 **Read this before you choose "Allow everything".** An agent can be misled by what it reads:
 a file, a command's output. hoprs does not review what the agent does, and it does not ask
@@ -776,10 +791,24 @@ around the drop; they name the cause (timeout, server close, reconnect attempts)
 start hoprs with `RUST_LOG=hoprs_ssh=debug,hoprs_remote=debug`.
 
 **An agent says "hoprs is not reachable".** hoprs is closed, or Settings › Agents (MCP) is off.
-Open hoprs and turn the switch on; then the agent's next call works.
+Open hoprs and turn the switch on; then the agent's next call works. On Linux, `hoprs mcp`
+looks for hoprs's channel under `$XDG_RUNTIME_DIR`: an agent started where that variable is
+missing or different (another login session, a service, a container, `sudo`) cannot find
+the running hoprs and says the same. Compare `echo $XDG_RUNTIME_DIR` in the agent's terminal
+with the one hoprs was started from; start the agent from the same desktop session, or pass
+the variable through to it.
 
-**An agent says to restart hoprs.** hoprs was updated while its window stayed open, so the
-window and the `hoprs mcp` program are different versions. Quit hoprs and open it again.
+**An agent says hoprs and its MCP server are different versions.** The window and the
+`hoprs mcp` program are not the same build, and the message says which is older. hoprs was
+updated while its window stayed open: quit hoprs and open it again. The `hoprs mcp` program
+was started before hoprs was updated (an agent session that stayed open across the update):
+restart or reconnect the hoprs MCP server in the MCP client (for example by restarting the
+agent session); restarting hoprs does not help then.
+
+**The copied MCP command stops working (macOS).** macOS can run an app opened from the
+Downloads folder or from the disk image from a temporary path that changes at each launch,
+so the path in the copied command no longer exists. Move hoprs to Applications, open it from
+there, and copy the command again.
 
 **The agent cannot start `hoprs` (Windows, macOS).** Register it with the full path to the
 executable, as Settings › Agents (MCP) shows it (`C:\Program Files\hoprs\hoprs.exe` on Windows).
