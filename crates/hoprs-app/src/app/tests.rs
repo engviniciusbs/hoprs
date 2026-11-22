@@ -1486,3 +1486,65 @@ mod tabs;
 mod terminal;
 mod transfers;
 mod update;
+
+#[tokio::test]
+async fn site_form_export_opens_the_export_screen() {
+    use crate::app::export::ExportTitle;
+    let a = site("a", "h", "u", Protocol::Ssh);
+    let fake = FakeBackend::new().with_site(a.clone());
+    let mut app = loaded(&fake).await;
+    app.update(Message::EditSite(a.id.clone()));
+    type_site(&mut app, SiteFormMsg::Name("renamed".into()));
+    app.update(Message::SiteForm(SiteFormMsg::Export));
+    assert!(matches!(app.form, Some(Form::Export)));
+    let flow = app.export.as_ref().expect("the flow");
+    assert_eq!(flow.title, ExportTitle::Site { name: "a".into() });
+
+    // A new site is not saved yet: nothing to export.
+    let mut app = loaded(&fake).await;
+    app.update(Message::NewSite);
+    app.update(Message::SiteForm(SiteFormMsg::Export));
+    assert!(matches!(app.form, Some(Form::Site(_))));
+    // A busy form stays.
+    app.update(Message::EditSite(a.id.clone()));
+    site_form(&mut app).busy = true;
+    app.update(Message::SiteForm(SiteFormMsg::Export));
+    assert!(matches!(app.form, Some(Form::Site(_))));
+}
+
+#[tokio::test]
+async fn workspace_form_export_opens_the_export_screen() {
+    use crate::app::export::ExportTitle;
+    let a = site("a", "h", "u", Protocol::Ssh);
+    let ws = workspace("team", &[&a.id]);
+    let fake = FakeBackend::new()
+        .with_site(a.clone())
+        .with_workspace(ws.clone());
+    let mut app = loaded(&fake).await;
+    app.update(Message::EditWorkspace(ws.id.clone()));
+    app.update(Message::WorkspaceForm(WorkspaceFormMsg::Name(
+        "other".into(),
+    )));
+    app.update(Message::WorkspaceForm(WorkspaceFormMsg::Export));
+    assert!(matches!(app.form, Some(Form::Export)));
+    let flow = app.export.as_ref().expect("the flow");
+    assert_eq!(
+        flow.title,
+        ExportTitle::Workspace {
+            name: "team".into(),
+            sites: 1
+        }
+    );
+
+    let mut app = loaded(&fake).await;
+    app.update(Message::NewWorkspace);
+    app.update(Message::WorkspaceForm(WorkspaceFormMsg::Export));
+    assert!(matches!(app.form, Some(Form::Workspace(_))));
+    app.update(Message::EditWorkspace(ws.id.clone()));
+    let Some(Form::Workspace(f)) = &mut app.form else {
+        panic!()
+    };
+    f.busy = true;
+    app.update(Message::WorkspaceForm(WorkspaceFormMsg::Export));
+    assert!(matches!(app.form, Some(Form::Workspace(_))));
+}

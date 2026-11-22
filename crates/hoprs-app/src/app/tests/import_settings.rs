@@ -826,7 +826,7 @@ fn sidebar_menu_hides_and_shows() {
     let open = || Message::Menu(MenuMsg::Open(MenuTarget::SidebarOptions));
     app.update(open());
     let items = app.menu_items(&MenuTarget::SidebarOptions);
-    assert_eq!(items.len(), 2);
+    assert_eq!(items.len(), 3, "two sections and Export everything…");
     assert!(items.iter().all(|item| item.enabled));
     assert_eq!(items[1].checked, Some(true));
     // Show all sites (checked): hides it, and the menu closes.

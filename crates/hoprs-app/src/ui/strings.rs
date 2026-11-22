@@ -1615,6 +1615,12 @@ pub fn export_title_workspace(name: &str, sites: usize) -> String {
         ],
     )
 }
+pub fn export_ellipsis() -> &'static str {
+    tr("export-ellipsis")
+}
+pub fn export_everything() -> &'static str {
+    tr("export-everything")
+}
 /// `Export everything (12 sites, 3 workspaces)`.
 pub fn export_title_all(sites: usize, workspaces: usize) -> String {
     tr_args(

@@ -622,6 +622,8 @@ backup-missing-secrets = Saved without their password (not in the keyring)
 backup-skipped-unreadable = Not exported (unreadable entries)
 backup-skipped-sites = Sites already here (kept)
 backup-skipped-workspaces = Workspaces already here (kept)
+export-ellipsis = Export…
+export-everything = Export everything…
 export-title-site = Export "{ $name }" (site)
 # { $sites }: "4 sites".
 export-title-workspace = Export "{ $name }" (workspace, { $sites })

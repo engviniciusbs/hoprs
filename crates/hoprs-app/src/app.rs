@@ -1264,6 +1264,7 @@ impl App {
                 site: *site,
                 password,
             }],
+            SiteFormOutcome::Export(id) => self.export_msg(ExportMsg::Open(ExportScope::Site(id))),
             SiteFormOutcome::Delete(id) => vec![Effect::DeleteSite(id)],
         }
     }
@@ -1279,6 +1280,9 @@ impl App {
                 Vec::new()
             }
             WorkspaceFormOutcome::Save(workspace) => vec![Effect::SaveWorkspace(workspace)],
+            WorkspaceFormOutcome::Export(id) => {
+                self.export_msg(ExportMsg::Open(ExportScope::Workspace(id)))
+            }
             WorkspaceFormOutcome::Delete(id) => vec![Effect::DeleteWorkspace(id)],
         }
     }

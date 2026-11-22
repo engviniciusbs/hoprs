@@ -22,6 +22,7 @@ pub enum WorkspaceFormMsg {
     ToggleSite(SiteId, bool),
     Save,
     Cancel,
+    Export,
     Delete,
     ConfirmDelete,
     CancelDelete,
@@ -32,6 +33,8 @@ pub enum WorkspaceFormOutcome {
     Nothing,
     Close,
     Save(Workspace),
+    /// The export screen for the workspace as saved.
+    Export(WorkspaceId),
     Delete(WorkspaceId),
 }
 
@@ -134,6 +137,11 @@ impl WorkspaceForm {
                 return WorkspaceFormOutcome::Save(workspace);
             }
             WorkspaceFormMsg::Cancel => return WorkspaceFormOutcome::Close,
+            WorkspaceFormMsg::Export => {
+                if self.editing && !self.busy {
+                    return WorkspaceFormOutcome::Export(self.base.id.clone());
+                }
+            }
             WorkspaceFormMsg::Delete => self.confirm_delete = self.editing,
             WorkspaceFormMsg::CancelDelete => self.confirm_delete = false,
             WorkspaceFormMsg::ConfirmDelete => {
@@ -230,6 +238,12 @@ pub fn view<'a>(form: &'a WorkspaceForm, sites: &'a [Site]) -> Element<'a, Messa
         .align_y(Alignment::Center)
         .spacing(theme::SPACE_XS);
         if form.editing {
+            buttons = buttons.push(
+                button(text(strings::export_ellipsis()))
+                    .padding(Padding::from([theme::SPACE_2XS, theme::SPACE_XS]))
+                    .style(theme::button_text)
+                    .on_press_maybe((!form.busy).then(|| msg(WorkspaceFormMsg::Export))),
+            );
             buttons = buttons.push(
                 button(text(strings::delete()))
                     .padding(Padding::from([theme::SPACE_2XS, theme::SPACE_XS]))
