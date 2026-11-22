@@ -10,7 +10,7 @@ use hoprs_core::{
 };
 use hoprs_import::ImportReport;
 use hoprs_transfer::{ConflictPolicy, Event, TransferId, TransferSpec};
-use hoprs_vault::{BackupImportReport, ExportReport, ExportScope, ImportMode, UnreadableEntry};
+use hoprs_vault::{BackupImportReport, ExportScope, ImportMode, UnreadableEntry};
 use secrecy::SecretString;
 
 use crate::backend::{
@@ -40,6 +40,9 @@ pub enum Form {
     /// "Import from FileZilla" ([`App::import`] holds its state, which outlives the view
     /// while an import runs).
     Import,
+    /// The export screen ([`App::export`] holds its state, which outlives the view while
+    /// an export runs).
+    Export,
     /// The question about unsent remote edits before the window or a workspace closes
     /// ([`App::center_ask`]).
     QuitEdits,
@@ -50,8 +53,6 @@ pub enum Form {
 pub enum PickTarget {
     /// The `sitemanager.xml` to import (open).
     Sitemanager,
-    /// Where to write a backup (save).
-    ExportBackup,
     /// The backup to restore (open).
     RestoreBackup,
 }
@@ -79,6 +80,7 @@ pub use actions::FileAction;
 pub use compare::{CompareItem, CompareMsg, CompareRunId};
 pub use dialogs::{Dialog, DialogMsg, Dialogs, FailureAction, KnownHostsFix, KnownHostsMsg, Typed};
 pub use edit::EditMsg;
+pub use export::ExportMsg;
 pub use files::{FileKey, Mods, PaneMsg, RequestId};
 pub use lifecycle::ConnStatus;
 pub use log::{LogLevel, LogMsg};
@@ -215,6 +217,10 @@ pub struct App {
     /// The settings changed while a save ran: saved again when it ends.
     settings_dirty: bool,
     pub backup: settings::Backup,
+    /// The export screen, while it is shown or an export runs ([`export`]).
+    pub export: Option<export::ExportFlow>,
+    /// Where the export screen's File field starts: Documents, else home.
+    pub export_dir: Option<PathBuf>,
     /// Advances while something runs without a known end (import, backup): drives the
     /// indeterminate progress bar.
     pub busy_phase: u32,
@@ -454,7 +460,6 @@ pub enum Message {
     /// Why the persistent queue could not be opened at start, if it could not.
     QueueStatus(Option<Error>),
     SettingsSaved(Result<(), Error>),
-    BackupExported(Result<ExportReport, Error>),
     BackupRestored(Result<BackupImportReport, Error>),
     /// A system file dialog closed: the path chosen, `None` if cancelled.
     FilePicked {
@@ -463,11 +468,6 @@ pub enum Message {
     },
     /// A frame of the indeterminate progress bar.
     BusyTick,
-    /// Whether the typed export file exists.
-    ExportTargetChecked {
-        path: PathBuf,
-        exists: bool,
-    },
     /// The window was resized to this size (logical pixels).
     WindowResized(iced::Size),
     /// A left or right press in the window, at this position (logical pixels), before
@@ -517,6 +517,8 @@ pub enum Message {
     Edit(EditMsg),
     /// The update check, the card's buttons and the download ([`update`]).
     Update(UpdateMsg),
+    /// The export screen: opened, typed into, its checks and its result ([`export`]).
+    Export(ExportMsg),
 }
 
 /// The profile change a form asked for, carried back with its result.
@@ -706,10 +708,14 @@ pub enum Effect {
     /// Keepalive (seconds) of the next SSH and FTP connections.
     SetKeepalive(u64),
     /// Checks whether the typed export file exists; back as
-    /// [`Message::ExportTargetChecked`].
+    /// [`ExportMsg::TargetChecked`].
     CheckExportTarget(PathBuf),
     /// Opens the system file dialog; back as [`Message::FilePicked`].
     PickFile(PickTarget),
+    /// The save dialog for an export, proposing `name`; back as [`ExportMsg::Picked`].
+    PickExportFile {
+        name: String,
+    },
     /// Imports a `sitemanager.xml`, off the UI thread; back as [`Message::Imported`].
     ImportFilezilla {
         path: PathBuf,
@@ -717,7 +723,7 @@ pub enum Effect {
     },
     /// Deletes the imported file; back as [`Message::SitemanagerDeleted`].
     DeleteSitemanager(PathBuf),
-    /// Writes an encrypted backup; back as [`Message::BackupExported`]. The only holder
+    /// Writes an encrypted backup of `scope`; back as [`ExportMsg::Done`]. The only holder
     /// of the password once emitted (its `Debug` is redacted).
     ExportBackup {
         scope: ExportScope,
@@ -864,6 +870,8 @@ impl App {
             settings_saving: false,
             settings_dirty: false,
             backup: settings::Backup::default(),
+            export: None,
+            export_dir: dirs::document_dir().or_else(dirs::home_dir),
             busy_phase: 0,
             window_width: INITIAL_WINDOW_WIDTH,
             window_height: INITIAL_WINDOW_HEIGHT,
@@ -1026,6 +1034,8 @@ impl App {
             self.compare_ignore_input = None;
             self.editor_input = None;
         }
+        // The same for the export screen's: a flow that does not run goes with it.
+        self.export_left();
         // The center shows another tab (or Settings, or a form): a menu about what it
         // showed goes.
         if self.shown_tab() != shown {
@@ -1212,10 +1222,6 @@ impl App {
             Message::QueueStatus(Some(error)) => self.queue_unavailable(error),
             Message::QueueStatus(None) => {}
             Message::SettingsSaved(result) => return self.settings_saved(result),
-            Message::ExportTargetChecked { path, exists } => {
-                return self.export_target_checked(path, exists);
-            }
-            Message::BackupExported(result) => self.backup_exported(result),
             Message::BackupRestored(result) => return self.backup_restored(result),
             Message::FilePicked { target, path } => self.file_picked(target, path),
             Message::BusyTick => self.busy_phase = self.busy_phase.wrapping_add(1),
@@ -1239,6 +1245,7 @@ impl App {
             } => return self.shell_opened(tab, request, result),
             Message::Edit(msg) => return self.edit_msg(msg),
             Message::Update(msg) => return self.update_msg(msg),
+            Message::Export(msg) => return self.export_msg(msg),
         }
         Vec::new()
     }
@@ -1303,7 +1310,7 @@ impl App {
             match form {
                 Form::Site(form) => form.finished(Some(error.clone())),
                 Form::Workspace(form) => form.finished(Some(error.clone())),
-                Form::Import | Form::QuitEdits => {}
+                Form::Import | Form::Export | Form::QuitEdits => {}
             }
         }
         let error = result.err();

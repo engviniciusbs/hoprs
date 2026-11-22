@@ -18,8 +18,8 @@ use secrecy::SecretString;
 use crate::app::edit::{EditsFor, FLUSH_LIMIT, Settle, Settled};
 use crate::app::terminal::ShellSignal;
 use crate::app::{
-    CompareItem, CompareMsg, CompareRunId, EditMsg, Effect, FileAction, Message, PickTarget,
-    ProfileOp, RequestId, TabId, TerminalMsg, UpdateMsg,
+    CompareItem, CompareMsg, CompareRunId, EditMsg, Effect, ExportMsg, FileAction, Message,
+    PickTarget, ProfileOp, RequestId, TabId, TerminalMsg, UpdateMsg,
 };
 use crate::backend::{
     BackendApi, KeptEdit, KnownHostEntry, PromptAnswer, PromptId, SessionId, ShellId, ShellOutput,
@@ -275,10 +275,13 @@ pub fn run(
             let exists = tokio::task::spawn_blocking(move || probe.try_exists())
                 .await
                 .is_ok_and(|found| found.unwrap_or(false));
-            Message::ExportTargetChecked { path, exists }
+            Message::Export(ExportMsg::TargetChecked { path, exists })
         }),
         Effect::PickFile(target) => Task::perform(pick_file(target), move |path| {
             Message::FilePicked { target, path }
+        }),
+        Effect::PickExportFile { name } => Task::perform(pick_export_file(name), |path| {
+            Message::Export(ExportMsg::Picked(path))
         }),
         Effect::ImportFilezilla {
             path,
@@ -573,7 +576,9 @@ pub async fn export_backup(
     path: PathBuf,
     password: SecretString,
 ) -> Message {
-    Message::BackupExported(backend.export_backup(scope, path, password).await)
+    Message::Export(ExportMsg::Done(
+        backend.export_backup(scope, path, password).await,
+    ))
 }
 
 pub async fn restore_backup(
@@ -614,16 +619,25 @@ async fn pick_file(target: PickTarget) -> Option<PathBuf> {
                 .pick_file()
                 .await
         }
-        PickTarget::ExportBackup => {
-            dialog
-                .set_title(strings::pick_export())
-                .set_file_name(strings::backup_file_name())
-                .save_file()
-                .await
-        }
         PickTarget::RestoreBackup => dialog.set_title(strings::pick_restore()).pick_file().await,
     };
     handle.map(|handle| handle.path().to_path_buf())
+}
+
+/// The export's save dialog, proposing `name` in Documents (else home), as the File field
+/// does. `None` if cancelled or no dialog is available.
+async fn pick_export_file(name: String) -> Option<PathBuf> {
+    let dialog = rfd::AsyncFileDialog::new()
+        .set_title(strings::pick_export())
+        .set_file_name(name);
+    let dialog = match dirs::document_dir().or_else(dirs::home_dir) {
+        Some(dir) => dialog.set_directory(dir),
+        None => dialog,
+    };
+    dialog
+        .save_file()
+        .await
+        .map(|handle| handle.path().to_path_buf())
 }
 
 /// The longest the window waits for the backend to shut down once asked to close.

@@ -1,6 +1,6 @@
 //! The settings page, shown as a tab in the strip (no modal): workers per site, the
-//! default conflict policy, the keepalive, the terminal, and the encrypted backup (export
-//! and restore).
+//! default conflict policy, the keepalive, the terminal, and the encrypted backup (restore
+//! here; "Export backup…" opens the export screen, [`super::export`]).
 //!
 //! The settings tab is a slot of its own ([`App::settings_tab`]), not a session [`Tab`](super::Tab)
 //! (it has no site): at most one, never saved with a workspace. While it is selected no
@@ -11,14 +11,14 @@
 //! the next connections) and is saved to `settings.toml`, unless that file was unreadable at start:
 //! then nothing is saved over it.
 //!
-//! Backup passwords live in the page only while typed: they leave it inside the effect
+//! The restore password lives in the page only while typed: they leave it inside the effect
 //! (a [`SecretString`]) and the fields are emptied.
 
 use std::path::PathBuf;
 
 use hoprs_core::Error;
 use hoprs_transfer::ConflictPolicy;
-use hoprs_vault::{BackupImportReport, ExportReport, ExportScope, ImportMode};
+use hoprs_vault::{BackupImportReport, ImportMode};
 use secrecy::SecretString;
 
 use super::{App, DividerMsg, Effect, Panel, PickTarget, Resize, TabId};
@@ -94,21 +94,13 @@ pub struct SettingsTab {
 
 #[derive(Debug, Clone)]
 pub enum BackupMsg {
-    OpenExport,
     OpenRestore,
-    /// Closes the export or restore panel.
+    /// Closes the restore panel.
     Cancel,
-    /// "Choose…" for the export or the restore file.
+    /// "Choose…" for the restore file.
     Choose(PickTarget),
-    ExportPath(String),
-    /// A typed password: its `Debug` never shows it.
-    ExportPassword(Password),
-    ExportConfirm(Password),
-    Export,
-    /// "Overwrite" on the inline question about an existing export file.
-    ConfirmOverwrite,
-    CancelOverwrite,
     RestorePath(String),
+    /// A typed password: its `Debug` never shows it.
     RestorePassword(Password),
     RestoreMode(ImportMode),
     Restore,
@@ -116,11 +108,10 @@ pub enum BackupMsg {
     CancelReplace,
 }
 
-/// Which backup panel is open.
+/// Whether the restore panel is open.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BackupPanel {
     Closed,
-    Export,
     Restore,
 }
 
@@ -142,23 +133,13 @@ impl<R> BackupState<R> {
 #[derive(Debug)]
 pub struct Backup {
     pub panel: BackupPanel,
-    pub export_path: String,
-    pub export_password: Password,
-    pub export_confirm: Password,
     pub restore_path: String,
     pub restore_password: Password,
     pub restore_mode: ImportMode,
     /// "Replace" asked once and waits for its confirmation.
     pub confirm_replace: bool,
-    /// The export path came from the save dialog (which already asked about overwriting).
-    pub export_path_picked: bool,
-    /// Whether the typed export file exists is being checked.
-    pub export_checking: bool,
-    /// The typed export file exists: "Overwrite?" waits for its answer.
-    pub confirm_overwrite: bool,
     /// What is wrong with the fields of the open panel.
     pub field_error: Option<&'static str>,
-    pub export: BackupState<ExportReport>,
     pub restore: BackupState<BackupImportReport>,
 }
 
@@ -166,42 +147,26 @@ impl Default for Backup {
     fn default() -> Self {
         Self {
             panel: BackupPanel::Closed,
-            export_path: String::new(),
-            export_password: Password::default(),
-            export_confirm: Password::default(),
             restore_path: String::new(),
             restore_password: Password::default(),
             restore_mode: ImportMode::Merge,
             confirm_replace: false,
-            export_path_picked: false,
-            export_checking: false,
-            confirm_overwrite: false,
             field_error: None,
-            export: BackupState::Idle,
             restore: BackupState::Idle,
         }
     }
 }
 
 impl Backup {
-    /// An export or a restore runs (both lock the vault; one at a time).
-    pub fn running(&self) -> bool {
-        self.export.running() || self.restore.running()
-    }
-
-    /// Empties every password field, and drops the questions that would send one.
+    /// Empties the password field, and drops the question that would send it.
     pub(super) fn forget_passwords(&mut self) {
-        self.export_password = Password::default();
-        self.export_confirm = Password::default();
         self.restore_password = Password::default();
         self.confirm_replace = false;
-        self.confirm_overwrite = false;
-        self.export_checking = false;
     }
 }
 
 /// The path typed in a field, or the reason it can't be used.
-fn path_of(field: &str) -> Result<PathBuf, &'static str> {
+pub(super) fn path_of(field: &str) -> Result<PathBuf, &'static str> {
     let trimmed = field.trim();
     if trimmed.is_empty() {
         Err(strings::backup_path_required())
@@ -486,17 +451,8 @@ impl App {
     fn backup_msg(&mut self, msg: BackupMsg) -> Vec<Effect> {
         let backup = &mut self.backup;
         match msg {
-            BackupMsg::OpenExport | BackupMsg::OpenRestore => {
-                let panel = if matches!(msg, BackupMsg::OpenExport) {
-                    BackupPanel::Export
-                } else {
-                    BackupPanel::Restore
-                };
-                if backup.panel != panel {
-                    // A password typed for one panel never goes to the other.
-                    backup.forget_passwords();
-                }
-                backup.panel = panel;
+            BackupMsg::OpenRestore => {
+                backup.panel = BackupPanel::Restore;
                 backup.field_error = None;
             }
             BackupMsg::Cancel => {
@@ -505,52 +461,10 @@ impl App {
                 backup.forget_passwords();
             }
             BackupMsg::Choose(target) => {
-                if matches!(target, PickTarget::ExportBackup | PickTarget::RestoreBackup) {
+                if target == PickTarget::RestoreBackup {
                     return vec![Effect::PickFile(target)];
                 }
             }
-            BackupMsg::ExportPath(path) => {
-                backup.export_path = path;
-                backup.export_path_picked = false;
-                backup.export_checking = false;
-                backup.confirm_overwrite = false;
-            }
-            BackupMsg::ExportPassword(password) => backup.export_password = password,
-            BackupMsg::ExportConfirm(password) => backup.export_confirm = password,
-            BackupMsg::Export => {
-                if backup.running() || backup.export_checking || backup.confirm_overwrite {
-                    return Vec::new();
-                }
-                let path = match path_of(&backup.export_path) {
-                    Ok(path) => path,
-                    Err(why) => {
-                        backup.field_error = Some(why);
-                        return Vec::new();
-                    }
-                };
-                if backup.export_password.0.is_empty() {
-                    backup.field_error = Some(strings::backup_password_required());
-                    return Vec::new();
-                }
-                if backup.export_password != backup.export_confirm {
-                    backup.field_error = Some(strings::backup_passwords_differ());
-                    return Vec::new();
-                }
-                backup.field_error = None;
-                if backup.export_path_picked {
-                    return self.start_export();
-                }
-                // A typed path: an existing file is overwritten only once confirmed.
-                backup.export_checking = true;
-                return vec![Effect::CheckExportTarget(path)];
-            }
-            BackupMsg::ConfirmOverwrite => {
-                if backup.confirm_overwrite {
-                    backup.confirm_overwrite = false;
-                    return self.start_export();
-                }
-            }
-            BackupMsg::CancelOverwrite => backup.confirm_overwrite = false,
             BackupMsg::RestorePath(path) => {
                 backup.restore_path = path;
                 backup.confirm_replace = false;
@@ -561,7 +475,7 @@ impl App {
                 backup.confirm_replace = false;
             }
             BackupMsg::Restore => {
-                if backup.running() {
+                if backup.restore.running() {
                     return Vec::new();
                 }
                 if let Err(why) = path_of(&backup.restore_path) {
@@ -591,51 +505,15 @@ impl App {
         Vec::new()
     }
 
-    /// Whether the typed export file exists came back.
-    pub(super) fn export_target_checked(&mut self, path: PathBuf, exists: bool) -> Vec<Effect> {
-        let backup = &mut self.backup;
-        // A path edited meanwhile (or the panel left) drops this answer.
-        if !backup.export_checking || path_of(&backup.export_path).ok() != Some(path) {
-            return Vec::new();
-        }
-        backup.export_checking = false;
-        if exists {
-            backup.confirm_overwrite = true;
-            return Vec::new();
-        }
-        self.start_export()
-    }
-
-    /// Sends the export with the typed password, which leaves the page.
-    fn start_export(&mut self) -> Vec<Effect> {
-        let backup = &mut self.backup;
-        let Ok(path) = path_of(&backup.export_path) else {
-            return Vec::new();
-        };
-        if backup.running()
-            || backup.export_password.0.is_empty()
-            || backup.export_password != backup.export_confirm
-        {
-            return Vec::new();
-        }
-        // From here on only the effect holds the password.
-        let password = SecretString::from(std::mem::take(&mut backup.export_password.0));
-        backup.export_confirm = Password::default();
-        backup.export = BackupState::Running;
-        vec![Effect::ExportBackup {
-            scope: ExportScope::All,
-            path,
-            password,
-        }]
-    }
-
     /// Sends the restore with the typed password, which leaves the page.
     fn start_restore(&mut self) -> Vec<Effect> {
+        // One at a time: both lock the vault.
+        let exporting = self.export_running();
         let backup = &mut self.backup;
         let Ok(path) = path_of(&backup.restore_path) else {
             return Vec::new();
         };
-        if backup.running() || backup.restore_password.0.is_empty() {
+        if exporting || backup.restore.running() || backup.restore_password.0.is_empty() {
             return Vec::new();
         }
         let password = SecretString::from(std::mem::take(&mut backup.restore_password.0));
@@ -645,15 +523,6 @@ impl App {
             password,
             mode: backup.restore_mode,
         }]
-    }
-
-    pub(super) fn backup_exported(&mut self, result: Result<ExportReport, Error>) {
-        if self.backup.export.running() {
-            self.backup.export = match result {
-                Ok(report) => BackupState::Done(report),
-                Err(error) => BackupState::Failed(error),
-            };
-        }
     }
 
     /// A restore finished; what it changed reaches the sidebar.
@@ -687,13 +556,6 @@ impl App {
                 self.import.path = path;
                 self.import.path_error = None;
             }
-            PickTarget::ExportBackup => {
-                self.backup.export_path = path;
-                // The save dialog asked about an existing file already.
-                self.backup.export_path_picked = true;
-                self.backup.export_checking = false;
-                self.backup.confirm_overwrite = false;
-            }
             PickTarget::RestoreBackup => {
                 self.backup.restore_path = path;
                 self.backup.confirm_replace = false;
@@ -701,9 +563,9 @@ impl App {
         }
     }
 
-    /// An import or a backup runs: the progress indicator moves.
+    /// An import, an export or a restore runs: the progress indicator moves.
     pub fn busy(&self) -> bool {
-        self.import.running() || self.backup.running()
+        self.import.running() || self.export_running() || self.backup.restore.running()
     }
 
     /// Whether the pointer's moves are wanted: only while a divider is dragged or a press

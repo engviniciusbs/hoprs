@@ -576,7 +576,11 @@ backup-missing-secrets = Salvos sem a senha (ausente do keyring)
 backup-skipped-unreadable = Não exportadas (entradas ilegíveis)
 backup-skipped-sites = Sites que já existem (mantidos)
 backup-skipped-workspaces = Workspaces que já existem (mantidos)
-backup-file-name = hoprs-backup.hoprs
+export-title-site = Exportar "{ $name }" (site)
+export-title-workspace = Exportar "{ $name }" (workspace, { $sites })
+export-title-all = Exportar tudo ({ $sites }, { $workspaces })
+export-password-hint = Guarde esta senha: sem ela o arquivo não pode ser aberto.
+export-partial-note = Este arquivo terá só uma parte dos seus sites. Restaure com Mesclar; o hoprs 1.5.0 e anteriores não conseguem abri-lo.
 pick-export = Salvar o backup do hoprs
 pick-restore = Escolher um backup do hoprs
 # "Exported 12 sites, 3 workspaces and 9 passwords."

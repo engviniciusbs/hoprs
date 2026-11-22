@@ -642,8 +642,6 @@ impl FakeBackend {
     }
 
     /// The next `export_backup` fails with `error`.
-    // No test fails an export until the export screen (Task 3); remove this then.
-    #[allow(dead_code)]
     pub fn fail_next_export(&self, error: Error) {
         self.state().export_failures.push_back(error);
     }

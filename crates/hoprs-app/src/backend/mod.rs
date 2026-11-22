@@ -288,8 +288,8 @@ pub trait BackendApi: Send + Sync {
     /// Deletes the imported `sitemanager.xml` (see [`hoprs_import::delete_source`]: only a
     /// regular file that still looks like FileZilla's).
     async fn delete_sitemanager(&self, path: PathBuf) -> Result<()>;
-    /// Writes the encrypted backup of every site, workspace and secret to `path`. Slow on
-    /// purpose (Argon2id).
+    /// Writes the encrypted backup of what `scope` names (one site, one workspace and its
+    /// sites, or everything), with their secrets, to `path`. Slow on purpose (Argon2id).
     async fn export_backup(
         &self,
         scope: ExportScope,

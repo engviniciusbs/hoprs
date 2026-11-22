@@ -1474,6 +1474,7 @@ fn small_window_clamps_without_rewriting() {
 mod compare;
 mod dialogs;
 mod edit;
+mod export;
 mod file_actions;
 mod import_settings;
 mod log;

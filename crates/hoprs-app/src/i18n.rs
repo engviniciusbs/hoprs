@@ -557,7 +557,6 @@ mod tests {
         "decrease",
         "increase",
         "backup",
-        "backup-file-name",
         "editor-command",
     ];
 

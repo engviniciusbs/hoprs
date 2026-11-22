@@ -1583,9 +1583,6 @@ pub fn backup_skipped_sites() -> &'static str {
 pub fn backup_skipped_workspaces() -> &'static str {
     tr("backup-skipped-workspaces")
 }
-pub fn backup_file_name() -> &'static str {
-    tr("backup-file-name")
-}
 pub fn pick_export() -> &'static str {
     tr("pick-export")
 }
@@ -1602,6 +1599,37 @@ pub fn export_done(sites: usize, workspaces: usize, secrets: usize) -> String {
             ("secrets", password_count(secrets).as_str().into()),
         ],
     )
+}
+
+/// `Export "Cliente Acme" (site)`.
+pub fn export_title_site(name: &str) -> String {
+    tr_args("export-title-site", &[("name", name.into())])
+}
+/// `Export "Cliente Acme" (workspace, 4 sites)`.
+pub fn export_title_workspace(name: &str, sites: usize) -> String {
+    tr_args(
+        "export-title-workspace",
+        &[
+            ("name", name.into()),
+            ("sites", site_count(sites).as_str().into()),
+        ],
+    )
+}
+/// `Export everything (12 sites, 3 workspaces)`.
+pub fn export_title_all(sites: usize, workspaces: usize) -> String {
+    tr_args(
+        "export-title-all",
+        &[
+            ("sites", site_count(sites).as_str().into()),
+            ("workspaces", workspace_count(workspaces).as_str().into()),
+        ],
+    )
+}
+pub fn export_password_hint() -> &'static str {
+    tr("export-password-hint")
+}
+pub fn export_partial_note() -> &'static str {
+    tr("export-partial-note")
 }
 
 /// A number of workspaces: "1 workspace", "3 workspaces".

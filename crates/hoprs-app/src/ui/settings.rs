@@ -4,7 +4,7 @@
 use std::fmt;
 
 use hoprs_transfer::ConflictPolicy;
-use hoprs_vault::{BackupImportReport, ExportReport, ImportMode};
+use hoprs_vault::{BackupImportReport, ExportScope, ImportMode};
 use iced::widget::{
     button, checkbox, column, container, pick_list, row, rule, scrollable, space, text, text_input,
 };
@@ -14,7 +14,7 @@ use crate::app::settings::{
     Backup, BackupMsg, BackupPanel, BackupState, SettingsMsg, SettingsSection, SettingsTab,
 };
 use crate::app::update::ManualCheck;
-use crate::app::{App, Message, PickTarget};
+use crate::app::{App, ExportMsg, Message, PickTarget};
 use crate::settings::{
     FONT_SIZE_MAX, FONT_SIZE_MIN, LanguageChoice, TerminalTheme, WORKERS_MAX, WORKERS_MIN,
 };
@@ -548,7 +548,7 @@ pub fn view<'a>(app: &'a App, tab: &SettingsTab) -> Element<'a, Message> {
         SettingsSection::Compare => comparing(app),
         SettingsSection::Editing => editing(app),
         SettingsSection::Terminal => terminal(app),
-        SettingsSection::Backup => backup_view(&app.backup, app.busy_phase),
+        SettingsSection::Backup => backup_view(app),
     });
 
     row![
@@ -565,12 +565,14 @@ pub fn view<'a>(app: &'a App, tab: &SettingsTab) -> Element<'a, Message> {
     .into()
 }
 
-fn backup_view(backup: &Backup, phase: u32) -> Element<'_, Message> {
-    let running = backup.running();
+fn backup_view(app: &App) -> Element<'_, Message> {
+    let backup = &app.backup;
+    // One at a time: an export and a restore both lock the vault.
+    let running = backup.restore.running() || app.export.as_ref().is_some_and(|f| f.running());
     let buttons = row![
         outlined(
             strings::export_backup(),
-            (!running).then(|| backup_msg(BackupMsg::OpenExport))
+            (!running).then_some(Message::Export(ExportMsg::Open(ExportScope::All)))
         ),
         outlined(
             strings::restore_backup(),
@@ -580,21 +582,9 @@ fn backup_view(backup: &Backup, phase: u32) -> Element<'_, Message> {
     .spacing(theme::SPACE_XS);
     let mut col = column![muted(strings::backup_hint()), buttons].spacing(theme::SPACE_SM);
 
-    // The running operation and the outcomes, above the panel (in view without
-    // scrolling).
-    match (&backup.export, &backup.restore) {
-        (BackupState::Running, _) => col = col.push(busy(strings::exporting(), phase)),
-        (_, BackupState::Running) => col = col.push(busy(strings::restoring(), phase)),
-        _ => {}
-    }
-    if backup.panel == BackupPanel::Export {
-        match &backup.export {
-            BackupState::Done(report) => col = col.push(export_report(report)),
-            BackupState::Failed(error) => {
-                col = col.push(outcome_error(strings::export_failed(), error));
-            }
-            BackupState::Idle | BackupState::Running => {}
-        }
+    // The running restore and its outcome, above the panel (in view without scrolling).
+    if backup.restore.running() {
+        col = col.push(busy(strings::restoring(), app.busy_phase));
     }
     if backup.panel == BackupPanel::Restore {
         match &backup.restore {
@@ -607,8 +597,7 @@ fn backup_view(backup: &Backup, phase: u32) -> Element<'_, Message> {
     }
     match backup.panel {
         BackupPanel::Closed => {}
-        BackupPanel::Export => col = col.push(export_panel(backup)),
-        BackupPanel::Restore => col = col.push(restore_panel(backup)),
+        BackupPanel::Restore => col = col.push(restore_panel(backup, running)),
     }
     col.into()
 }
@@ -648,69 +637,8 @@ fn field_error(backup: &Backup) -> Element<'_, Message> {
     }
 }
 
-fn export_panel(backup: &Backup) -> Element<'_, Message> {
-    panel(
-        column![
-            heading(strings::export_backup()),
-            field(
-                strings::backup_file(),
-                path_row(&backup.export_path, PickTarget::ExportBackup, |v| {
-                    backup_msg(BackupMsg::ExportPath(v))
-                }),
-                None,
-            ),
-            row![
-                field(
-                    strings::backup_password(),
-                    input(&backup.export_password.0, true, |v| {
-                        backup_msg(BackupMsg::ExportPassword(Password(v)))
-                    })
-                    .into(),
-                    None,
-                ),
-                field(
-                    strings::backup_password_confirm(),
-                    input(&backup.export_confirm.0, true, |v| {
-                        backup_msg(BackupMsg::ExportConfirm(Password(v)))
-                    })
-                    .on_submit(backup_msg(BackupMsg::Export))
-                    .into(),
-                    None,
-                ),
-            ]
-            .spacing(theme::SPACE_SM),
-            field_error(backup),
-            export_actions(backup),
-        ]
-        .spacing(theme::SPACE_SM),
-    )
-}
-
-/// Export / Cancel, or the inline question about an existing file.
-fn export_actions(backup: &Backup) -> Element<'_, Message> {
-    if backup.confirm_overwrite {
-        return confirm_with(
-            strings::export_overwrite_confirm(),
-            strings::overwrite(),
-            backup_msg(BackupMsg::ConfirmOverwrite),
-            backup_msg(BackupMsg::CancelOverwrite),
-        );
-    }
-    let idle = !backup.running() && !backup.export_checking;
-    row![
-        primary(
-            strings::export(),
-            idle.then(|| backup_msg(BackupMsg::Export))
-        ),
-        plain(strings::cancel(), Some(backup_msg(BackupMsg::Cancel))),
-    ]
-    .spacing(theme::SPACE_XS)
-    .align_y(Alignment::Center)
-    .into()
-}
-
-fn restore_panel(backup: &Backup) -> Element<'_, Message> {
-    let running = backup.running();
+/// The restore form; Restore is off while `running` (a restore or an export).
+fn restore_panel(backup: &Backup, running: bool) -> Element<'_, Message> {
     let mode = |label, mode: ImportMode| {
         button(text(label))
             .padding(Padding::from([theme::SPACE_2XS, theme::SPACE_MD]))
@@ -777,7 +705,10 @@ fn restore_panel(backup: &Backup) -> Element<'_, Message> {
     )
 }
 
-fn outcome_error<'a>(title: &'a str, error: &'a hoprs_core::Error) -> Element<'a, Message> {
+pub(super) fn outcome_error<'a>(
+    title: &'a str,
+    error: &'a hoprs_core::Error,
+) -> Element<'a, Message> {
     column![
         text(title).size(theme::TEXT_SM).color(palette().error),
         failure(Some(error)),
@@ -787,7 +718,7 @@ fn outcome_error<'a>(title: &'a str, error: &'a hoprs_core::Error) -> Element<'a
 }
 
 /// A titled list of names (mono), skipped when empty.
-fn names<'a>(
+pub(super) fn names<'a>(
     col: iced::widget::Column<'a, Message>,
     title: &'a str,
     items: impl IntoIterator<Item = String>,
@@ -820,31 +751,6 @@ fn names<'a>(
         ]
         .spacing(theme::SPACE_2XS),
     )
-}
-
-fn export_report(report: &ExportReport) -> Element<'_, Message> {
-    let mut col = column![text(strings::export_done(
-        report.sites,
-        report.workspaces,
-        report.secrets
-    ))]
-    .spacing(theme::SPACE_SM);
-    col = names(
-        col,
-        strings::backup_missing_secrets(),
-        report.missing_secrets.iter().cloned(),
-        false,
-    );
-    col = names(
-        col,
-        strings::backup_skipped_unreadable(),
-        report
-            .skipped_unreadable
-            .iter()
-            .map(|entry| strings::unreadable_name(entry.name.as_deref(), entry.file, entry.index)),
-        false,
-    );
-    col.into()
 }
 
 fn restore_report(report: &BackupImportReport) -> Element<'_, Message> {
