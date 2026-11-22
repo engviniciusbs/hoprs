@@ -247,14 +247,17 @@ pub fn site_edited(site: &str) -> String {
 /// session is not closed under it). Names no host.
 pub fn site_edited_busy(site: &str) -> String {
     format!(
-        "The site \"{site}\" was edited in hoprs while a transfer still uses its connection to the previous server. Wait until the site's transfers in the hoprs queue have ended, then call the tool again."
+        "The site \"{site}\" was edited in hoprs while a transfer still uses its connection to the previous server. Wait until the site's transfers in the hoprs queue have ended (if one is paused, ask the user to resume or cancel it in hoprs), then call the tool again."
     )
 }
 /// `transfer_status` of anything but an agent's transfer on a site the caller may read:
 /// one text for an unknown id, a user's transfer, a cleared one and a closed site.
 pub const NO_SUCH_TRANSFER: &str = "No such agent transfer. Pass the transfer number that download or upload answered; a transfer cleared from the hoprs queue, or on a site no longer open to agents, is not known.";
 /// A connection needs an answer from the user.
-pub const WAITING_FOR_USER: &str = "hoprs is waiting for the user: a question about this connection (host key, certificate, password or passphrase) must be answered in the hoprs window. Ask the user, then call the tool again.";
+/// Sent when the attempt's [`PROMPT_WAIT`] ran out with a dialog open: an agent-only
+/// session is closed then (its dialog withdrawn), a tab's is left with its dialog, so the
+/// text holds for both. The minutes match [`PROMPT_WAIT`] (pinned by a test).
+pub const WAITING_FOR_USER: &str = "hoprs asked the user a question about this connection (host key, certificate, password or passphrase) in the hoprs window and got no answer within two minutes; the question may have been withdrawn. Ask the user to be at the hoprs window, then call the tool again: the question appears again (or is still there) and waits two minutes for the answer.";
 /// The server's host key changed.
 pub const HOST_KEY_CHANGED: &str = "The server's host key changed. The user has to resolve it in the hoprs window; an agent cannot accept a new key.";
 /// The server's `instructions`.
@@ -357,6 +360,10 @@ mod tests {
         assert!(ssh_only("Acme").contains("SSH"));
         assert!(protected("/home/u/.ssh/id").starts_with("/home/u/.ssh/id is protected"));
         assert!(WAITING_FOR_USER.contains("hoprs window"));
+        assert_eq!(PROMPT_WAIT, Duration::from_secs(120));
+        assert!(WAITING_FOR_USER.contains("within two minutes"));
+        assert!(WAITING_FOR_USER.contains("waits two minutes"));
+        assert!(site_edited_busy("Acme").contains("resume or cancel it in hoprs"));
         assert!(HOST_KEY_CHANGED.contains("host key changed"));
         assert!(INSTRUCTIONS.contains("list_sites"));
         assert!(INSTRUCTIONS.contains("log"));

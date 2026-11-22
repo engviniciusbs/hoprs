@@ -59,6 +59,24 @@ rows were written, so the NEEDS HUMAN rows are the first real run.
 | Every new text in English, pt-BR and Turkish | Pass: `every_en_key_is_used`, `same_keys_and_variables_in_both_languages`, `error_codes_exist_in_both_catalogs`, `pt_br_values_differ_from_english`, `tr_values_differ_from_english` |
 | The look and behaviour on real machines, with a real MCP client, in English, pt-BR and Turkish | NEEDS HUMAN: steps below |
 
+## End-to-end run (2026-11-22, not in CI)
+
+What ran: the real app, the real `hoprs mcp` relay and the Docker sshd together on Linux, in
+a container with a virtual display (a debug build, a scripted MCP client speaking both
+protocol eras).
+
+Result: all twelve steps passed. The thirteen tools; the three levels; a "No access" site
+answering exactly like an unknown one; nine protected-path refusals, the program itself
+included; a timed-out command (killed on the server); the switch turned off in the UI during
+a running call; hoprs not running; an unknown host key raised by an agent (the dialog with
+its "An agent asked for this connection." line, the two-minute wait, the answer while a call
+waits). The indicator, the queue tag and the sidebar mark were seen in screenshots.
+
+What it does not replace: a real Claude Code session, macOS and Windows, a normal window
+close, FTP sites, a changed host key, password and passphrase prompts, a version mismatch,
+the limits on relays and calls, the idle close. The NEEDS HUMAN rows below keep their
+status; rows 1 and 2 stay required before the 1.6.0 tag.
+
 ## NEEDS HUMAN
 
 Run each row on Linux, macOS and Windows unless it says otherwise. Use a vault with four
@@ -112,8 +130,9 @@ Have Claude Code (a recent version) in a terminal on the same computer.
    A password prompt (a site with no saved password) behaves the same way, and a typed
    password with "save" ticked is stored once the connection works.
 5. **A question left unanswered.** Raise the dialog again and leave it for two minutes: the
-   agent gets "hoprs is waiting for the user…", the dialog disappears, and the session is
-   closed. Ask again: the dialog comes back.
+   agent gets "hoprs asked the user a question about this connection… and got no answer
+   within two minutes…", the dialog disappears, and the session is closed. Ask again: the
+   dialog comes back and waits two minutes.
 6. **A changed host key.** Edit `known_hosts` so the key of `rw` is wrong: the agent gets
    "The server's host key changed…" and the hoprs window offers no accept for it.
 7. **The switch turned off mid-session.** Turn Settings › Agents (MCP) off while the agent is

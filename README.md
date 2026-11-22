@@ -463,10 +463,11 @@ tooltip counts them). It appears with the agent's first call, when `hoprs mcp` c
 hoprs, not when the MCP client starts it. A small "agent" tag on its transfers in the queue
 (you can pause or cancel them there); "Connected (by an agent)" on its sites in the
 sidebar; and one line per action in the log, from `agent`, for example
-``ran `systemctl status nginx` on "Acme" (exit 0)``. The log holds the command line and the paths, never file content or command
-output. Turning the switch off closes the channel and the agents' sessions at once, except a
-session an unfinished transfer still uses (it stays until the transfer ends; a paused
-transfer keeps it), and the agent's next calls say so.
+``ran `systemctl status nginx` on "Acme" (exit 0)``. The log holds the command line and
+the paths, never file content or command output. Turning the switch off closes the channel
+and the agents' sessions at once, except a session an unfinished transfer still uses (it
+stays until the transfer ends; a paused transfer keeps it), and the agent's next calls say
+so.
 
 **Read this before you choose "Allow everything".** An agent can be misled by what it reads:
 a file, a command's output. hoprs does not review what the agent does, and it does not ask
