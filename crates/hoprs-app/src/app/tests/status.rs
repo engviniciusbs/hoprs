@@ -675,6 +675,7 @@ async fn close_request_cancels_dialogs_and_ignores_input() {
     drive(&mut app, &fake, sites).await;
     let session = session_of(&app, &a.id);
     let request = |id: u64| PromptRequest {
+        by_agent: false,
         id: PromptId(id),
         session,
         site: a.id.clone(),

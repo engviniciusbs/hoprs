@@ -372,6 +372,7 @@ fn no_secret_reaches_the_log() {
         }
         let session = session.expect("the session started");
         fake.push_prompt(BrokerEvent::Request(PromptRequest {
+            by_agent: false,
             id: PromptId(7),
             session,
             site: s.id.clone(),

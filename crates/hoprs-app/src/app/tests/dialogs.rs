@@ -13,6 +13,7 @@ use crate::ui::dialogs;
 
 fn request(id: u64, session: u64, key: &str, kind: PromptKind) -> PromptRequest {
     PromptRequest {
+        by_agent: false,
         id: PromptId(id),
         session: SessionId(session),
         site: SiteId::new(),
@@ -590,6 +591,7 @@ fn cert_changed_shows_both_fingerprints() {
 
     // An untrusted one shows its fingerprint and reason; no "trusted before".
     let untrusted = PromptRequest {
+        by_agent: false,
         kind: certificate(CertProblem::Untrusted {
             reason: CertReason::WrongName,
         }),
@@ -1117,6 +1119,7 @@ async fn closing_a_connecting_tab_drops_its_prompts() {
     connect_effect(app.update(Message::OpenWorkspace(w.id.clone())));
     assert_eq!(app.tab_conn(0).state, TabState::Connecting);
     let of = |site: &Site, id: u64, session: u64, kind: PromptKind| PromptRequest {
+        by_agent: false,
         site: site.id.clone(),
         ..request(id, session, "h:22", kind)
     };

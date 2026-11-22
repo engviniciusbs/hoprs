@@ -35,6 +35,17 @@
 //! authentication or TLS, never after `close`, and only for a session that was connected
 //! before); the next such drop waits for the user (the app reconnects on their next action).
 //! The budget comes back once the session is connected again.
+//!
+//! **Sessions for agents (Plan 17).** [`connect_for_agent`](SessionManager::connect_for_agent)
+//! is the one-site connect an agent's call takes. A session it *starts* is `agent_only` and
+//! its prompter is [`by_agent`](SessionPrompter::by_agent) (its dialogs say an agent asked);
+//! a session the site already has is reused as it is (a tab's stays the tab's, and is not
+//! retried for the agent if it is `Disconnected`: that is the user's to do). When the user
+//! connects a site whose session is `agent_only` (`connect_batch`), the tab takes it over:
+//! the flag is cleared, and the agent side never closes it
+//! ([`close_agent_session`](SessionManager::close_agent_session) closes `agent_only`
+//! sessions only). Nothing here opens a tab or reaches the UI: the app sees an agent's
+//! session only through the dialogs and [`agent_sites`](SessionManager::agent_sites).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -49,7 +60,7 @@ use hoprs_core::{
     ConnectionState, Error, ErrorKind, Protocol, ReconnectPolicy, Result, Site, SiteId,
 };
 use hoprs_remote::{Connection, FtpFs, LocalFs, RemoteFs, SftpConfig, SftpFs};
-use hoprs_ssh::{PtyRequest, SshSession};
+use hoprs_ssh::{ExecLimits, ExecOutput, PtyRequest, SshSession};
 use hoprs_transfer::{SiteEndpoints, TransferEngine, spawn_site_watcher};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
@@ -128,6 +139,13 @@ impl Default for SessionConfig {
     }
 }
 
+/// Who asks for a connection: the user (a tab, a workspace) or an agent's call.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum Caller {
+    User,
+    Agent,
+}
+
 /// The live connection of a session.
 #[derive(Clone)]
 enum Link {
@@ -198,6 +216,8 @@ struct Entry {
     /// Set once the first connection is up and the site is registered.
     remote: Option<Arc<dyn RemoteFs>>,
     watcher: Option<JoinHandle<()>>,
+    /// Started by an agent's call and not used by a tab since (see the module docs).
+    agent_only: bool,
 }
 
 /// Connects, registers, watches and closes sessions. Cheap to clone.
@@ -344,7 +364,7 @@ impl SessionManager {
     /// Results come in the order of `sites`; a site missing from the vault is `NotFound`.
     #[cfg(test)]
     pub async fn connect_many(&self, sites: Vec<SiteId>) -> Vec<(SiteId, ConnectResult)> {
-        futures_util::future::join_all(self.site_connects(sites).await).await
+        futures_util::future::join_all(self.site_connects(sites, Caller::User).await).await
     }
 
     /// Open workspace: like [`connect_many`](Self::connect_many) (one secret batch, every
@@ -356,8 +376,11 @@ impl SessionManager {
         sites: Vec<SiteId>,
         results: mpsc::UnboundedSender<(SiteId, ConnectResult)>,
     ) {
-        let mut pending: FuturesUnordered<_> =
-            self.site_connects(sites).await.into_iter().collect();
+        let mut pending: FuturesUnordered<_> = self
+            .site_connects(sites, Caller::User)
+            .await
+            .into_iter()
+            .collect();
         while let Some(result) = pending.next().await {
             // A send fails only once the receiver is gone. In the app the receiver and this
             // future live in the same stream, so they are dropped together: the remaining
@@ -367,10 +390,26 @@ impl SessionManager {
         }
     }
 
+    /// Connects `site` for an agent's call: the one-site path of
+    /// [`connect_batch`](Self::connect_batch). A session it starts is `agent_only` and its
+    /// dialogs say an agent asked; a session the site already has is reused as it is (see
+    /// the module docs). Opens no tab and takes no focus.
+    // TODO(Task 12): remove
+    #[allow(dead_code)]
+    pub async fn connect_for_agent(&self, site: SiteId) -> ConnectResult {
+        let (_, result) =
+            futures_util::future::join_all(self.site_connects(vec![site], Caller::Agent).await)
+                .await
+                .pop()
+                .expect("one result per site");
+        result
+    }
+
     /// Reads the secrets of `sites` as one batch, then one connect future per site.
     async fn site_connects(
         &self,
         sites: Vec<SiteId>,
+        caller: Caller,
     ) -> Vec<BoxFuture<'_, (SiteId, ConnectResult)>> {
         let read = match self.inner.vault.sites_with_secrets(sites.clone()).await {
             Ok(read) => read,
@@ -388,7 +427,7 @@ impl SessionManager {
             .map(|(id, found)| {
                 async move {
                     let result = match found {
-                        Ok((site, secrets)) => self.connect_site(site, secrets).await,
+                        Ok((site, secrets)) => self.connect_site(site, secrets, caller).await,
                         Err(error) => Err(ConnectError::before_start(error)),
                     };
                     (id, result)
@@ -398,21 +437,48 @@ impl SessionManager {
             .collect()
     }
 
-    async fn connect_site(&self, site: Site, secrets: SiteSecrets) -> ConnectResult {
+    async fn connect_site(
+        &self,
+        site: Site,
+        secrets: SiteSecrets,
+        caller: Caller,
+    ) -> ConnectResult {
         let site_lock = self.site_lock(&site.id);
         let _turn = site_lock.lock().await;
-        let existing = lock(&self.inner.sessions)
-            .iter()
-            .find(|(_, entry)| entry.site == site.id)
-            .map(|(id, entry)| (*id, entry.link.clone(), entry.keyring_unavailable));
+        let existing = {
+            let mut sessions = lock(&self.inner.sessions);
+            sessions
+                .iter_mut()
+                .find(|(_, entry)| entry.site == site.id)
+                .map(|(id, entry)| {
+                    let agent_only = entry.agent_only;
+                    if caller == Caller::User && entry.agent_only {
+                        // A tab takes the agent's session over: it is the user's now.
+                        entry.agent_only = false;
+                        entry.prompter.taken_over();
+                    }
+                    (
+                        *id,
+                        entry.link.clone(),
+                        entry.keyring_unavailable,
+                        agent_only,
+                    )
+                })
+        };
         // An existing session keeps the secrets (and the flag) it was started with.
         let (id, keyring_unavailable) = match existing {
-            Some((id, link, keyring_unavailable)) => {
-                // Does nothing unless `Disconnected`.
-                link.reconnect_now().await;
+            Some((id, link, keyring_unavailable, agent_only)) => {
+                // Does nothing unless `Disconnected`. An agent never retries a tab's
+                // session: that is the user's to do, in the tab.
+                if caller == Caller::User || agent_only {
+                    link.reconnect_now().await;
+                }
                 (id, keyring_unavailable)
             }
-            None => (self.start(&site, &secrets), secrets.keyring_unavailable),
+            None => (
+                self.start(&site, &secrets, caller),
+                secrets.keyring_unavailable,
+            ),
         };
         match self.ready(id).await {
             Ok(()) => Ok(Connected {
@@ -427,13 +493,17 @@ impl SessionManager {
         }
     }
 
-    /// Starts the connection of `site` under a new session id.
-    fn start(&self, site: &Site, secrets: &SiteSecrets) -> SessionId {
+    /// Starts the connection of `site` under a new session id; an agent's is
+    /// `agent_only` and its dialogs say so.
+    fn start(&self, site: &Site, secrets: &SiteSecrets, caller: Caller) -> SessionId {
         let id = SessionId(self.inner.next_id.fetch_add(1, Ordering::SeqCst));
-        let prompter = self
+        let mut prompter = self
             .inner
             .broker
             .session(id, site.id.clone(), &site.host, site.port);
+        if caller == Caller::Agent {
+            prompter = prompter.by_agent();
+        }
         let config = &self.inner.config;
         let keepalive = self.keepalive();
         let reconnect = config.reconnect.clone().unwrap_or_default();
@@ -469,10 +539,12 @@ impl SessionManager {
             label,
             prompter,
             secrets.keyring_unavailable,
+            caller,
         );
         id
     }
 
+    #[allow(clippy::too_many_arguments)] // one call per kind of session
     fn insert(
         &self,
         id: SessionId,
@@ -481,6 +553,7 @@ impl SessionManager {
         label: SessionLabel,
         prompter: SessionPrompter,
         keyring_unavailable: bool,
+        caller: Caller,
     ) {
         let activity = Arc::new(Activity::new());
         // Subscribed before the entry exists: the monitor sees every state from the first.
@@ -495,6 +568,7 @@ impl SessionManager {
             keyring_unavailable,
             remote: None,
             watcher: None,
+            agent_only: caller == Caller::Agent,
         };
         lock(&self.inner.sessions).insert(id, entry);
     }
@@ -657,10 +731,32 @@ impl SessionManager {
     /// first connection holds it, and closing is what ends that wait. A `ready` still
     /// running for this session notices the close and pauses the site again itself.
     pub async fn close(&self, id: SessionId) {
+        self.close_where(id, |_| true).await;
+    }
+
+    /// Closes the session of `site` if it is `agent_only` (no tab uses it); a tab's
+    /// session is left alone. Whether a session was closed.
+    // TODO(Task 12): remove
+    #[allow(dead_code)]
+    pub async fn close_agent_session(&self, site: &SiteId) -> bool {
+        let Some(id) = self.session_of(site) else {
+            return false;
+        };
+        // Checked again under the lock that removes it: a tab taking the session over in
+        // between keeps it.
+        self.close_where(id, |entry| entry.agent_only).await
+    }
+
+    /// [`close`](Self::close), if the session exists and `closes` says so (read under
+    /// the sessions lock that removes it). Whether it was closed.
+    async fn close_where(&self, id: SessionId, closes: impl FnOnce(&Entry) -> bool) -> bool {
         let (entry, replaced) = {
             let mut sessions = lock(&self.inner.sessions);
+            if !sessions.get(&id).is_some_and(closes) {
+                return false;
+            }
             let Some(entry) = sessions.remove(&id) else {
-                return;
+                return false;
             };
             let replaced = sessions.values().any(|other| other.site == entry.site);
             (entry, replaced)
@@ -685,6 +781,69 @@ impl SessionManager {
         }
         entry.link.disconnect().await;
         drop(entry);
+        true
+    }
+
+    /// The sites whose session only an agent uses, sorted.
+    // TODO(Task 12): remove
+    #[allow(dead_code)]
+    pub fn agent_sites(&self) -> Vec<SiteId> {
+        let mut sites: Vec<SiteId> = lock(&self.inner.sessions)
+            .values()
+            .filter(|entry| entry.agent_only)
+            .map(|entry| entry.site.clone())
+            .collect();
+        sites.sort_by(|a, b| a.0.cmp(&b.0));
+        sites.dedup();
+        sites
+    }
+
+    /// The session of `site`, in any state.
+    // TODO(Task 12): remove
+    #[allow(dead_code)]
+    pub(crate) fn session_of(&self, site: &SiteId) -> Option<SessionId> {
+        lock(&self.inner.sessions)
+            .iter()
+            .find(|(_, entry)| entry.site == *site)
+            .map(|(id, _)| *id)
+    }
+
+    /// The session of `site` while it is connected and its remote filesystem is built.
+    // TODO(Task 12): remove
+    #[allow(dead_code)]
+    pub fn connected_session(&self, site: &SiteId) -> Option<SessionId> {
+        lock(&self.inner.sessions)
+            .iter()
+            .find(|(_, entry)| {
+                entry.site == *site
+                    && entry.remote.is_some()
+                    && matches!(*entry.link.state().borrow(), ConnectionState::Connected)
+            })
+            .map(|(id, _)| *id)
+    }
+
+    /// Runs `command` on its own exec channel of the SSH session `id` (see
+    /// [`SshSession::exec`]); the session counts as used. Not for FTP sessions.
+    // TODO(Task 12): remove
+    #[allow(dead_code)]
+    pub async fn exec(
+        &self,
+        id: SessionId,
+        command: String,
+        limits: ExecLimits,
+    ) -> Result<ExecOutput> {
+        let link = {
+            let sessions = lock(&self.inner.sessions);
+            sessions.get(&id).ok_or_else(closed)?.link.clone()
+        };
+        let Link::Ssh(session) = link else {
+            return Err(Error::new(ErrorKind::Protocol, "Commands need an SSH site"));
+        };
+        self.touch(id);
+        let output = session.exec(&command, limits).await;
+        // A long command: the session was in use until now.
+        self.touch(id);
+        output
     }
 
     /// Opens a terminal of `cols` x `rows` on the SSH session `id` (see
@@ -811,16 +970,39 @@ impl SessionManager {
 
     /// Adds a session over a test connection and `remote`, then readies it like `connect`.
     #[cfg(test)]
-    async fn attach(
+    pub(crate) async fn attach(
         &self,
         site: SiteId,
         conn: Arc<dyn Connection>,
         remote: Arc<dyn RemoteFs>,
     ) -> Result<SessionId> {
+        self.attach_as(site, conn, remote, Caller::User).await
+    }
+
+    /// [`attach`](Self::attach) as [`connect_for_agent`](Self::connect_for_agent) would
+    /// start it: `agent_only`, its dialogs flagged.
+    #[cfg(test)]
+    pub(crate) async fn attach_for_agent(
+        &self,
+        site: SiteId,
+        conn: Arc<dyn Connection>,
+        remote: Arc<dyn RemoteFs>,
+    ) -> Result<SessionId> {
+        self.attach_as(site, conn, remote, Caller::Agent).await
+    }
+
+    #[cfg(test)]
+    async fn attach_as(
+        &self,
+        site: SiteId,
+        conn: Arc<dyn Connection>,
+        remote: Arc<dyn RemoteFs>,
+        caller: Caller,
+    ) -> Result<SessionId> {
         let mut test_site = Site::new("test", "test", "u", Protocol::Ftp);
         test_site.id = site;
         test_site.port = 0;
-        self.attach_site(&test_site, conn, remote).await
+        self.attach_site_as(&test_site, conn, remote, caller).await
     }
 
     /// [`attach`](Self::attach) for a given saved site (what the connection log names).
@@ -831,18 +1013,32 @@ impl SessionManager {
         conn: Arc<dyn Connection>,
         remote: Arc<dyn RemoteFs>,
     ) -> Result<SessionId> {
+        self.attach_site_as(site, conn, remote, Caller::User).await
+    }
+
+    #[cfg(test)]
+    async fn attach_site_as(
+        &self,
+        site: &Site,
+        conn: Arc<dyn Connection>,
+        remote: Arc<dyn RemoteFs>,
+        caller: Caller,
+    ) -> Result<SessionId> {
         let id = SessionId(self.inner.next_id.fetch_add(1, Ordering::SeqCst));
-        let prompter = self
+        let mut prompter = self
             .inner
             .broker
             .session(id, site.id.clone(), &site.host, site.port);
+        if caller == Caller::Agent {
+            prompter = prompter.by_agent();
+        }
         let link = Link::Fake {
             conn,
             reconnects: Arc::new(AtomicUsize::new(0)),
         };
         let attempts = self.inner.config.reconnect.clone().unwrap_or_default();
         let label = SessionLabel::of(site, attempts.max_attempts);
-        self.insert(id, site.id.clone(), link, label, prompter, false);
+        self.insert(id, site.id.clone(), link, label, prompter, false, caller);
         lock(&self.inner.test_remotes).insert(id, remote);
         let site_lock = self.site_lock(&site.id);
         let _turn = site_lock.lock().await;
@@ -1553,6 +1749,151 @@ mod tests {
             assert_eq!(f.manager.fake_reconnects(id), 2, "{refused:?}");
         }
         f.manager.close(id).await;
+    }
+
+    /// A saved FTP site the fixture's vault knows, for the user's connect path.
+    async fn saved_site(f: &Fixture) -> Site {
+        let mut site = Site::new("agent", "127.0.0.1", "u", Protocol::Ftp);
+        site.port = 1;
+        f.vault.upsert_site(site.clone()).await.unwrap();
+        site
+    }
+
+    fn connected_link() -> Arc<FakeConn> {
+        let (state, _) = watch::channel(ConnectionState::Connected);
+        Arc::new(FakeConn::new(state))
+    }
+
+    /// A session an agent opened is the agent's until the user connects the same site:
+    /// then it is the tab's (same session), and no longer listed as the agent's.
+    #[tokio::test]
+    async fn agent_session_is_marked_and_a_tab_takes_it_over() {
+        let f = fixture();
+        let site = saved_site(&f).await;
+        let id = f
+            .manager
+            .attach_for_agent(site.id.clone(), connected_link(), Arc::new(MemFs::new()))
+            .await
+            .unwrap();
+        assert_eq!(f.manager.agent_sites(), std::slice::from_ref(&site.id));
+        assert_eq!(f.manager.session_of(&site.id), Some(id));
+
+        let mut events = f.broker.take_events().unwrap();
+        let ask = |prompter: SessionPrompter| {
+            tokio::spawn(async move {
+                hoprs_ssh::Prompter::password(&prompter, "u", "h").await;
+            })
+        };
+        let asked = ask(f.manager.prompter(id).unwrap());
+        let Some(BrokerEvent::Request(request)) = events.recv().await else {
+            panic!("a dialog");
+        };
+        assert!(request.by_agent, "the agent's session says so");
+        f.broker.answer(request.id, PromptAnswer::Cancel);
+        asked.await.unwrap();
+
+        let taken = f.manager.connect(site.id.clone()).await.unwrap();
+        assert_eq!(taken.session, id, "the same session");
+        assert!(f.manager.agent_sites().is_empty());
+        // Its dialogs are the user's now.
+        let asked = ask(f.manager.prompter(id).unwrap());
+        let Some(BrokerEvent::Request(request)) = events.recv().await else {
+            panic!("a dialog");
+        };
+        assert!(!request.by_agent);
+        f.broker.answer(request.id, PromptAnswer::Cancel);
+        asked.await.unwrap();
+        // An agent's connect afterwards reuses it as it is: still the tab's.
+        let again = f.manager.connect_for_agent(site.id.clone()).await.unwrap();
+        assert_eq!(again.session, id);
+        assert!(f.manager.agent_sites().is_empty());
+    }
+
+    /// The agent side never closes a session a tab uses.
+    #[tokio::test]
+    async fn close_agent_session_spares_a_tab_session() {
+        let f = fixture();
+        let user_site = SiteId::new();
+        let user = f
+            .manager
+            .attach(user_site.clone(), connected_link(), Arc::new(MemFs::new()))
+            .await
+            .unwrap();
+        assert!(!f.manager.close_agent_session(&user_site).await);
+        assert!(f.manager.state(user).is_some(), "still there");
+        assert!(f.manager.remote(user).is_ok());
+
+        let agent_site = SiteId::new();
+        let agent = f
+            .manager
+            .attach_for_agent(agent_site.clone(), connected_link(), Arc::new(MemFs::new()))
+            .await
+            .unwrap();
+        assert!(f.manager.close_agent_session(&agent_site).await);
+        assert!(f.manager.state(agent).is_none(), "gone");
+        assert!(f.manager.agent_sites().is_empty());
+        // Nothing left to close.
+        assert!(!f.manager.close_agent_session(&agent_site).await);
+        assert!(!f.manager.close_agent_session(&SiteId::new()).await);
+    }
+
+    /// `connected_session` names a session only while it is connected and its remote
+    /// filesystem is built.
+    #[tokio::test]
+    async fn connected_session_needs_a_live_connection() {
+        let f = fixture();
+        let site = SiteId::new();
+        assert_eq!(f.manager.connected_session(&site), None);
+        let conn = connected_link();
+        let id = f
+            .manager
+            .attach_for_agent(site.clone(), conn.clone(), Arc::new(MemFs::new()))
+            .await
+            .unwrap();
+        assert_eq!(f.manager.connected_session(&site), Some(id));
+        conn.state
+            .send_replace(ConnectionState::Disconnected(Error::new(
+                ErrorKind::Network,
+                "gone",
+            )));
+        assert_eq!(f.manager.connected_session(&site), None);
+        assert_eq!(f.manager.session_of(&site), Some(id), "any state");
+        conn.state
+            .send_replace(ConnectionState::Reconnecting { attempt: 1 });
+        assert_eq!(f.manager.connected_session(&site), None);
+        conn.state.send_replace(ConnectionState::Connected);
+        assert_eq!(f.manager.connected_session(&site), Some(id));
+    }
+
+    /// Commands run over SSH only; a closed session is the "session closed" error.
+    #[tokio::test]
+    async fn exec_needs_ssh() {
+        let f = fixture();
+        let site = SiteId::new();
+        let id = f
+            .manager
+            .attach_for_agent(site, connected_link(), Arc::new(MemFs::new()))
+            .await
+            .unwrap();
+        let limits = hoprs_ssh::ExecLimits {
+            stream_bytes: 1024,
+            timeout: Duration::from_secs(5),
+        };
+        let e = f
+            .manager
+            .exec(id, "uptime".into(), limits)
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind, ErrorKind::Protocol);
+        assert_eq!(e.message, "Commands need an SSH site");
+        f.manager.close(id).await;
+        assert_eq!(
+            f.manager
+                .exec(id, "uptime".into(), limits)
+                .await
+                .unwrap_err(),
+            closed()
+        );
     }
 
     #[tokio::test]

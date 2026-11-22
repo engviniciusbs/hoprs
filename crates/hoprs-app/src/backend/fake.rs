@@ -1904,6 +1904,7 @@ mod tests {
         fake.fail_next_connect(&site.id, Error::new(ErrorKind::Auth, "Denied"));
         let ask = |id: u64, kind: PromptKind| {
             fake.push_prompt(BrokerEvent::Request(PromptRequest {
+                by_agent: false,
                 id: PromptId(id),
                 session: SessionId(1),
                 site: site.id.clone(),

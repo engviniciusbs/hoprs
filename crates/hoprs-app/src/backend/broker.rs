@@ -24,6 +24,10 @@
 //!   password the server refused before keyboard-interactive or a key succeeded, or a wrong
 //!   passphrase skipped for another method, is never reported, so never saved. A later
 //!   answer of the same kind replaces the pending one.
+//! - **Asked by an agent:** the prompter of a session an agent started
+//!   ([`SessionPrompter::by_agent`]) flags each of its requests ([`PromptRequest::by_agent`]):
+//!   the dialog says so. The agent never answers or skips one; it only waits, and
+//!   [`PromptBroker::has_open`] tells whether a session is waiting on the user.
 //! - **Pins:** `store_pin` writes the accepted certificate to the session's site, if the
 //!   site still points at the session's `host:port`
 //!   ([`Vault::set_ftps_pin`](hoprs_vault::Vault::set_ftps_pin)); `pin_superseded` (a trusted
@@ -32,7 +36,7 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use async_trait::async_trait;
@@ -61,6 +65,10 @@ pub struct PromptRequest {
     /// `host:port` of the connection asking.
     pub key: String,
     pub kind: PromptKind,
+    /// The session was started by an agent's call (the dialog says so).
+    // TODO(Task 14): remove
+    #[allow(dead_code)]
+    pub by_agent: bool,
 }
 
 /// What a dialog asks.
@@ -160,6 +168,9 @@ struct State {
     pending: HashMap<PromptId, oneshot::Sender<PromptAnswer>>,
     /// Open host key / certificate dialogs, by `key`.
     decisions: HashMap<String, InFlight>,
+    /// Per session, its dialogs open in the UI plus its waits on another session's
+    /// dialog (see [`PromptBroker::has_open`]). A session with none has no entry.
+    open: HashMap<SessionId, usize>,
 }
 
 /// An open host key or certificate dialog that others may wait on.
@@ -215,7 +226,16 @@ impl PromptBroker {
             key: endpoint_key(host, port),
             cancel: CancellationToken::new(),
             pending: Arc::default(),
+            by_agent: Arc::default(),
         }
+    }
+
+    /// Whether a dialog of `session` is open in the UI, or `session` waits on another
+    /// session's host key or certificate dialog: the session is waiting on the user.
+    // TODO(Task 12): remove
+    #[allow(dead_code)]
+    pub fn has_open(&self, session: SessionId) -> bool {
+        self.state().open.contains_key(&session)
     }
 
     /// Delivers the UI's answer. Returns false if the dialog is no longer open.
@@ -242,12 +262,14 @@ impl PromptBroker {
         self.state().pending.insert(id, reply);
         // Withdraws the dialog however this future ends without an answer (dropped too).
         let _open = OpenDialog { broker: self, id };
+        let _waiting = Waiting::new(self, from.session);
         let request = PromptRequest {
             id,
             session: from.session,
             site: from.site.clone(),
             key,
             kind,
+            by_agent: from.is_by_agent(),
         };
         if self
             .inner
@@ -314,6 +336,7 @@ impl PromptBroker {
                     };
                 }
                 Turn::Wait { same, mut answer } => {
+                    let _waiting = Waiting::new(self, from.session);
                     let decided = tokio::select! {
                         decided = answer.wait_for(Option::is_some) => {
                             decided.ok().and_then(|value| *value)
@@ -360,6 +383,31 @@ impl Drop for OpenDialog<'_> {
                 .inner
                 .events
                 .send(BrokerEvent::Withdrawn(self.id));
+        }
+    }
+}
+
+/// Counts one dialog or wait of a session in [`State::open`] while it lives.
+struct Waiting<'a> {
+    broker: &'a PromptBroker,
+    session: SessionId,
+}
+
+impl<'a> Waiting<'a> {
+    fn new(broker: &'a PromptBroker, session: SessionId) -> Waiting<'a> {
+        *broker.state().open.entry(session).or_default() += 1;
+        Waiting { broker, session }
+    }
+}
+
+impl Drop for Waiting<'_> {
+    fn drop(&mut self) {
+        let mut state = self.broker.state();
+        if let Some(count) = state.open.get_mut(&self.session) {
+            *count -= 1;
+            if *count == 0 {
+                state.open.remove(&self.session);
+            }
         }
     }
 }
@@ -413,9 +461,28 @@ pub struct SessionPrompter {
     /// Typed secrets to save once the session connects (see the module docs), with
     /// whether they proved right.
     pending: Arc<Mutex<HashMap<SecretKind, Pending>>>,
+    /// The session was started by an agent (shared by the clones: the user's connect of
+    /// the same site takes it over and clears it).
+    by_agent: Arc<AtomicBool>,
 }
 
 impl SessionPrompter {
+    /// This session was started by an agent's call: its dialogs say so.
+    pub fn by_agent(self) -> Self {
+        self.by_agent.store(true, Ordering::SeqCst);
+        self
+    }
+
+    /// The user connected this session's site from a tab: its dialogs are the user's
+    /// from now on.
+    pub fn taken_over(&self) {
+        self.by_agent.store(false, Ordering::SeqCst);
+    }
+
+    fn is_by_agent(&self) -> bool {
+        self.by_agent.load(Ordering::SeqCst)
+    }
+
     /// The session is closing: refuses its open prompts (their dialogs are withdrawn) and
     /// every later one.
     pub fn cancel(&self) {
@@ -1032,6 +1099,91 @@ mod tests {
         // Debug of an answer shows the flag, never the secret.
         let debug = format!("{:?}", secret("hunter2", true));
         assert_eq!(debug, "Secret(<redacted>, save: true)");
+    }
+
+    /// A session an agent started says so on each of its dialogs; another session's
+    /// dialogs do not.
+    #[tokio::test]
+    async fn agent_prompts_are_flagged() {
+        let mut f = fixture();
+        let agent = f.prompter(1).by_agent();
+        let user = f.prompter(2);
+
+        let q = agent.clone();
+        let ask = tokio::spawn(async move { Prompter::password(&q, "u", "h").await });
+        let r = f.next_request().await;
+        assert!(r.by_agent, "{r:?}");
+        assert_eq!(r.session, SessionId(1));
+        f.broker.answer(r.id, PromptAnswer::Cancel);
+        join(ask).await;
+
+        let ask = ask_cert(agent.clone(), "SHA256:AA");
+        let r = f.next_request().await;
+        assert!(r.by_agent, "a decision too: {r:?}");
+        f.broker.answer(r.id, PromptAnswer::Decision(false));
+        join(ask).await;
+
+        let q = user.clone();
+        let ask = tokio::spawn(async move { Prompter::password(&q, "u", "h").await });
+        let r = f.next_request().await;
+        assert!(!r.by_agent, "{r:?}");
+        f.broker.answer(r.id, PromptAnswer::Cancel);
+        join(ask).await;
+    }
+
+    /// `has_open` is true while a dialog of the session is shown or the session waits on
+    /// another session's host-key dialog, and false once that ends.
+    #[tokio::test]
+    async fn has_open_follows_the_dialog() {
+        let mut f = fixture();
+        let p = f.prompter(1);
+        assert!(!f.broker.has_open(SessionId(1)));
+
+        let q = p.clone();
+        let ask = tokio::spawn(async move { Prompter::password(&q, "u", "h").await });
+        let r = f.next_request().await;
+        assert!(f.broker.has_open(SessionId(1)));
+        assert!(!f.broker.has_open(SessionId(2)), "another session");
+        f.broker.answer(r.id, secret("pw", false));
+        join(ask).await;
+        assert!(!f.broker.has_open(SessionId(1)));
+
+        // Session 2 waits on session 1's host-key dialog for the same `host:port`.
+        let p1 = f.prompter(1);
+        let leader = tokio::spawn(async move {
+            p1.confirm_host_key("h", 21, "ssh-ed25519", "SHA256:AA", &[])
+                .await
+        });
+        let r = f.next_request().await;
+        let p2 = f.prompter(2);
+        let waiter = tokio::spawn({
+            let p2 = p2.clone();
+            async move {
+                p2.confirm_host_key("h", 21, "ssh-ed25519", "SHA256:AA", &[])
+                    .await
+            }
+        });
+        f.quiet().await;
+        assert!(f.broker.has_open(SessionId(1)));
+        assert!(
+            f.broker.has_open(SessionId(2)),
+            "waiting on the other's dialog"
+        );
+        f.broker.answer(r.id, PromptAnswer::Decision(true));
+        assert!(join(leader).await);
+        assert!(join(waiter).await);
+        assert!(!f.broker.has_open(SessionId(1)));
+        assert!(!f.broker.has_open(SessionId(2)));
+
+        // Closing the session ends its dialog.
+        let q = p.clone();
+        let ask = tokio::spawn(async move { Prompter::password(&q, "u", "h").await });
+        let r = f.next_request().await;
+        assert!(f.broker.has_open(SessionId(1)));
+        p.cancel();
+        assert!(join(ask).await.is_none());
+        assert_eq!(f.next().await, BrokerEvent::Withdrawn(r.id));
+        assert!(!f.broker.has_open(SessionId(1)));
     }
 
     #[tokio::test]

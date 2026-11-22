@@ -17,6 +17,7 @@ fn open() -> Message {
 
 pub(super) fn host_key_prompt(id: u64) -> Message {
     Message::Prompt(BrokerEvent::Request(PromptRequest {
+        by_agent: false,
         id: PromptId(id),
         session: SessionId(1),
         site: SiteId::new(),
