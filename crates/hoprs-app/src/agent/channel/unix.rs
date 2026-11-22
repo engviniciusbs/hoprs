@@ -10,8 +10,13 @@
 //! nobody listens on it); anything else at that path (a file, a directory, a link, a
 //! socket of another user) is never deleted or bound over: `bind` fails instead.
 //!
+//! The directory itself may not be a symbolic link (on either side): its owner and mode
+//! are those of the directory the socket really is in.
+//!
 //! `accept` drops, without answering, a peer whose user id is not this process's.
-//! `connect` (the relay) refuses a directory or a socket that another user owns.
+//! `connect` (the relay) refuses a directory or a socket that another user owns, and,
+//! once connected, a peer that is not this user: the checks by name and the connect are
+//! separate lookups, so the peer itself is what decides.
 
 use std::fs::{self, DirBuilder, Permissions};
 use std::io::{Error, ErrorKind, Result};
@@ -34,6 +39,26 @@ fn usable(owner: u32, mode: u32, me: u32) -> bool {
     owner == me && mode & 0o077 == 0
 }
 
+/// Whether the other end of a connection, whose user id the system reported as
+/// `peer`, may be talked to by user `me`: only the same user, and never an end whose
+/// user id could not be read.
+fn same_user(peer: Result<u32>, me: u32) -> bool {
+    matches!(peer, Ok(uid) if uid == me)
+}
+
+fn peer_uid(stream: &UnixStream) -> Result<u32> {
+    stream.peer_cred().map(|cred| cred.uid())
+}
+
+/// The directory's own metadata, refusing a symbolic link in its place.
+fn dir_metadata(dir: &Path) -> Result<fs::Metadata> {
+    let meta = fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() {
+        return Err(refused("the channel's directory is a symbolic link"));
+    }
+    Ok(meta)
+}
+
 fn refused(what: &str) -> Error {
     Error::new(ErrorKind::PermissionDenied, what.to_owned())
 }
@@ -42,7 +67,7 @@ fn refused(what: &str) -> Error {
 fn secure_dir(dir: &Path) -> Result<()> {
     // Created closed: the mode is 0700 minus the umask, never more.
     DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    let meta = fs::metadata(dir)?;
+    let meta = dir_metadata(dir)?;
     if !meta.is_dir() {
         return Err(Error::new(
             ErrorKind::NotADirectory,
@@ -55,7 +80,7 @@ fn secure_dir(dir: &Path) -> Result<()> {
     if meta.mode() & 0o777 != 0o700 {
         fs::set_permissions(dir, Permissions::from_mode(0o700))?;
     }
-    let meta = fs::metadata(dir)?;
+    let meta = dir_metadata(dir)?;
     if !usable(meta.uid(), meta.mode(), me()) {
         return Err(refused("the channel's directory is open to other users"));
     }
@@ -113,11 +138,11 @@ impl Listener {
     pub(super) async fn accept(&mut self) -> Result<Stream> {
         loop {
             let (stream, _) = self.listener.accept().await?;
-            match stream.peer_cred() {
-                Ok(cred) if cred.uid() == me() => return Ok(stream),
-                // Not this user (or unknown): dropped without a word.
-                _ => tracing::warn!("refused a connection to the agent channel from another user"),
+            if same_user(peer_uid(&stream), me()) {
+                return Ok(stream);
             }
+            // Not this user (or unknown): dropped without a word.
+            tracing::warn!("refused a connection to the agent channel from another user");
         }
     }
 }
@@ -137,7 +162,7 @@ pub(super) async fn connect(path: &Path) -> Result<Stream> {
     let dir = path
         .parent()
         .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "the channel has no directory"))?;
-    if fs::metadata(dir)?.uid() != me() {
+    if dir_metadata(dir)?.uid() != me() {
         return Err(refused("the channel's directory belongs to another user"));
     }
     let meta = fs::symlink_metadata(path)?;
@@ -150,7 +175,11 @@ pub(super) async fn connect(path: &Path) -> Result<Stream> {
     if meta.uid() != me() {
         return Err(refused("the channel's socket belongs to another user"));
     }
-    UnixStream::connect(path).await
+    let stream = UnixStream::connect(path).await?;
+    if !same_user(peer_uid(&stream), me()) {
+        return Err(refused("the agent channel is held by another user"));
+    }
+    Ok(stream)
 }
 
 #[cfg(test)]
@@ -209,6 +238,48 @@ mod tests {
         assert!(!usable(me, 0o750, me));
         assert!(!usable(me, 0o701, me));
         assert!(!usable(me, 0o707, me));
+    }
+
+    #[test]
+    fn peer_rule() {
+        assert!(same_user(Ok(1000), 1000));
+        assert!(!same_user(Ok(1001), 1000), "another user");
+        assert!(!same_user(Ok(0), 1000), "root is another user too");
+        assert!(
+            !same_user(Err(Error::other("no credentials")), 1000),
+            "unknown"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_directory_is_refused() {
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real");
+        fs::create_dir(&real).unwrap();
+        fs::set_permissions(&real, Permissions::from_mode(0o700)).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let err = Listener::bind(&link.join("agent.sock")).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied, "{err}");
+        assert!(
+            fs::read_dir(&real).unwrap().next().is_none(),
+            "nothing made"
+        );
+        // The relay refuses it too, even with a socket behind it.
+        let _listener = Listener::bind(&real.join("agent.sock")).unwrap();
+        let err = connect(&link.join("agent.sock")).await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied, "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_path_too_long_fails_cleanly() {
+        let base = tempfile::tempdir().unwrap();
+        // Over `sun_path` (108 bytes on Linux, 104 on macOS) whatever the base.
+        let dir = base.path().join("d".repeat(120));
+        let path = dir.join("agent.sock");
+        assert!(Listener::bind(&path).is_err());
+        assert!(fs::symlink_metadata(&path).is_err(), "no socket left");
+        assert!(connect(&path).await.is_err());
     }
 
     #[tokio::test]

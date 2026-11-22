@@ -669,10 +669,15 @@ impl Service {
     /// Closes the agent-only sessions whose site is gone or no longer open to agents, or
     /// whose last call ended `limits.idle_close` ago (or that never had one), except
     /// while the site has a call running or an unfinished transfer; then tells which
-    /// sites still hold one (when that changed).
+    /// sites still hold one (when that changed). With the master switch off no site is
+    /// open to agents: their sessions close at once, idle or not.
     pub async fn reap(&self) {
-        // A vault that cannot be read opens no site.
-        let sites = self.host.sites().await.unwrap_or_default();
+        // A vault that cannot be read opens no site; neither does the switch off.
+        let sites = if self.host.enabled() {
+            self.host.sites().await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
         let transfers = self.host.transfers().await;
         let now = Instant::now();
         for id in self.host.agent_sites() {

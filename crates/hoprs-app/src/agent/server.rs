@@ -11,19 +11,27 @@
 //! closes, are dropped, which cancels them: the service logs each as cancelled and
 //! releases what it held.
 //!
-//! **A relay.** Its first line must be a [`Hello`] within [`HELLO_WAIT`]: anything else,
-//! or nothing, closes the connection without an answer; another channel number or
+//! **A relay.** Its first line must be a [`Hello`] of at most [`proto::HELLO_MAX`] bytes
+//! within [`HELLO_WAIT`]: anything else, or nothing, closes the connection without an
+//! answer; another channel number or
 //! another version is answered with a mismatch, then closed. At most [`MAX_RELAYS`] are
 //! connected at once (one more is closed at its hello). Then each call runs in its own
 //! task through [`Service::call`], the only way to the tools, at most [`MAX_IN_FLIGHT`]
-//! at a time per relay (the next ones wait, in order); its reply is one line under its
-//! id. A cancel drops that call and nothing is written for it. A line that is not a
-//! message, a call id already in use, or the end of the input closes the connection.
+//! at a time per relay (the next ones wait, in order, up to [`WAITING_MAX`]; one more is
+//! answered at once with an error saying so, and reading goes on); its reply is one line
+//! under its id. A cancel drops that call and nothing is written for it. A line that is
+//! not a message, a call id already in use, or the end of the input closes the
+//! connection. Cancels and the end of the input are always read.
 //!
 //! **Back-pressure.** Each relay has its own reader and writer: a relay that stops
 //! reading its replies holds up only itself (its calls wait for their replies to be
-//! written, and once enough wait it is not read either), never another relay or the
-//! service; a goodbye to it is given [`BYE_WAIT`], then the connection is closed anyway.
+//! written before their turn is free), never another relay or the service. Memory stays
+//! bounded: at most [`MAX_IN_FLIGHT`] running and [`WAITING_MAX`] waiting calls, and a
+//! relay with [`WAITING_MAX`] refusals not yet written is closed. A goodbye is given
+//! [`BYE_WAIT`], then the connection is closed anyway.
+//!
+//! **Switch off.** Once the channel is closed the service's reaper runs at once: with
+//! the switch off it closes the sessions only an agent used.
 //!
 //! Nothing here logs a message's content. [`Service::reap`] runs every [`REAP_EVERY`]
 //! for the whole run, the switch on or off.
@@ -42,14 +50,14 @@ use tokio::task::{AbortHandle, JoinHandle, JoinSet};
 use tokio::time::{Instant, MissedTickBehavior, timeout};
 
 use super::channel::{Endpoint, Listener, Stream};
-use super::proto::{self, ByeReason, Hello, HelloReply, Reply, ToApp, ToRelay};
+use super::proto::{self, ByeReason, HelloReply, Reply, ToApp, ToRelay};
 use super::service::Service;
 use super::{AgentEvent, HELLO_WAIT, MAX_IN_FLIGHT, MAX_RELAYS, REAP_EVERY};
 
 /// How long a goodbye, or the answer to a mismatched hello, may take to be written.
 const BYE_WAIT: Duration = Duration::from_secs(1);
-/// Calls read from a relay and waiting for a turn; past this the relay is not read until
-/// one starts.
+/// Calls read from a relay and waiting for a turn; one more is refused (see
+/// [`TOO_MANY`]). Also the most refusals a relay may leave unread before it is closed.
 const WAITING_MAX: usize = MAX_IN_FLIGHT;
 /// Connections still in their hello at once; more are closed at once.
 const HANDSHAKES_MAX: usize = MAX_RELAYS;
@@ -57,6 +65,8 @@ const HANDSHAKES_MAX: usize = MAX_RELAYS;
 const ACCEPT_PAUSE: Duration = Duration::from_millis(100);
 /// The reply to a call whose task failed (a bug in hoprs): the agent is not left waiting.
 const FAILED: &str = "hoprs failed while answering this call. Call the tool again; if it fails again, tell the user.";
+/// The reply to a call that arrives while [`WAITING_MAX`] calls wait already.
+const TOO_MANY: &str = "Too many calls are waiting in hoprs on this connection. Wait for some to finish, then call the tool again.";
 /// The reply to a call whose answer does not fit in one line of the channel.
 const TOO_LONG: &str = "The answer was too long for hoprs's channel. Ask for less (a smaller range, a lower limit), or use download.";
 
@@ -254,6 +264,8 @@ async fn follow(
         if reason == ByeReason::Quit {
             return;
         }
+        // Agents were turned off: their sessions go now, not after the idle time.
+        shared.service.reap().await;
     }
 }
 
@@ -312,8 +324,13 @@ async fn listen(
     drop(listener);
     stop.send_replace(Some(reason));
     while relays.join_next().await.is_some() {}
-    *shared.relays() = 0;
-    shared.send(AgentEvent::Relays(0));
+    // Each relay's seat already counted it out; this only guards the count.
+    let mut count = shared.relays();
+    if *count != 0 {
+        *count = 0;
+        shared.send(AgentEvent::Relays(0));
+    }
+    drop(count);
     reason
 }
 
@@ -327,7 +344,7 @@ async fn relay(
     let (read, mut write) = tokio::io::split(stream);
     let mut reader = BufReader::new(read);
     let hello = tokio::select! {
-        hello = timeout(HELLO_WAIT, proto::read_message::<_, Hello>(&mut reader)) => hello,
+        hello = timeout(HELLO_WAIT, proto::read_hello(&mut reader)) => hello,
         _ = stopped(&mut stop) => return,
     };
     // Silence, a line that is not a hello, or the end: closed without an answer.
@@ -359,7 +376,12 @@ async fn relay(
 
 /// What the writer of a relay writes.
 enum Outgoing {
-    Answer(u64, Reply),
+    /// `turn`: the answer of a call that had a turn (else a refusal).
+    Answer {
+        id: u64,
+        reply: Reply,
+        turn: bool,
+    },
     Bye(ByeReason),
 }
 
@@ -383,10 +405,12 @@ struct Connection {
     busy: usize,
     /// Calls read and waiting for a turn, in order.
     waiting: VecDeque<(u64, String, Value)>,
+    /// Refusals ([`TOO_MANY`]) not written yet.
+    refused: usize,
     tasks: JoinSet<()>,
     out: mpsc::UnboundedSender<Outgoing>,
-    /// One per answer written: its turn is free.
-    written: mpsc::UnboundedReceiver<()>,
+    /// One per answer written: whether it had a turn (now free) or was a refusal.
+    written: mpsc::UnboundedReceiver<bool>,
     writer: JoinHandle<()>,
 }
 
@@ -403,6 +427,7 @@ impl Connection {
             running: Arc::default(),
             busy: 0,
             waiting: VecDeque::new(),
+            refused: 0,
             tasks: JoinSet::new(),
             out,
             written,
@@ -422,25 +447,42 @@ impl Connection {
                 biased;
                 reason = stopped(&mut stop) => break End::Stop(reason),
                 _ = &mut self.writer => break End::Gone,
-                Some(()) = self.written.recv() => self.busy = self.busy.saturating_sub(1),
+                Some(turn) = self.written.recv() => {
+                    if turn {
+                        self.busy = self.busy.saturating_sub(1);
+                    } else {
+                        self.refused = self.refused.saturating_sub(1);
+                    }
+                }
                 Some(joined) = self.tasks.join_next_with_id(), if !self.tasks.is_empty() => {
                     if let Err(err) = joined {
                         self.failed(err.id());
                     }
                 }
-                message = incoming.recv(), if self.waiting.len() < WAITING_MAX => {
-                    match message {
-                        None => break End::Gone,
-                        Some(ToApp::Cancel { cancel }) => self.cancel(cancel),
-                        Some(ToApp::Call { call, tool, args }) => {
-                            if self.knows(call) {
-                                // Ids are unique per connection: the relay is confused.
-                                break End::Gone;
-                            }
+                message = incoming.recv() => match message {
+                    None => break End::Gone,
+                    Some(ToApp::Cancel { cancel }) => self.cancel(cancel),
+                    Some(ToApp::Call { call, tool, args }) => {
+                        if self.knows(call) {
+                            // Ids are unique per connection: the relay is confused.
+                            break End::Gone;
+                        }
+                        if self.waiting.len() < WAITING_MAX {
                             self.waiting.push_back((call, tool, args));
+                        } else if self.refused < WAITING_MAX {
+                            // This call only; it holds nothing.
+                            self.refused += 1;
+                            let _ = self.out.send(Outgoing::Answer {
+                                id: call,
+                                reply: Reply::Err(TOO_MANY.to_owned()),
+                                turn: false,
+                            });
+                        } else {
+                            // Flooding calls and not reading the answers.
+                            break End::Gone;
                         }
                     }
-                }
+                },
             }
             self.start_waiting();
         };
@@ -486,9 +528,11 @@ impl Connection {
         if let Some(id) = id {
             running.remove(&id);
             tracing::warn!("a call of an agent failed inside hoprs");
-            let _ = self
-                .out
-                .send(Outgoing::Answer(id, Reply::Err(FAILED.to_owned())));
+            let _ = self.out.send(Outgoing::Answer {
+                id,
+                reply: Reply::Err(FAILED.to_owned()),
+                turn: true,
+            });
         }
     }
 
@@ -506,7 +550,11 @@ impl Connection {
             let task = self.tasks.spawn(async move {
                 let reply = service.call(&tool, args).await;
                 if lock(&running).remove(&id).is_some() {
-                    let _ = out.send(Outgoing::Answer(id, reply));
+                    let _ = out.send(Outgoing::Answer {
+                        id,
+                        reply,
+                        turn: true,
+                    });
                 }
             });
             calls.insert(id, task);
@@ -531,11 +579,11 @@ async fn read_lines(mut reader: BufReader<ReadHalf<Stream>>, to: mpsc::Sender<To
 async fn write_lines(
     mut write: WriteHalf<Stream>,
     mut outgoing: mpsc::UnboundedReceiver<Outgoing>,
-    written: mpsc::UnboundedSender<()>,
+    written: mpsc::UnboundedSender<bool>,
 ) {
     while let Some(message) = outgoing.recv().await {
         match message {
-            Outgoing::Answer(id, reply) => {
+            Outgoing::Answer { id, reply, turn } => {
                 let line = ToRelay::answer(id, reply);
                 let sent = match proto::write_line(&mut write, &line).await {
                     Err(err) if err.kind() == IoKind::InvalidInput => {
@@ -547,7 +595,7 @@ async fn write_lines(
                 if sent.is_err() {
                     return;
                 }
-                let _ = written.send(());
+                let _ = written.send(turn);
             }
             Outgoing::Bye(bye) => {
                 let _ = proto::write_line(&mut write, &ToRelay::Bye { bye }).await;

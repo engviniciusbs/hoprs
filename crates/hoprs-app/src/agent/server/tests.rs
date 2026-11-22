@@ -248,6 +248,149 @@ async fn a_ninth_call_waits_its_turn() {
 }
 
 #[tokio::test]
+async fn a_seventeenth_call_is_refused_and_cancels_are_still_read() {
+    let mut fx = fixture(true);
+    let hold = fx.host.hold(&fx.site.id, FsOp::Read);
+    let mut client = Client::greeted(&fx.endpoint).await;
+    fx.event(|e| *e == AgentEvent::Relays(1)).await;
+    // Eight run, eight wait.
+    let queued = (MAX_IN_FLIGHT + WAITING_MAX) as u64;
+    for id in 1..=queued {
+        client.call(id, "read_file", fx.read_args()).await;
+    }
+    until("eight calls run", || {
+        fx.host.calls(&fx.site.id, FsOp::Read) == MAX_IN_FLIGHT
+    })
+    .await;
+    // One more is answered at once, under its own id, and holds nothing.
+    client.call(99, "read_file", fx.read_args()).await;
+    let refused = client.recv().await.unwrap();
+    assert_eq!(reply_id(&refused), 99);
+    assert_eq!(refused["error"], TOO_MANY, "{refused}");
+    // A cancel is still read: it frees a turn, and the first waiting call starts.
+    client.send(json!({"cancel": 1})).await;
+    until("a waiting call started", || {
+        fx.host.calls(&fx.site.id, FsOp::Read) == MAX_IN_FLIGHT + 1
+    })
+    .await;
+    // And so is the end: every call goes with the relay, the waiting ones never start.
+    drop(client);
+    fx.event(|e| *e == AgentEvent::Relays(0)).await;
+    assert!(hold.dropped());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(fx.host.calls(&fx.site.id, FsOp::Read), MAX_IN_FLIGHT + 1);
+}
+
+#[tokio::test]
+async fn a_relay_that_floods_without_reading_is_closed() {
+    let fx = fixture(true);
+    let _hold = fx.host.hold(&fx.site.id, FsOp::Read);
+    let mut client = Client::greeted(&fx.endpoint).await;
+    // Sixteen calls held, then refusals the relay never reads: far more than the
+    // socket's buffers hold, so the refusals pile up unwritten and the relay is cut.
+    const CALLS: u64 = 20_000;
+    for id in 1..=CALLS {
+        client.call(id, "read_file", fx.read_args()).await;
+    }
+    let mut answers = 0u64;
+    while client.recv().await.is_some() {
+        answers += 1;
+    }
+    assert!(answers < CALLS - 16, "cut before every refusal: {answers}");
+    // The server keeps serving others.
+    let mut other = Client::greeted(&fx.endpoint).await;
+    other.call(1, "list_sites", json!({})).await;
+    assert_eq!(reply_id(&other.recv().await.unwrap()), 1);
+}
+
+#[tokio::test]
+async fn a_call_whose_task_panics_is_answered() {
+    let dir = tempfile::tempdir().unwrap();
+    let endpoint = channel::endpoint_in(dir.path());
+    let (tx, _events) = mpsc::unbounded_channel();
+    let service = Service::new(Arc::new(PanicHost), Limits::default(), tx.clone());
+    let (_switch, watching) = watch::channel(true);
+    let server = AgentServer::start(service, Some(endpoint.clone()), watching, tx);
+    let mut client = Client::greeted(&endpoint).await;
+    // Each call is answered, and its turn comes back: more than eight in a row.
+    for id in 1..=(MAX_IN_FLIGHT as u64 + 2) {
+        client.call(id, "list_sites", json!({})).await;
+        let reply = client.recv().await.unwrap();
+        assert_eq!(reply_id(&reply), id);
+        assert_eq!(reply["ok"], false, "{reply}");
+        assert_eq!(reply["error"], FAILED, "{reply}");
+    }
+    tokio::time::timeout(WAIT, server.shutdown()).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_answer_too_long_for_a_line_is_replaced() {
+    let fx = fixture(true);
+    // A site whose name alone is a full line: list_sites cannot be one line.
+    let mut huge = fx.site.clone();
+    huge.id = hoprs_core::SiteId::new();
+    huge.name = "n".repeat(proto::MAX_LINE);
+    fx.host.add_site(huge);
+    let mut client = Client::greeted(&fx.endpoint).await;
+    client.call(1, "list_sites", json!({})).await;
+    let reply = client.recv().await.unwrap();
+    assert_eq!(reply_id(&reply), 1);
+    assert_eq!(reply["error"], TOO_LONG, "{reply}");
+    // The connection goes on.
+    client.call(2, "stat", fx.read_args()).await;
+    assert_eq!(reply_id(&client.recv().await.unwrap()), 2);
+}
+
+#[tokio::test]
+async fn hellos_in_progress_are_capped() {
+    let fx = fixture(true);
+    let mut silent = Vec::new();
+    for _ in 0..HANDSHAKES_MAX {
+        silent.push(Client::connect(&fx.endpoint).await);
+    }
+    // One more is closed at once, long before the hello's time is up.
+    let start = std::time::Instant::now();
+    let mut extra = Client::connect(&fx.endpoint).await;
+    extra.assert_closed().await;
+    assert!(start.elapsed() < HELLO_WAIT / 2, "{:?}", start.elapsed());
+    // Once they are gone, a relay is greeted again.
+    drop(silent);
+    let start = tokio::time::Instant::now();
+    loop {
+        let mut client = Client::connect(&fx.endpoint).await;
+        client
+            .send(json!({"hoprs_agent": 1, "version": VERSION}))
+            .await;
+        if client.recv().await.is_some() {
+            break;
+        }
+        assert!(start.elapsed() < WAIT, "never greeted again");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn the_hello_is_small() {
+    let fx = fixture(true);
+    let hello = json!({"hoprs_agent": 1, "version": VERSION}).to_string();
+    // Up to the limit: greeted.
+    let mut client = Client::connect(&fx.endpoint).await;
+    client
+        .send_raw(format!("{hello:<width$}\n", width = proto::HELLO_MAX).as_bytes())
+        .await;
+    assert_eq!(
+        client.recv().await,
+        Some(json!({"hello": "ok", "version": VERSION}))
+    );
+    // One byte more: closed without an answer.
+    let mut client = Client::connect(&fx.endpoint).await;
+    client
+        .send_raw(format!("{hello:<width$}\n", width = proto::HELLO_MAX + 1).as_bytes())
+        .await;
+    client.assert_closed().await;
+}
+
+#[tokio::test]
 async fn mismatch_is_answered_and_closed() {
     let mut fx = fixture(true);
     for hello in [
@@ -269,13 +412,22 @@ async fn mismatch_is_answered_and_closed() {
     );
 }
 
-#[tokio::test(start_paused = true)]
+/// In real time (five seconds): paused time over a real socket or pipe could advance
+/// while the I/O is still on its way.
+#[tokio::test]
 async fn silent_client_is_dropped() {
     let mut fx = fixture(true);
+    let start = std::time::Instant::now();
     let mut client = Client::connect(&fx.endpoint).await;
-    let start = tokio::time::Instant::now();
     client.assert_closed().await;
-    assert!(start.elapsed() >= HELLO_WAIT, "{:?}", start.elapsed());
+    // The server's clock started at its accept, after `start`: a margin for the
+    // connect, none the other way.
+    let waited = start.elapsed();
+    assert!(
+        waited + Duration::from_millis(500) >= HELLO_WAIT,
+        "{waited:?}"
+    );
+    assert!(waited < WAIT, "{waited:?}");
     assert!(!fx.events_now().contains(&AgentEvent::Relays(1)));
 }
 
@@ -382,6 +534,9 @@ async fn switch_off_drops_relays_and_removes_the_socket() {
     client.call(1, "read_file", fx.read_args()).await;
     hold.entered().await;
 
+    // An agent-only session, used a moment ago: it goes with the switch.
+    fx.host.mark_agent_only(&fx.site.id);
+    fx.host.set_enabled(false);
     fx.switch.send_replace(false);
     for relay in [&mut client, &mut idle] {
         assert_eq!(relay.recv().await, Some(json!({"bye": "off"})));
@@ -389,6 +544,9 @@ async fn switch_off_drops_relays_and_removes_the_socket() {
     }
     fx.event(|e| *e == AgentEvent::Relays(0)).await;
     assert!(hold.dropped(), "the call in flight was dropped");
+    fx.event(|e| *e == AgentEvent::Sites(Vec::new())).await;
+    assert_eq!(fx.host.closed(), [fx.site.id.clone()], "closed at once");
+    fx.host.set_enabled(true);
     #[cfg(unix)]
     {
         let Endpoint::Socket(path) = &fx.endpoint;
@@ -515,7 +673,6 @@ async fn no_endpoint_never_listens() {
         .with_max_level(tracing::Level::INFO)
         .finish();
     let _default = tracing::subscriber::set_default(subscriber);
-    let _other = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
 
     let dir = tempfile::tempdir().unwrap();
     let mut fx = fixture_at(dir, None, true);
@@ -560,4 +717,65 @@ async fn reaper_runs_with_the_switch_off() {
             .iter()
             .any(|e| matches!(e, AgentEvent::Channel(_)))
     );
+}
+
+/// A host whose every call is a bug: the service's task panics at its first step.
+struct PanicHost;
+
+#[async_trait::async_trait]
+impl crate::agent::host::AgentHost for PanicHost {
+    fn enabled(&self) -> bool {
+        panic!("a bug in hoprs (test)")
+    }
+    async fn sites(&self) -> hoprs_core::Result<Vec<Site>> {
+        unreachable!()
+    }
+    fn connected(&self, _: &hoprs_core::SiteId) -> Option<crate::backend::SessionId> {
+        unreachable!()
+    }
+    async fn connect(
+        &self,
+        _: &hoprs_core::SiteId,
+    ) -> std::result::Result<crate::backend::SessionId, crate::agent::host::ConnectFailure> {
+        unreachable!()
+    }
+    fn prompt_open(&self, _: &hoprs_core::SiteId) -> bool {
+        unreachable!()
+    }
+    async fn close_agent_session(&self, _: &hoprs_core::SiteId) -> bool {
+        unreachable!()
+    }
+    fn agent_sites(&self) -> Vec<hoprs_core::SiteId> {
+        unreachable!()
+    }
+    fn remote(
+        &self,
+        _: crate::backend::SessionId,
+    ) -> hoprs_core::Result<Arc<dyn hoprs_remote::RemoteFs>> {
+        unreachable!()
+    }
+    async fn exec(
+        &self,
+        _: crate::backend::SessionId,
+        _: String,
+        _: hoprs_ssh::ExecLimits,
+    ) -> hoprs_core::Result<hoprs_ssh::ExecOutput> {
+        unreachable!()
+    }
+    async fn enqueue(
+        &self,
+        _: hoprs_transfer::TransferSpec,
+        _: hoprs_transfer::ConflictPolicy,
+    ) -> hoprs_core::Result<hoprs_transfer::TransferId> {
+        unreachable!()
+    }
+    async fn transfers(&self) -> Vec<hoprs_transfer::TransferItem> {
+        unreachable!()
+    }
+    fn transfer_events(&self) -> tokio::sync::broadcast::Receiver<hoprs_transfer::Event> {
+        unreachable!()
+    }
+    async fn protected(&self) -> crate::agent::paths::Protected {
+        unreachable!()
+    }
 }

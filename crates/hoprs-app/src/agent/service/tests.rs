@@ -936,6 +936,28 @@ async fn session_of_a_site_that_lost_access_is_closed() {
     assert_eq!(fx.host.closed(), [fx.ro.id.clone(), fx.ssh.id.clone()]);
 }
 
+/// The master switch off: no site is open to agents, so their sessions close at the
+/// next look, idle or not; a tab's session stays.
+#[tokio::test(start_paused = true)]
+async fn switch_off_closes_agent_sessions_at_once() {
+    let mut fx = fixture();
+    ok(fx
+        .call("list_directory", json!({"site": fx.ssh.id.0, "path": "/"}))
+        .await);
+    fx.host.connect_user(&fx.ro.id).await;
+    fx.events();
+    fx.service.reap().await;
+    assert!(fx.host.closed().is_empty(), "just used, switch on: kept");
+    fx.host.set_enabled(false);
+    fx.service.reap().await;
+    assert_eq!(fx.host.closed(), std::slice::from_ref(&fx.ssh.id));
+    assert!(
+        fx.host.connected(&fx.ro.id).is_some(),
+        "a tab's session stays"
+    );
+    assert_eq!(fx.events().last(), Some(&AgentEvent::Sites(Vec::new())));
+}
+
 #[tokio::test]
 async fn one_log_line_per_call() {
     let (logs, _guard) = capture_logs();

@@ -328,10 +328,11 @@ pub trait BackendApi: Send + Sync {
     /// `settings.toml` saved afterwards sets it too (the stored setting wins).
     async fn set_agents_enabled(&self, on: bool);
     /// What the agent side reports (relays connected, the channel's state, the sites an
-    /// agent holds), for the UI's subscription. Only the first call gets it.
+    /// agent holds), for the UI's subscription. Only the first call gets it. Bounded,
+    /// the latest state winning while nobody reads (see [`crate::agent::latest_events`]).
     // TODO(Task 14): remove
     #[allow(dead_code)]
-    fn agent_events(&self) -> Option<mpsc::UnboundedReceiver<AgentEvent>>;
+    fn agent_events(&self) -> Option<mpsc::Receiver<AgentEvent>>;
 
     /// The latest stable release (the update check). `update-dev-build` in a debug build
     /// without `HOPRS_UPDATE_URL` (see [`http::api_url`]).
@@ -564,6 +565,9 @@ pub struct Backend {
     settings_path: PathBuf,
     /// What `settings.toml` held when the backend opened.
     settings: SettingsLoad,
+    /// Held across a write of `settings.toml` and the switch's update from it, so the
+    /// switch always equals the file written last.
+    settings_turn: tokio::sync::Mutex<()>,
     /// Why the queue database could not be opened (the engine runs in memory then).
     queue_error: Option<Error>,
     backup_params: ExportParams,
@@ -584,7 +588,7 @@ pub struct Backend {
     /// The agent channel's server; `None` only while [`Backend::open`] builds it.
     agent_server: Option<AgentServer>,
     /// The agent side's events, until the UI takes them.
-    agent_events: Mutex<Option<mpsc::UnboundedReceiver<AgentEvent>>>,
+    agent_events: Mutex<Option<mpsc::Receiver<AgentEvent>>>,
 }
 
 impl Backend {
@@ -648,6 +652,7 @@ impl Backend {
             profile_dir: config.profile_dir,
             settings_path,
             settings: loaded,
+            settings_turn: tokio::sync::Mutex::new(()),
             queue_error,
             backup_params: config.backup_params,
             vault,
@@ -660,7 +665,7 @@ impl Backend {
             agents,
             agent,
             agent_server: None,
-            agent_events: Mutex::new(Some(agent_rx)),
+            agent_events: Mutex::new(Some(crate::agent::latest_events(agent_rx))),
         };
         // Its own task: the channel is opened there (never on this thread) when the
         // switch is on.
@@ -1121,8 +1126,10 @@ impl BackendApi for Backend {
 
     /// Once the file is written, its `agents_enabled` is the master switch: the stored
     /// setting wins over a [`set_agents_enabled`](BackendApi::set_agents_enabled) that
-    /// reached the backend out of order.
+    /// reached the backend out of order. One save at a time, the write and the switch
+    /// together: two saves racing leave the switch as the file written last.
     async fn save_settings(&self, settings: Settings) -> Result<()> {
+        let _turn = self.settings_turn.lock().await;
         let path = self.settings_path.clone();
         let agents = settings.agents_enabled;
         blocking(move || settings::save(&path, &settings)).await?;
@@ -1139,7 +1146,7 @@ impl BackendApi for Backend {
         self.agents.send_replace(on);
     }
 
-    fn agent_events(&self) -> Option<mpsc::UnboundedReceiver<AgentEvent>> {
+    fn agent_events(&self) -> Option<mpsc::Receiver<AgentEvent>> {
         self.agent_events
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -1412,7 +1419,17 @@ mod tests {
         }
         assert!(seen.contains(&AgentEvent::Channel(None)), "{seen:?}");
         assert!(seen.contains(&AgentEvent::Relays(1)), "{seen:?}");
-        assert_eq!(seen.last(), Some(&AgentEvent::Relays(0)), "{seen:?}");
+        let relays = seen
+            .iter()
+            .rev()
+            .find(|e| matches!(e, AgentEvent::Relays(_)));
+        assert_eq!(relays, Some(&AgentEvent::Relays(0)), "{seen:?}");
+        // The reaper ran when the channel closed.
+        assert_eq!(
+            seen.last(),
+            Some(&AgentEvent::Sites(Vec::new())),
+            "{seen:?}"
+        );
 
         // The stored setting is the switch: saved on, the channel opens again.
         let on = Settings {
@@ -1424,6 +1441,28 @@ mod tests {
         backend.shutdown().await;
         assert_eq!(relay.line().await.as_deref(), Some(r#"{"bye":"quit"}"#));
         assert_eq!(relay.line().await, None);
+    }
+
+    /// Saves racing each other: whatever order their writes and their continuations
+    /// take, the switch ends equal to the file written last.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_switch_is_the_file_written_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = open(dir.path());
+        let path = backend.settings_path.clone();
+        for round in 0..40 {
+            let saves = (0..8).map(|i| {
+                backend.save_settings(Settings {
+                    agents_enabled: (i + round) % 2 == 0,
+                    ..Settings::default()
+                })
+            });
+            for saved in futures_util::future::join_all(saves).await {
+                saved.unwrap();
+            }
+            let stored = settings::load(&path).settings.agents_enabled;
+            assert_eq!(*backend.agents.borrow(), stored, "round {round}");
+        }
     }
 
     #[tokio::test]

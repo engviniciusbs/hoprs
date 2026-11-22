@@ -215,8 +215,8 @@ pub struct FakeBackend {
     next_transfer: AtomicI64,
     events: mpsc::UnboundedSender<BrokerEvent>,
     receiver: Mutex<Option<mpsc::UnboundedReceiver<BrokerEvent>>>,
-    agent_events: mpsc::UnboundedSender<AgentEvent>,
-    agent_receiver: Mutex<Option<mpsc::UnboundedReceiver<AgentEvent>>>,
+    agent_events: mpsc::Sender<AgentEvent>,
+    agent_receiver: Mutex<Option<mpsc::Receiver<AgentEvent>>>,
     /// Engine events the test sends with [`FakeBackend::send_transfer_event`].
     transfer_events: broadcast::Sender<Event>,
     shells: Shells,
@@ -329,7 +329,8 @@ impl Default for FakeBackend {
 impl FakeBackend {
     pub fn new() -> Self {
         let (events, receiver) = mpsc::unbounded_channel();
-        let (agent_events, agent_receiver) = mpsc::unbounded_channel();
+        // Bounded like the real one's; a test reads what it pushes.
+        let (agent_events, agent_receiver) = mpsc::channel(crate::agent::EVENTS_BUFFER);
         Self {
             state: Arc::new(Mutex::new(State::default())),
             next_session: AtomicU64::new(1),
@@ -567,9 +568,12 @@ impl FakeBackend {
         self.state().local.clone()
     }
 
-    /// Sends an agent event to the UI's subscription.
+    /// Sends an agent event to the UI's subscription (at most
+    /// [`EVENTS_BUFFER`](crate::agent::EVENTS_BUFFER) unread).
     pub fn push_agent_event(&self, event: AgentEvent) {
-        let _ = self.agent_events.send(event);
+        self.agent_events
+            .try_send(event)
+            .expect("the test reads the agent events it pushes");
     }
 
     /// Sends a broker event to the UI's subscription.
@@ -1529,7 +1533,7 @@ impl BackendApi for FakeBackend {
         self.record(BackupCall::SetAgents(on));
     }
 
-    fn agent_events(&self) -> Option<mpsc::UnboundedReceiver<AgentEvent>> {
+    fn agent_events(&self) -> Option<mpsc::Receiver<AgentEvent>> {
         self.agent_receiver
             .lock()
             .unwrap_or_else(PoisonError::into_inner)

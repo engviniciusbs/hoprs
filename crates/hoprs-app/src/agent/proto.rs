@@ -21,6 +21,9 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 pub const PROTOCOL: u32 = 1;
 /// The longest line either side accepts or writes, newline excluded (8 MiB).
 pub const MAX_LINE: usize = 8 * 1024 * 1024;
+/// The longest hello the app reads (4 KiB): a hello holds a number and a version, and
+/// [`MAX_LINE`] applies only after a successful one.
+pub const HELLO_MAX: usize = 4 * 1024;
 
 /// The relay's first line.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,6 +145,8 @@ pub fn hello_reply(theirs: &Hello) -> HelloReply {
 /// Reads one line, without its `\n` (or `\r\n`). `None` at end-of-file; a last line
 /// without a newline is returned. A line over [`MAX_LINE`] bytes, or one that is not
 /// UTF-8, is `InvalidData`; the reader never holds more than [`MAX_LINE`] bytes of it.
+// TODO(Task 13): remove
+#[allow(dead_code)]
 pub async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<String>> {
     read_line_within(reader, MAX_LINE).await
 }
@@ -199,7 +204,19 @@ fn too_long() -> Error {
 pub async fn read_message<R: AsyncBufRead + Unpin, T: DeserializeOwned>(
     reader: &mut R,
 ) -> Result<Option<T>> {
-    let Some(line) = read_line(reader).await? else {
+    read_message_within(reader, MAX_LINE).await
+}
+
+/// Reads the relay's [`Hello`], like [`read_message`] but at most [`HELLO_MAX`] bytes.
+pub async fn read_hello<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<Hello>> {
+    read_message_within(reader, HELLO_MAX).await
+}
+
+async fn read_message_within<R: AsyncBufRead + Unpin, T: DeserializeOwned>(
+    reader: &mut R,
+    max: usize,
+) -> Result<Option<T>> {
+    let Some(line) = read_line_within(reader, max).await? else {
         return Ok(None);
     };
     if !line.trim_start().starts_with('{') {
@@ -568,6 +585,27 @@ mod tests {
         let err = write_line(&mut out, &huge).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_hello_is_small() {
+        let hello = format!(
+            r#"{{"hoprs_agent":1,"version":"{}"}}"#,
+            env!("CARGO_PKG_VERSION")
+        );
+        // Padded to exactly the limit (spaces after the object are still JSON): read.
+        let fits = format!("{hello:<HELLO_MAX$}\n");
+        let mut r = fits.as_bytes();
+        assert!(read_hello(&mut r).await.unwrap().is_some());
+        // One byte more: refused, though `read_message` would take it.
+        let over = format!("{hello:<width$}\n", width = HELLO_MAX + 1);
+        let mut r = over.as_bytes();
+        assert_eq!(
+            read_hello(&mut r).await.unwrap_err().kind(),
+            ErrorKind::InvalidData
+        );
+        let mut r = over.as_bytes();
+        assert!(read_message::<_, Hello>(&mut r).await.unwrap().is_some());
     }
 
     #[tokio::test]

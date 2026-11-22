@@ -28,13 +28,15 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::windows::named_pipe::{
     ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
 };
-use windows_sys::Win32::Foundation::{CloseHandle, ERROR_PIPE_BUSY, HANDLE, LocalFree};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_NO_DATA, ERROR_PIPE_BUSY, HANDLE, LocalFree,
+};
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo,
-    SDDL_REVISION_1, SE_KERNEL_OBJECT,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    ConvertStringSidToSidW, GetSecurityInfo, SDDL_REVISION_1, SE_KERNEL_OBJECT,
 };
 use windows_sys::Win32::Security::{
-    GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    EqualSid, GetTokenInformation, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
     SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
@@ -204,11 +206,14 @@ impl Listener {
     }
 
     pub(super) async fn accept(&mut self) -> Result<Stream> {
-        if let Err(err) = self.next.connect().await {
-            // That instance is spoilt (its client went first): a fresh one takes its
-            // place, made before the old one closes so the name is never free.
+        while let Err(err) = self.next.connect().await {
+            // That instance is spoilt: a fresh one takes its place, made before the old
+            // one closes so the name is never free.
             self.next = create(&self.name, &self.descriptor, false)?;
-            return Err(err);
+            // A client that left before its connection was taken: a quiet retry.
+            if err.raw_os_error() != Some(ERROR_NO_DATA as i32) {
+                return Err(err);
+            }
         }
         // The next instance before this one is handed out, so a relay always finds one.
         let fresh = create(&self.name, &self.descriptor, false)?;
@@ -237,8 +242,37 @@ fn create(name: &str, descriptor: &Descriptor, first: bool) -> Result<NamedPipeS
     }
 }
 
-/// The SID that owns the object behind `handle`, as text.
-fn owner_of(handle: HANDLE) -> Result<String> {
+/// A SID in binary form, made from its text (`S-1-…`), freed on drop.
+struct BinarySid(Local);
+
+impl BinarySid {
+    fn from_text(text: &str) -> Result<BinarySid> {
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut sid: PSID = ptr::null_mut();
+        // SAFETY: `wide` is NUL-terminated and alive for the call; `sid` is a valid out
+        // pointer (the SID is allocated with LocalAlloc and freed by `Local`).
+        if unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut sid) } == 0 {
+            return Err(Error::last_os_error());
+        }
+        Ok(BinarySid(Local(sid)))
+    }
+
+    /// Whether `other` is this SID: compared as SIDs, never by their spelling (Windows
+    /// writes some SIDs by an alias, such as `LA` for the built-in Administrator).
+    fn is(&self, other: PSID) -> bool {
+        // SAFETY: both are valid SIDs: ours lives as long as `self`, `other` is the
+        // caller's (alive meanwhile).
+        unsafe { EqualSid(self.0.0, other) != 0 }
+    }
+}
+
+/// The user's SID in binary form.
+fn user_binary_sid() -> Result<BinarySid> {
+    BinarySid::from_text(&user_sid()?)
+}
+
+/// Whether the object behind `handle` is owned by this process's user.
+fn owned_by_user(handle: HANDLE) -> Result<bool> {
     let mut owner: PSID = ptr::null_mut();
     let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
     // SAFETY: `handle` is an open pipe handle (opened for reading, so with READ_CONTROL);
@@ -260,7 +294,7 @@ fn owner_of(handle: HANDLE) -> Result<String> {
         return Err(Error::from_raw_os_error(code as i32));
     }
     let _descriptor = Local(descriptor);
-    sid_text(owner)
+    Ok(user_binary_sid()?.is(owner))
 }
 
 /// The relay's side: opens the pipe and checks that this user owns it.
@@ -278,7 +312,7 @@ pub(super) async fn connect(name: &str) -> Result<Stream> {
             Err(err) => return Err(err),
         }
     };
-    if owner_of(client.as_raw_handle())? != user_sid()? {
+    if !owned_by_user(client.as_raw_handle())? {
         return Err(Error::new(
             ErrorKind::PermissionDenied,
             "the agent channel's pipe belongs to another user",
@@ -332,19 +366,26 @@ impl AsyncWrite for Stream {
 #[cfg(test)]
 mod tests {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use windows_sys::Win32::Security::Authorization::ConvertSecurityDescriptorToStringSecurityDescriptorW;
-    use windows_sys::Win32::Security::{ACL, DACL_SECURITY_INFORMATION};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce,
+        GetSecurityDescriptorControl, SE_DACL_PROTECTED,
+    };
 
     use super::*;
 
     const WAIT: Duration = Duration::from_secs(10);
+    /// `ACCESS_ALLOWED_ACE_TYPE` (in `Win32_System_SystemServices`, a feature this crate
+    /// does not need otherwise).
+    const ALLOW: u8 = 0;
 
-    /// The DACL of the object behind `handle`, as SDDL.
-    fn dacl_of(handle: HANDLE) -> String {
+    /// The DACL of the object behind `handle`, read as a structure: whether it is
+    /// protected, and each entry's type and SID (checked against the user's SID as a
+    /// SID, not as text).
+    fn dacl_of(handle: HANDLE) -> (bool, Vec<(u8, bool)>) {
         let mut dacl: *mut ACL = ptr::null_mut();
         let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
         // SAFETY: `handle` is an open pipe handle; the out pointers are valid; the
-        // descriptor is freed below.
+        // descriptor is freed below and `dacl` points into it.
         let code = unsafe {
             GetSecurityInfo(
                 handle,
@@ -359,23 +400,33 @@ mod tests {
         };
         assert_eq!(code, 0, "GetSecurityInfo");
         let descriptor = Local(descriptor);
-        let mut text: *mut u16 = ptr::null_mut();
-        // SAFETY: `descriptor` is the valid descriptor read above; `text` is a valid out
-        // pointer; the length out pointer may be null.
-        let ok = unsafe {
-            ConvertSecurityDescriptorToStringSecurityDescriptorW(
-                descriptor.0,
-                SDDL_REVISION_1,
-                DACL_SECURITY_INFORMATION,
-                &mut text,
-                ptr::null_mut(),
-            )
-        };
-        assert_ne!(
-            ok, 0,
-            "ConvertSecurityDescriptorToStringSecurityDescriptorW"
-        );
-        wide_text(&Local(text.cast()))
+        assert!(!dacl.is_null(), "a DACL");
+        let (mut control, mut revision) = (0u16, 0u32);
+        // SAFETY: `descriptor` is the valid descriptor read above; the out pointers are
+        // valid.
+        let ok = unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) };
+        assert_ne!(ok, 0, "GetSecurityDescriptorControl");
+        let user = user_binary_sid().unwrap();
+        // SAFETY: `dacl` points to the valid ACL inside `descriptor`.
+        let count = unsafe { (*dacl).AceCount };
+        let mut entries = Vec::new();
+        for index in 0..u32::from(count) {
+            let mut ace: *mut c_void = ptr::null_mut();
+            // SAFETY: `index` is below the ACL's entry count; `ace` is a valid out pointer
+            // and points into the ACL afterwards.
+            assert_ne!(unsafe { GetAce(dacl, index, &mut ace) }, 0, "GetAce");
+            // SAFETY: every entry starts with an ACE_HEADER; an allow entry is an
+            // ACCESS_ALLOWED_ACE whose SID starts at `SidStart`, inside the entry.
+            let entry = unsafe {
+                let kind = (*ace.cast::<ACE_HEADER>()).AceType;
+                let is_user = kind == ALLOW
+                    && user
+                        .is(ptr::addr_of_mut!((*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast());
+                (kind, is_user)
+            };
+            entries.push(entry);
+        }
+        (control & SE_DACL_PROTECTED != 0, entries)
     }
 
     fn temp_name() -> (tempfile::TempDir, String) {
@@ -451,12 +502,16 @@ mod tests {
         let Stream::Client(client) = &client else {
             panic!("connect gives a client");
         };
-        let sddl = dacl_of(client.as_raw_handle());
-        let sid = user_sid().unwrap();
-        assert!(sddl.starts_with("D:P"), "{sddl}");
-        assert_eq!(sddl.matches('(').count(), 1, "one entry: {sddl}");
-        assert_eq!(sddl.matches("(A;").count(), 1, "one allow entry: {sddl}");
-        assert!(sddl.ends_with(&format!(";;;{sid})")), "{sddl}");
-        assert_eq!(owner_of(client.as_raw_handle()).unwrap(), sid);
+        let (protected, entries) = dacl_of(client.as_raw_handle());
+        assert!(protected, "the DACL is protected (nothing inherited)");
+        assert_eq!(
+            entries,
+            [(ALLOW, true)],
+            "one entry: an allow entry for the user's SID"
+        );
+        assert!(
+            owned_by_user(client.as_raw_handle()).unwrap(),
+            "owned by the user"
+        );
     }
 }

@@ -12,9 +12,11 @@ pub mod service;
 pub mod testing;
 pub mod tools;
 
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use hoprs_core::{Error, SiteId};
+use tokio::sync::mpsc;
 
 use crate::backend::SessionId;
 
@@ -29,6 +31,99 @@ pub enum AgentEvent {
     Connected(SessionId),
     /// The channel could not start (`Some`), or started after a failure (`None`).
     Channel(Option<Error>),
+}
+
+/// The most agent events waiting for the UI (see [`latest_events`]).
+pub const EVENTS_BUFFER: usize = 16;
+/// The most [`AgentEvent::Connected`] kept while the UI does not read.
+const CONNECTED_KEPT: usize = 16;
+
+/// What [`latest_events`] holds back while the UI's channel is full: the latest of each
+/// state, and the last few sessions that came up.
+#[derive(Default)]
+struct Held {
+    channel: Option<Option<Error>>,
+    relays: Option<usize>,
+    sites: Option<Vec<SiteId>>,
+    connected: VecDeque<SessionId>,
+}
+
+impl Held {
+    fn add(&mut self, event: AgentEvent) {
+        match event {
+            AgentEvent::Channel(state) => self.channel = Some(state),
+            AgentEvent::Relays(n) => self.relays = Some(n),
+            AgentEvent::Sites(sites) => self.sites = Some(sites),
+            AgentEvent::Connected(session) => {
+                if self.connected.len() == CONNECTED_KEPT {
+                    self.connected.pop_front();
+                }
+                self.connected.push_back(session);
+            }
+        }
+    }
+
+    fn next(&mut self) -> Option<AgentEvent> {
+        if let Some(state) = self.channel.take() {
+            return Some(AgentEvent::Channel(state));
+        }
+        if let Some(n) = self.relays.take() {
+            return Some(AgentEvent::Relays(n));
+        }
+        if let Some(sites) = self.sites.take() {
+            return Some(AgentEvent::Sites(sites));
+        }
+        self.connected.pop_front().map(AgentEvent::Connected)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.channel.is_none()
+            && self.relays.is_none()
+            && self.sites.is_none()
+            && self.connected.is_empty()
+    }
+}
+
+/// The agent side's events for the UI, in constant memory whether or not anyone reads:
+/// at most [`EVENTS_BUFFER`] wait in the returned channel; past that, each state (the
+/// channel's, the relay count, the agent sites) keeps only its latest value and only
+/// the last few `Connected` are kept, and they follow as soon as there is room. So a
+/// reader that comes late still ends on the current state. Spawns its task (inside the
+/// tokio runtime); it ends when `from` closes and all is handed on, or the receiver is
+/// dropped.
+pub fn latest_events(mut from: mpsc::UnboundedReceiver<AgentEvent>) -> mpsc::Receiver<AgentEvent> {
+    let (to, events) = mpsc::channel(EVENTS_BUFFER);
+    tokio::spawn(async move {
+        let mut held = Held::default();
+        loop {
+            if held.is_empty() {
+                match from.recv().await {
+                    Some(event) => held.add(event),
+                    None => return,
+                }
+                continue;
+            }
+            tokio::select! {
+                event = from.recv() => match event {
+                    Some(event) => held.add(event),
+                    None => {
+                        while let Some(event) = held.next() {
+                            if to.send(event).await.is_err() {
+                                return;
+                            }
+                        }
+                        return;
+                    }
+                },
+                room = to.reserve() => match (room, held.next()) {
+                    (Ok(room), Some(event)) => room.send(event),
+                    (Ok(_), None) => {}
+                    (Err(_), _) => return,
+                },
+            }
+        }
+    });
+    events
 }
 
 /// Entries a `list_directory` call answers without a `limit`.
@@ -165,6 +260,58 @@ mod tests {
             (8, 16, Duration::from_secs(5))
         );
     }
+    #[tokio::test]
+    async fn events_keep_the_latest_state_in_constant_memory() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut events = latest_events(rx);
+        // Nobody reads while a run's worth of events comes.
+        for n in 0..1000 {
+            tx.send(AgentEvent::Relays(n % 17)).unwrap();
+            tx.send(AgentEvent::Sites(vec![SiteId(format!("s{n}"))]))
+                .unwrap();
+            tx.send(AgentEvent::Connected(SessionId(n as u64))).unwrap();
+        }
+        tx.send(AgentEvent::Relays(3)).unwrap();
+        drop(tx);
+        // Let the hand-on catch up with nobody reading: the channel is full, the rest
+        // held.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut got = Vec::new();
+        while let Some(event) = events.recv().await {
+            got.push(event);
+        }
+        assert!(
+            got.len() <= EVENTS_BUFFER + 3 + CONNECTED_KEPT,
+            "{} events kept",
+            got.len()
+        );
+        let last_relays = got.iter().rev().find_map(|e| match e {
+            AgentEvent::Relays(n) => Some(*n),
+            _ => None,
+        });
+        assert_eq!(last_relays, Some(3), "the latest count wins");
+        let last_sites = got.iter().rev().find_map(|e| match e {
+            AgentEvent::Sites(s) => Some(s.clone()),
+            _ => None,
+        });
+        assert_eq!(last_sites, Some(vec![SiteId("s999".into())]));
+        assert_eq!(
+            got.last(),
+            Some(&AgentEvent::Connected(SessionId(999))),
+            "the last sessions that came up are kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn events_pass_in_order_while_read() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let mut events = latest_events(rx);
+        for n in [1, 2, 1, 0] {
+            tx.send(AgentEvent::Relays(n)).unwrap();
+            assert_eq!(events.recv().await, Some(AgentEvent::Relays(n)));
+        }
+    }
+
     #[test]
     fn texts_tell_what_to_do() {
         assert!(UNREACHABLE.contains("Settings › Agents (MCP)"));
