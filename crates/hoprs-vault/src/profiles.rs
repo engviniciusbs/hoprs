@@ -503,4 +503,47 @@ mod tests {
         assert!(profiles.unreadable_site("s1").is_none());
         assert!(profiles.unreadable_site("w1").is_none());
     }
+
+    #[test]
+    fn agent_access_round_trips_in_sites_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut all = Site::new("Open", "h", "u", hoprs_core::Protocol::Ssh);
+        all.agent_access = hoprs_core::AgentAccess::All;
+        let none = Site::new("Closed", "h", "u", hoprs_core::Protocol::Ssh);
+        let profiles = Profiles {
+            sites: vec![all.clone(), none.clone()],
+            ..Profiles::default()
+        };
+        save_sites(tmp.path(), &profiles).unwrap();
+        let text = fs::read_to_string(tmp.path().join(SITES_FILE)).unwrap();
+        assert_eq!(text.matches("agent_access").count(), 1, "{text}");
+        assert_eq!(
+            text.lines()
+                .filter(|l| *l == "agent_access = \"all\"")
+                .count(),
+            1,
+            "{text}"
+        );
+        let loaded = load(tmp.path()).unwrap();
+        assert_eq!(loaded.sites[0].agent_access, hoprs_core::AgentAccess::All);
+        assert_eq!(loaded.sites[1].agent_access, hoprs_core::AgentAccess::None);
+    }
+
+    #[test]
+    fn unknown_agent_access_is_no_access_not_unreadable() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join(SITES_FILE),
+            "version = 1\n\n\
+             [[site]]\nid = \"s1\"\nname = \"One\"\nprotocol = \"ssh\"\nhost = \"h\"\nport = 22\nuser = \"u\"\nagent_access = \"admin\"\n",
+        )
+        .unwrap();
+        let profiles = load(tmp.path()).unwrap();
+        assert!(profiles.unreadable().is_empty());
+        assert_eq!(profiles.sites.len(), 1);
+        assert_eq!(
+            profiles.sites[0].agent_access,
+            hoprs_core::AgentAccess::None
+        );
+    }
 }
