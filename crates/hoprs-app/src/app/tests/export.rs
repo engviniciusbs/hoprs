@@ -1550,3 +1550,80 @@ async fn drive_effects_reach_the_backend() {
         "{message:?}"
     );
 }
+
+/// Fix round 2: once an export finished, Submit (Enter in the confirm field) does
+/// nothing: the button is Done.
+#[tokio::test]
+async fn submit_does_nothing_after_a_finished_file_export() {
+    let mut f = fixture().await;
+    started(&mut f);
+    export(&mut f.app, ExportMsg::Done(Ok(report())));
+    // Empty fields: no "password required" under the report.
+    assert!(export(&mut f.app, ExportMsg::Submit).is_empty());
+    assert_eq!(flow(&f.app).field_error, None);
+    assert_eq!(flow(&f.app).state, BackupState::Done(report()));
+    // Retyped, path picked: no second export.
+    let picked = f.dir.path().join("picked.hoprs");
+    export(&mut f.app, ExportMsg::Picked(Some(picked)));
+    typed(&mut f.app, "pw", "pw");
+    assert!(export(&mut f.app, ExportMsg::Submit).is_empty());
+    assert_eq!(flow(&f.app).field_error, None);
+    assert_eq!(flow(&f.app).state, BackupState::Done(report()));
+}
+
+#[tokio::test]
+async fn a_failed_file_export_can_be_submitted_again() {
+    let mut f = fixture().await;
+    started(&mut f);
+    export(
+        &mut f.app,
+        ExportMsg::Done(Err(Error::new(ErrorKind::Io, "disk full"))),
+    );
+    typed(&mut f.app, "pw", "pw");
+    let effects = export(&mut f.app, ExportMsg::Submit);
+    assert!(
+        matches!(effects[..], [Effect::ExportBackup { .. }]),
+        "{effects:?}"
+    );
+}
+
+#[tokio::test]
+async fn submit_does_nothing_after_an_upload_or_a_local_save() {
+    let mut f = drive_fixture().await;
+    uploading(&mut f);
+    export(&mut f.app, ExportMsg::UploadDone(Ok(uploaded_file())));
+    assert!(matches!(flow(&f.app).drive, DriveExport::Uploaded { .. }));
+    assert!(export(&mut f.app, ExportMsg::Submit).is_empty());
+    assert_eq!(flow(&f.app).field_error, None);
+    typed(&mut f.app, "pw", "pw");
+    assert!(export(&mut f.app, ExportMsg::Submit).is_empty());
+    assert!(matches!(flow(&f.app).drive, DriveExport::Uploaded { .. }));
+
+    let mut f = drive_fixture().await;
+    failed_upload(&mut f);
+    let path = f.dir.path().join("saved.hoprs");
+    export(&mut f.app, ExportMsg::SavePicked(Some(path.clone())));
+    export(
+        &mut f.app,
+        ExportMsg::SaveDone {
+            path,
+            result: Ok(()),
+        },
+    );
+    assert!(matches!(flow(&f.app).drive, DriveExport::Saved { .. }));
+    typed(&mut f.app, "pw", "pw");
+    assert!(export(&mut f.app, ExportMsg::Submit).is_empty());
+    assert!(matches!(flow(&f.app).drive, DriveExport::Saved { .. }));
+}
+
+#[tokio::test]
+async fn a_failed_upload_can_be_submitted_again() {
+    let mut f = drive_fixture().await;
+    failed_upload(&mut f);
+    typed(&mut f.app, "pw", "pw");
+    let effects = export(&mut f.app, ExportMsg::Submit);
+    assert!(
+        matches!(effects[..], [Effect::SealExport { .. }]),
+        "{effects:?}"
+    );
+}

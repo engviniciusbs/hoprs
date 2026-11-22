@@ -245,6 +245,19 @@ impl ExportFlow {
             && self.sealed.is_some()
     }
 
+    /// The export of the current destination succeeded (file: the report; Google Drive:
+    /// uploaded or saved): the primary button is Done, and Submit does nothing. A failed
+    /// export is not finished: it can be submitted again.
+    pub fn finished(&self) -> bool {
+        match self.destination {
+            Destination::File => matches!(self.state, BackupState::Done(_)),
+            Destination::Drive => matches!(
+                self.drive,
+                DriveExport::Uploaded { .. } | DriveExport::Saved { .. }
+            ),
+        }
+    }
+
     /// Empties the passwords and drops the questions that would send them.
     fn forget_passwords(&mut self) {
         self.password = Password::default();
@@ -510,7 +523,7 @@ impl App {
     /// Export: the fields checked in order (file, password, the same password twice);
     /// a chosen file starts at once, a typed one is checked for an existing file first.
     fn submit_export(&mut self) -> Vec<Effect> {
-        if !self.export_ready() {
+        if !self.export_ready() || self.export.as_ref().is_some_and(ExportFlow::finished) {
             return Vec::new();
         }
         if self

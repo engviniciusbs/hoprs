@@ -117,16 +117,7 @@ pub fn drive_outcome(app: &App) -> DriveOutcome {
 /// The export succeeded (to the file, or to or from Google Drive): the primary button is
 /// Done.
 pub fn export_finished(app: &App) -> bool {
-    let Some(flow) = app.export.as_ref() else {
-        return false;
-    };
-    match flow.destination {
-        Destination::File => matches!(flow.state, BackupState::Done(_)),
-        Destination::Drive => matches!(
-            drive_outcome(app),
-            DriveOutcome::Uploaded { .. } | DriveOutcome::Saved(_)
-        ),
-    }
+    app.export.as_ref().is_some_and(ExportFlow::finished)
 }
 
 /// Whether Export can be pressed: the model's rule and, for Google Drive, a connection.
