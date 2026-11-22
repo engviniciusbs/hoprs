@@ -6,6 +6,7 @@ pub mod channel;
 pub mod host;
 pub mod paths;
 pub mod proto;
+pub mod relay;
 pub mod server;
 pub mod service;
 #[cfg(test)]
@@ -192,14 +193,10 @@ impl Default for Limits {
 // ---- The texts an agent receives (English only, not in the Fluent catalogs) ----
 
 /// The relay could not reach the app.
-// TODO(Task 13): remove
-#[allow(dead_code)]
 pub const UNREACHABLE: &str = "hoprs is not reachable: it is not running, or agent access is off. Open hoprs and turn on Settings › Agents (MCP), then call the tool again.";
 /// The app closed the channel because the user turned agent access off.
 pub const TURNED_OFF: &str = "Agent access was turned off in hoprs. Turn on Settings › Agents (MCP) in the hoprs window, then call the tool again.";
 /// The running window is another version than the relay.
-// TODO(Task 13): remove
-#[allow(dead_code)]
 pub fn version_mismatch(app: &str, relay: &str) -> String {
     format!(
         "hoprs was updated while its window stayed open (window {app}, this program {relay}). Restart hoprs, then call the tool again."
@@ -234,8 +231,6 @@ pub const WAITING_FOR_USER: &str = "hoprs is waiting for the user: a question ab
 /// The server's host key changed.
 pub const HOST_KEY_CHANGED: &str = "The server's host key changed. The user has to resolve it in the hoprs window; an agent cannot accept a new key.";
 /// The server's `instructions`.
-// TODO(Task 13): remove
-#[allow(dead_code)]
 pub const INSTRUCTIONS: &str = "hoprs is a desktop client for SSH, SFTP, FTP and FTPS. These tools work on the sites the user saved in hoprs and opened to agents; the user sees every action in hoprs's log. Call list_sites first: it returns the sites you can use, with the id every other tool wants. Each site has one of two levels: read (list folders, read files, download) or all (also write, rename, delete, change permissions, upload, and run commands on SSH sites). A tool that needs more than the site allows is refused with a message saying so. Remote paths are absolute. There is no interactive terminal. If hoprs needs the user to answer a question about a connection, the tool says so: ask the user, then call it again.";
 
 #[cfg(test)]

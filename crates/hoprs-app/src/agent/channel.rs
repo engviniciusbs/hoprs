@@ -76,8 +76,6 @@ pub fn override_dir() -> Option<PathBuf> {
 /// The channels a relay tries, in order: the override's alone when there is one;
 /// otherwise on Unix the socket in each directory of the instance lock's locations (the
 /// app listens in the one it locked), and on Windows the standard pipe.
-// TODO(Task 13): remove
-#[allow(dead_code)]
 pub fn candidates() -> Vec<Endpoint> {
     if let Some(dir) = override_dir() {
         return vec![endpoint_in(&dir)];
@@ -120,8 +118,6 @@ impl Listener {
 
 /// The relay's end: connects to the app's channel at `endpoint`, after checking that it
 /// belongs to this user.
-// TODO(Task 13): remove
-#[allow(dead_code)]
 pub async fn connect(endpoint: &Endpoint) -> io::Result<Stream> {
     match endpoint {
         #[cfg(unix)]

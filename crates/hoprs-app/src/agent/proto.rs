@@ -109,8 +109,6 @@ impl ToRelay {
 
     /// The id and outcome of an answer; `None` for a goodbye. A failed answer without
     /// text is still a failure.
-    // TODO(Task 13): remove
-    #[allow(dead_code)]
     pub fn into_reply(self) -> Option<(u64, Reply)> {
         match self {
             ToRelay::Answer {
@@ -145,8 +143,8 @@ pub fn hello_reply(theirs: &Hello) -> HelloReply {
 /// Reads one line, without its `\n` (or `\r\n`). `None` at end-of-file; a last line
 /// without a newline is returned. A line over [`MAX_LINE`] bytes, or one that is not
 /// UTF-8, is `InvalidData`; the reader never holds more than [`MAX_LINE`] bytes of it.
-// TODO(Task 13): remove
-#[allow(dead_code)]
+/// Both ends read messages ([`read_message`]); this is for tests that read raw lines.
+#[cfg(test)]
 pub async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Result<Option<String>> {
     read_line_within(reader, MAX_LINE).await
 }

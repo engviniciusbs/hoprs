@@ -76,6 +76,14 @@ base64 = { workspace = true }
 # Percent-encodes the authorisation URL and decodes the browser's callback (Google Drive
 # sign-in). Already in the tree. MIT OR Apache-2.0.
 percent-encoding = "2"
+# The MCP server's protocol for `hoprs mcp` (the relay an agent starts): the official Rust
+# SDK, which serves both protocol eras (2026-07-28 and 2025-11-25 and earlier) on one stdio
+# process. Only `server` and `transport-io`, no default features (no macros, no HTTP, no
+# TLS). It adds `rmcp`, `schemars`, `schemars_derive`, `serde_derive_internals`,
+# `dyn-clone`, `ref-cast`, `ref-cast-impl`, `pastey`, `unicode-general-category` and
+# `unicode-normalization`; no OpenSSL, no ring. Apache-2.0 (`rmcp`,
+# `unicode-general-category`), MIT (`schemars`), the rest MIT OR Apache-2.0.
+rmcp = { version = "3.11", default-features = false, features = ["server", "transport-io"] }
 
 # Unix: the update download reuses an existing file only when this user (geteuid) owns
 # it. Already in the tree. MIT OR Apache-2.0.

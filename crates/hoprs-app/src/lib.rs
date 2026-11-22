@@ -1,7 +1,9 @@
 //! hoprs: desktop SSH + SFTP + FTP/FTPS client.
 //!
 //! The binary only calls [`run`], which owns the process-level concerns: the
-//! single-instance lock, logging and handing the [`App`] to iced. The crate is a
+//! single-instance lock, logging and handing the [`App`] to iced, or [`run_mcp`] for
+//! `hoprs mcp`, the relay an MCP client starts (none of that, and nothing on stdout but
+//! the protocol). The crate is a
 //! library so that the benchmarks in `benches/` reach the view ([`bench`]) and the
 //! start-up probe; nothing else is public.
 
@@ -58,6 +60,10 @@ const SUPPAFTP_CAP: &str = "debug";
 /// and trace: never above warn, whatever `RUST_LOG` says.
 const TERMINAL_LOG_CRATES: [&str; 2] = ["vte", "alacritty_terminal"];
 const TERMINAL_LOG_CAP: &str = "warn";
+/// The MCP SDK's target: never above info, whatever `RUST_LOG` says. At debug it logs
+/// every request and every unparsable input line verbatim, and a line of an agent's
+/// input can carry a whole `write_file` content.
+const RMCP_LOG_CRATE: &str = "rmcp";
 
 /// Runs hoprs until its window closes. With `HOPRS_PROBE_STARTUP=1` it runs the start-up
 /// probe instead (see `probe`): the same start-up, then two lines on stdout, then exit.
@@ -109,6 +115,44 @@ pub fn run() -> iced::Result {
             ..iced::window::Settings::default()
         })
         .run()
+}
+
+/// Runs `hoprs mcp`: the relay between an MCP client (on stdin and stdout) and the
+/// running hoprs (over the agent channel), until the client closes stdin. Returns the
+/// exit status: 0 when the input ended, 1 when the streams could not be used.
+///
+/// Nothing of the app starts: no instance lock (several clients each start their own
+/// relay while hoprs runs), no window, no renderer, no backend. The log goes to stderr
+/// only: stdout carries protocol messages and nothing else.
+pub fn run_mcp() -> i32 {
+    use tracing_subscriber::util::SubscriberInitExt;
+    let filter = log_filter(std::env::var("RUST_LOG").ok().as_deref());
+    // The panel's buffer is never shown here; the subscriber wants one.
+    log_subscriber(&filter, logbuf::LogBuffer::new(), io::stderr).init();
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            tracing::error!(%err, "hoprs mcp could not start its runtime");
+            return 1;
+        }
+    };
+    let served = runtime.block_on(agent::relay::serve(
+        rmcp::transport::stdio(),
+        agent::relay::Dial::standard(),
+    ));
+    // A read of stdin still pending on the blocking pool (the streams failed before
+    // the input ended) must not hold the exit.
+    runtime.shutdown_background();
+    match served {
+        Ok(()) => 0,
+        Err(err) => {
+            tracing::error!(%err, "hoprs mcp stopped: its standard streams could not be used");
+            1
+        }
+    }
 }
 
 /// On Linux the window's app id (Wayland `app_id`, X11 `WM_CLASS`) is what the dock
@@ -503,13 +547,17 @@ fn level_rank(level: &str) -> Option<u8> {
 }
 
 /// A hard per-target cap on top of the `EnvFilter`: the terminal crates
-/// stay at warn even inside a span a `[span]=debug` directive enables.
+/// stay at warn, and the MCP SDK ([`RMCP_LOG_CRATE`]) at info, even inside a
+/// span a `[span]=debug` directive enables.
 fn terminal_log_cap() -> tracing_subscriber::filter::Targets {
-    TERMINAL_LOG_CRATES.iter().fold(
-        tracing_subscriber::filter::Targets::new()
-            .with_default(tracing_subscriber::filter::LevelFilter::TRACE),
-        |targets, name| targets.with_target(*name, tracing::Level::WARN),
-    )
+    TERMINAL_LOG_CRATES
+        .iter()
+        .fold(
+            tracing_subscriber::filter::Targets::new()
+                .with_default(tracing_subscriber::filter::LevelFilter::TRACE),
+            |targets, name| targets.with_target(*name, tracing::Level::WARN),
+        )
+        .with_target(RMCP_LOG_CRATE, tracing::Level::INFO)
 }
 
 /// The subscriber's filter: `RUST_LOG` (as rewritten by [`log_filter`])
@@ -907,6 +955,11 @@ mod tests {
                 }
                 "vte::warn" => tracing::enabled!(target: "vte", tracing::Level::WARN),
                 "hoprs_app" => tracing::enabled!(target: "hoprs_app", tracing::Level::DEBUG),
+                "rmcp" => tracing::enabled!(target: "rmcp", tracing::Level::DEBUG),
+                "rmcp::service" => {
+                    tracing::enabled!(target: "rmcp::service", tracing::Level::DEBUG)
+                }
+                "rmcp::info" => tracing::enabled!(target: "rmcp", tracing::Level::INFO),
                 other => panic!("no callsite for {other}"),
             };
             drop(span);
@@ -952,6 +1005,32 @@ mod tests {
             let _span = tracing::info_span!("connect").entered();
             assert!(tracing::enabled!(target: "vte", tracing::Level::DEBUG));
         });
+    }
+
+    /// The MCP SDK logs requests and unparsable input lines verbatim at debug: never
+    /// enabled, whatever `RUST_LOG` says (L11 of Plan 17).
+    #[test]
+    fn real_filter_never_logs_rmcp_debug() {
+        let _lock = subscriber_test_lock();
+        for rust_log in [
+            None,
+            Some("debug"),
+            Some("trace"),
+            Some("rmcp=trace"),
+            Some("rmcp::service=debug"),
+            Some("info,[connect]=trace"),
+        ] {
+            for target in ["rmcp", "rmcp::service"] {
+                for in_span in [false, true] {
+                    assert!(
+                        !debug_enabled(rust_log, target, in_span),
+                        "{rust_log:?} enables debug for {target} (span: {in_span})"
+                    );
+                }
+            }
+        }
+        // Not vacuous: its info lines pass.
+        assert!(debug_enabled(Some("rmcp=trace"), "rmcp::info", false));
     }
 
     /// The panel's buffer sits behind the terminal's filter: the suppaftp cap (at

@@ -9,6 +9,10 @@ fn main() -> iced::Result {
     // Handled before `run()`: no instance lock, no logging, no window.
     match cli::parse_args(std::env::args().skip(1)) {
         Cli::Run => hoprs_app::run(),
+        // The relay an MCP client starts: its stdin and stdout are the protocol, so the
+        // standard handles the client gave are used as they are (no console attach, on
+        // Windows nothing reopened), and nothing here prints.
+        Cli::Mcp => std::process::exit(hoprs_app::run_mcp()),
         Cli::Version => {
             attach_parent_console();
             println!("{}", cli::version_line());
@@ -33,7 +37,8 @@ fn main() -> iced::Result {
 ///
 /// Started from an interactive cmd/PowerShell, the standard handles are null and attaching
 /// alone does not fill them, so any null/invalid output handle is pointed at `CONOUT$`.
-/// Redirected or piped handles are left untouched.
+/// Redirected or piped handles are left untouched. Never called for `mcp`, whose
+/// standard handles belong to the MCP client.
 #[cfg(windows)]
 fn attach_parent_console() {
     use std::ptr::{null, null_mut};

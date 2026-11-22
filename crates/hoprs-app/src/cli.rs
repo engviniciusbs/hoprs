@@ -1,5 +1,5 @@
-//! Command-line arguments. Parsed before anything else starts, so `--version` and
-//! `--help` never take the instance lock or open a window.
+//! Command-line arguments. Parsed before anything else starts, so `--version`, `--help`
+//! and `mcp` never take the instance lock or open a window.
 
 /// What the command line asks for.
 #[derive(Debug, PartialEq, Eq)]
@@ -10,6 +10,8 @@ pub enum Cli {
     Version,
     /// `--help` / `-h`.
     Help,
+    /// `mcp`: the relay an MCP client starts (stdio).
+    Mcp,
     /// Anything else; carries the first offending argument.
     Unknown(String),
 }
@@ -26,6 +28,11 @@ where
         Some(first) => match first.as_ref() {
             "--version" | "-V" => Cli::Version,
             "--help" | "-h" => Cli::Help,
+            // Exactly `mcp`: anything after it is refused rather than ignored.
+            "mcp" => match args.next() {
+                None => Cli::Mcp,
+                Some(extra) => Cli::Unknown(extra.as_ref().to_owned()),
+            },
             other => Cli::Unknown(other.to_owned()),
         },
     }
@@ -38,7 +45,7 @@ pub fn version_line() -> String {
 
 /// The `--help` text.
 pub fn usage() -> &'static str {
-    "Usage: hoprs [--version | --help]"
+    "Usage: hoprs [mcp | --version | --help]"
 }
 
 #[cfg(test)]
@@ -54,5 +61,13 @@ mod tests {
         assert_eq!(parse_args(["-h"]), Cli::Help);
         assert_eq!(parse_args(["--bogus"]), Cli::Unknown("--bogus".into()));
         assert_eq!(parse_args(["-V", "x"]), Cli::Version);
+    }
+
+    #[test]
+    fn parse_args_mcp() {
+        assert_eq!(parse_args(["mcp"]), Cli::Mcp);
+        assert_eq!(parse_args(["mcp", "x"]), Cli::Unknown("x".into()));
+        assert_eq!(parse_args(["MCP"]), Cli::Unknown("MCP".into()));
+        assert!(usage().contains("mcp"));
     }
 }

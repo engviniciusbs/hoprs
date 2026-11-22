@@ -26,8 +26,6 @@ pub enum Need {
 }
 
 /// One tool of the table.
-// TODO(Task 13): remove
-#[allow(dead_code)]
 pub struct ToolSpec {
     pub name: &'static str,
     pub title: &'static str,
@@ -42,8 +40,6 @@ pub struct ToolSpec {
 }
 
 /// The thirteen tools, in the order `tools/list` serves them.
-// TODO(Task 13): remove
-#[allow(dead_code)]
 pub fn all() -> &'static [ToolSpec] {
     &TOOLS
 }
