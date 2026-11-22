@@ -9,8 +9,11 @@
 //! **Nothing is replaced by default.** `write_file` refuses an existing path unless the
 //! call says `overwrite`, and always refuses a folder or a link at the path; `rename`
 //! never replaces what is at its target; `delete` removes a folder that is not empty only
-//! with `recursive`, and the walk removes a link as a link, never what it points to (see
-//! `backend::ops` for FTP servers that list a link to a folder as a folder).
+//! with `recursive` (without it a folder is only ever `remove_dir`ed, which fails on a
+//! folder that is not empty), and the walk removes a link as a link, never what it points
+//! to, as far as the server reports it: some FTP servers list a link to a folder as a
+//! folder, and the walk then goes into it (see `backend::ops`). `write_file` and
+//! `set_permissions` refuse a link at the path, again as the server reports it.
 
 use std::time::SystemTime;
 
@@ -300,21 +303,33 @@ impl Service {
     ) -> Result<Done, Failure> {
         let remote = self.remote(site).await?;
         let what = format!("Could not change the permissions of {path}");
+        // Over SFTP a chmod follows a link and changes its target: refused, as the server
+        // reports the path.
+        let found = remote.stat(path).await.map_err(|e| failed(&what, &e))?;
+        if found.kind == EntryKind::Symlink {
+            return Err(Failure::new(
+                format!(
+                    "{path} is a symbolic link: set_permissions does not change permissions through a link. Change the file or folder it points to by its own path. Nothing changed."
+                ),
+                "a symbolic link",
+            ));
+        }
         match remote.chmod(path, mode).await {
             Ok(()) => {
                 let result =
                     json!({"ok": true, "path": path.as_str(), "mode": format!("{mode:04o}")});
                 Ok(vec![result.to_string()].into())
             }
-            // The FTP backend reports a command the server does not know (500, 502, 504)
-            // as an unexpected reply.
+            // The FTP backend reports an answer to SITE CHMOD it does not expect (500, 502,
+            // 504: a server without it, or one that rejects this mode) as an unexpected
+            // reply.
             Err(e) if site.protocol != Protocol::Ssh && e.kind == ErrorKind::Protocol => {
                 Err(Failure::new(
                     format!(
-                        "{what}: the FTP server of \"{}\" does not support changing permissions (it did not accept SITE CHMOD).",
+                        "{what}: the FTP server of \"{}\" did not accept the change of permissions to {mode:04o} (SITE CHMOD). Some FTP servers do not support it at all.",
                         site.name
                     ),
-                    "the server does not support it",
+                    "the server did not accept SITE CHMOD",
                 ))
             }
             Err(e) => Err(failed(&what, &e)),
@@ -347,6 +362,20 @@ impl Service {
                     "a folder that is not empty",
                 ));
             }
+        }
+        if found.kind == EntryKind::Dir && !recursive {
+            // Never the walk: a folder filled since the listing makes this fail, and
+            // nothing in it is removed.
+            remote.remove_dir(path).await.map_err(|e| {
+                let mut failure = failed(&what, &e);
+                failure.text.push_str(". Nothing was deleted.");
+                failure
+            })?;
+            let result = json!({"ok": true, "path": path.as_str(), "deleted": 1});
+            return Ok(Done {
+                blocks: vec![result.to_string()],
+                note: Some(count(1, "item")),
+            });
         }
         let target = DeleteTarget {
             path: path.clone(),

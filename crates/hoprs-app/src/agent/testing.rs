@@ -57,6 +57,9 @@ pub enum FsOp {
     Chmod,
 }
 
+/// How long [`Hold::entered`] waits for a call.
+const ENTER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Holds calls until [`release`](Self::release), or until the last clone of the handle
 /// is dropped (a test that forgets to release never hangs). Cheap to clone; clones are
 /// one hold.
@@ -86,10 +89,15 @@ impl Hold {
         Arc::downgrade(&self.0)
     }
 
-    /// Waits until a call reached the hold.
+    /// Waits until a call reached the hold; panics after [`ENTER_WAIT`] (of paused time
+    /// too), so a call that never comes fails its test instead of hanging it.
     pub async fn entered(&self) {
         let mut entered = self.0.entered.subscribe();
-        let _ = entered.wait_for(|n| *n > 0).await;
+        let reached = tokio::time::timeout(ENTER_WAIT, entered.wait_for(|n| *n > 0)).await;
+        assert!(
+            reached.is_ok(),
+            "no call reached the hold within {ENTER_WAIT:?}"
+        );
     }
 
     /// Lets every held call, and every later one, through.

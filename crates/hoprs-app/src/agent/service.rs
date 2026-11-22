@@ -533,21 +533,40 @@ impl Job {
     /// What the call does, for its log line (never content).
     fn action(&self, spec: &ToolSpec) -> String {
         match self {
-            Job::List { path, .. } => format!("listed {path}"),
-            Job::Stat { path } => format!("described {path}"),
-            Job::Read { path, .. } => format!("read {path}"),
-            Job::Write { path, content, .. } => {
-                format!("wrote {path} ({})", count(content.len() as u64, "byte"))
-            }
-            Job::Mkdir { path } => format!("created the folder {path}"),
-            Job::Rename { from, to } => format!("renamed {from} to {to}"),
-            Job::Chmod { path, mode } => {
-                format!("changed the permissions of {path} to {mode:04o}")
-            }
-            Job::Delete { path, .. } => format!("deleted {path}"),
-            Job::Run { command, .. } => format!("ran `{command}`"),
+            Job::List { path, .. } => format!("listed {}", capped(path.as_str())),
+            Job::Stat { path } => format!("described {}", capped(path.as_str())),
+            Job::Read { path, .. } => format!("read {}", capped(path.as_str())),
+            Job::Write { path, content, .. } => format!(
+                "wrote {} ({})",
+                capped(path.as_str()),
+                count(content.len() as u64, "byte")
+            ),
+            Job::Mkdir { path } => format!("created the folder {}", capped(path.as_str())),
+            Job::Rename { from, to } => format!(
+                "renamed {} to {}",
+                capped(from.as_str()),
+                capped(to.as_str())
+            ),
+            Job::Chmod { path, mode } => format!(
+                "changed the permissions of {} to {mode:04o}",
+                capped(path.as_str())
+            ),
+            Job::Delete { path, .. } => format!("deleted {}", capped(path.as_str())),
+            Job::Run { command, .. } => format!("ran `{}`", capped(command)),
             Job::Later => spec.name.to_owned(),
         }
+    }
+}
+
+/// The most characters of a path or a command a log line keeps: the outcome at its end
+/// must survive the log panel's cut of a long line.
+const LOGGED_MAX: usize = 500;
+
+/// `text` up to [`LOGGED_MAX`] characters, then `… (N more bytes)`.
+fn capped(text: &str) -> String {
+    match text.char_indices().nth(LOGGED_MAX) {
+        None => text.to_owned(),
+        Some((at, _)) => format!("{}… ({} more bytes)", &text[..at], text.len() - at),
     }
 }
 
@@ -1129,11 +1148,18 @@ fn typed<T: DeserializeOwned>(spec: &ToolSpec, map: Map<String, Value>) -> Resul
         .map_err(|_| format!("The arguments of {} do not fit its schema.", spec.name))
 }
 
-/// The remote path of argument `name`: absolute, not above `/`.
+/// The remote path of argument `name`: absolute, with no `..` component (it would be
+/// resolved here by its text, while the server resolves it through any link on the way,
+/// so the log would name another path than the one touched).
 fn remote_path(site: &Site, name: &str, raw: &str) -> Result<RemotePath, String> {
     if raw.is_empty() {
         return Err(format!(
             "Argument `{name}` is empty: give an absolute path on the server, such as /var/www."
+        ));
+    }
+    if raw.split('/').any(|part| part == "..") {
+        return Err(format!(
+            "Argument `{name}` contains a `..` component, which the tools do not accept. Send the absolute path without it, such as /var/www rather than /var/www/app/.."
         ));
     }
     RemotePath::new(raw).map_err(|e| match e {

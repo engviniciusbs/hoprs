@@ -273,9 +273,19 @@ async fn no_access_and_no_such_site_read_the_same() {
     }
     assert_eq!(fx.host.connects(&fx.closed.id), 0);
     assert_eq!(fx.host.connects(&nobody), 0);
-    for op in [FsOp::List, FsOp::Stat, FsOp::Read] {
-        assert_eq!(fx.host.calls(&fx.closed.id, op), 0);
+    for op in [
+        FsOp::List,
+        FsOp::Stat,
+        FsOp::Read,
+        FsOp::Write,
+        FsOp::Mkdir,
+        FsOp::Rename,
+        FsOp::Remove,
+        FsOp::Chmod,
+    ] {
+        assert_eq!(fx.host.calls(&fx.closed.id, op), 0, "{op:?}");
     }
+    assert!(fx.host.execs().is_empty());
     assert!(fx.host.agent_sites().is_empty());
     assert!(fx.events().is_empty());
     let listed = ok(fx.call("list_sites", json!({})).await).join("\n");
@@ -1539,8 +1549,15 @@ async fn write_file_rules() {
     // One byte over the cap: an error, nothing written, no connection needed.
     let writes = fx.host.calls(&fx.ssh.id, FsOp::Write);
     let big = "x".repeat(1_048_577);
+    fx.host.close_agent_session(&fx.ssh.id).await;
+    let connects = fx.host.connects(&fx.ssh.id);
     let text = err(write(&fx.ssh, "/var/www/big.txt", &big, Some(true)).await);
     assert!(text.contains("1048576"), "{text}");
+    assert_eq!(
+        fx.host.connects(&fx.ssh.id),
+        connects,
+        "no connection for it"
+    );
     assert!(fx.ssh_fs.read_file("/var/www/big.txt").is_none());
     assert_eq!(fx.host.calls(&fx.ssh.id, FsOp::Write), writes);
     // The cap itself fits.
@@ -1738,8 +1755,19 @@ async fn make_rename_chmod() {
         on(&fx.ftp, json!({"path": "/f.txt", "mode": "600"})),
     )
     .await);
-    assert!(text.contains("does not support"), "{text}");
+    assert!(text.contains("did not accept"), "{text}");
+    assert!(text.contains("0600"), "{text}");
     assert!(!text.contains("502"), "{text}");
+    // A link at the path: refused before any chmod (SFTP's would change its target).
+    fx.ssh_fs.add_symlink("/var/www/link", "/etc/passwd");
+    let chmods = fx.host.calls(&fx.ssh.id, FsOp::Chmod);
+    let text = err(call(
+        "set_permissions",
+        on(&fx.ssh, json!({"path": "/var/www/link", "mode": "777"})),
+    )
+    .await);
+    assert!(text.contains("symbolic link"), "{text}");
+    assert_eq!(fx.host.calls(&fx.ssh.id, FsOp::Chmod), chmods);
 }
 
 #[tokio::test]
@@ -2085,4 +2113,169 @@ async fn write_tools_log_what_they_did() {
     for secret in ["hello world!", "SECRET-OUTPUT", "SECRET-ERR"] {
         assert!(!log.contains(secret), "{log}");
     }
+}
+
+/// A `..` component is refused in every path argument, reading and writing alike: the
+/// server would resolve it through links, the log by its text.
+#[tokio::test]
+async fn dot_dot_paths_are_refused() {
+    let fx = fixture();
+    fx.ssh_fs.add_file("/var/x.txt", b"x", EPOCH);
+    let call = |tool: &'static str, more: Value| {
+        let service = fx.service.clone();
+        let args = on(&fx.ssh, more);
+        async move { service.call(tool, args).await }
+    };
+    let text = err(call("read_file", json!({"path": "/var/www/../x.txt"})).await);
+    assert!(text.contains("`path`") && text.contains("`..`"), "{text}");
+    for recursive in [false, true] {
+        let text = err(call(
+            "delete",
+            json!({"path": "/var/www/..", "recursive": recursive}),
+        )
+        .await);
+        assert!(text.contains("`..`"), "{text}");
+    }
+    let text = err(call(
+        "rename",
+        json!({"from": "/var/www/../x.txt", "to": "/var/y.txt"}),
+    )
+    .await);
+    assert!(text.contains("`from`") && text.contains("`..`"), "{text}");
+    let text = err(call(
+        "rename",
+        json!({"from": "/var/x.txt", "to": "/var/www/../y.txt"}),
+    )
+    .await);
+    assert!(text.contains("`to`") && text.contains("`..`"), "{text}");
+    // Nothing reached the server, and everything is still there.
+    for op in [
+        FsOp::Read,
+        FsOp::Stat,
+        FsOp::List,
+        FsOp::Remove,
+        FsOp::Rename,
+    ] {
+        assert_eq!(fx.host.calls(&fx.ssh.id, op), 0, "{op:?}");
+    }
+    assert_eq!(fx.host.connects(&fx.ssh.id), 0);
+    assert_eq!(children(&fx.ssh_fs, "/var").await, ["www", "x.txt"]);
+    // A name that only contains dots is a name.
+    fx.ssh_fs.add_file("/var/www/..a", b"dots", EPOCH);
+    assert_eq!(
+        ok(call("read_file", json!({"path": "/var/www/..a"})).await)[1],
+        "dots"
+    );
+}
+
+/// Without `recursive` a folder is only removed as an empty folder: one filled between
+/// the check and the removal fails, and what was put in it stays.
+#[tokio::test]
+async fn delete_without_recursive_never_walks() {
+    let fx = fixture();
+    fx.ssh_fs.add_dir("/srv/empty");
+    let hold = fx.host.hold(&fx.ssh.id, FsOp::Remove);
+    let running = tokio::spawn({
+        let service = fx.service.clone();
+        let args = on(&fx.ssh, json!({"path": "/srv/empty"}));
+        async move { service.call("delete", args).await }
+    });
+    hold.entered().await;
+    fx.ssh_fs.add_file("/srv/empty/new.txt", b"new", EPOCH);
+    hold.release();
+    let text = err(running.await.unwrap());
+    assert!(text.contains("Nothing was deleted"), "{text}");
+    assert_eq!(
+        fx.ssh_fs.read_file("/srv/empty/new.txt").as_deref(),
+        Some(&b"new"[..])
+    );
+    assert_eq!(fx.host.calls(&fx.ssh.id, FsOp::Remove), 1, "one remove_dir");
+    // The check's listing only: no walk lists the folder again (a walk would remove
+    // whatever its own listing found).
+    assert_eq!(fx.host.calls(&fx.ssh.id, FsOp::List), 1);
+}
+
+/// A command waiting its turn that is cancelled leaves the queue, logged as cancelled;
+/// the one behind it still runs.
+#[tokio::test]
+async fn a_cancelled_waiting_command_leaves_the_queue() {
+    let (logs, _guard) = capture_logs();
+    let fx = fixture();
+    let spawn = |command: &str| {
+        let service = fx.service.clone();
+        let args = on(&fx.ssh, json!({"command": command}));
+        tokio::spawn(async move { service.call("run_command", args).await })
+    };
+    let running = || {
+        fx.service
+            .activity()
+            .running
+            .get(&fx.ssh.id)
+            .copied()
+            .unwrap_or(0)
+    };
+    let hold = fx.host.hold_exec();
+    let first = spawn("one");
+    hold.entered().await;
+    let waiting = spawn("two");
+    let third = spawn("three");
+    until(|| running() == 3).await;
+    waiting.abort();
+    assert!(waiting.await.unwrap_err().is_cancelled());
+    assert_eq!(running(), 2);
+    assert!(
+        logs.agent_lines()
+            .iter()
+            .any(|l| l.ends_with("ran `two` on \"Acme\" (cancelled)")),
+        "{:?}",
+        logs.agent_lines()
+    );
+    hold.release();
+    ok(first.await.unwrap());
+    ok(third.await.unwrap());
+    let commands: Vec<String> = fx.host.execs().into_iter().map(|e| e.1).collect();
+    assert_eq!(commands, ["one", "three"]);
+    assert!(fx.service.commands().is_empty());
+}
+
+/// An exec error of network kind says the connection may have been lost.
+#[tokio::test]
+async fn a_network_exec_error_says_the_connection_may_be_lost() {
+    let fx = fixture();
+    fx.host.set_exec(Err(Error::new(
+        ErrorKind::Network,
+        "Timed out opening a channel for the command",
+    )));
+    let text = err(fx
+        .call("run_command", on(&fx.ssh, json!({"command": "uptime"})))
+        .await);
+    assert!(
+        text.contains("Timed out opening a channel for the command"),
+        "{text}"
+    );
+    assert!(text.contains("connection may have been lost"), "{text}");
+}
+
+/// A command of megabytes is cut in the log line, which keeps its outcome.
+#[tokio::test]
+async fn a_long_command_keeps_its_outcome_in_the_log() {
+    let (logs, _guard) = capture_logs();
+    let fx = fixture();
+    fx.host
+        .set_exec(Ok(exec_output(b"", b"", ExecEnd::Exit(7))));
+    let command = format!("echo {}", "y".repeat(3_000_000));
+    ok(fx
+        .call("run_command", on(&fx.ssh, json!({"command": command})))
+        .await);
+    let lines = logs.agent_lines();
+    let line = lines.last().unwrap();
+    assert!(
+        line.ends_with("on \"Acme\" (exit 7)"),
+        "{}",
+        &line[line.len() - 80..]
+    );
+    assert!(line.contains("… (2999505 more bytes)"), "{}", &line[..600]);
+    assert!(line.len() < 1024, "{}", line.len());
+    // The host got the whole command.
+    assert_eq!(fx.host.execs().last().unwrap().1, command);
 }
