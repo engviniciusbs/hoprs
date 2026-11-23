@@ -78,7 +78,7 @@ sites and saved tabs. Run a debug or release build of this branch: `cargo run -p
 
 ## Google Drive destination (2026-11-23)
 
-Behaviour as of pull request #48 (`drive-enable`). Nothing here needs a Google account except
+Behaviour as of pull request #48 (`drive-enable`). The Pass results come from that pull request's CI (ubuntu, macos, windows), not from runs on this branch. Nothing here needs a Google account except
 the rows under "End-to-end run" and "NEEDS HUMAN (Google Drive)".
 
 | Check | Result |
@@ -96,7 +96,7 @@ the rows under "End-to-end run" and "NEEDS HUMAN (Google Drive)".
 | The flow: connect waits then connects; a second Connect click is ignored; export seals then uploads; a failed upload offers Try again and Save to this computer; a refused authorisation asks to connect again and clears the marker; one export at a time; Disconnect clears the marker; a stale marker is cleared when the entry is gone | Pass: `connect_waits_then_connects`, `second_connect_click_is_ignored`, `export_to_drive_seals_then_uploads`, `upload_failure_offers_try_again_and_save`, `refused_authorisation_asks_to_connect_again`, `one_export_at_a_time_for_drive_too`, `disconnect_clears_the_marker`, `stale_marker_is_cleared_when_the_entry_is_gone` |
 | Opening the form never reads the keyring; an unreadable keyring is asked again on the next pick | Pass: `opening_the_form_never_reads_the_keyring`, `unreadable_keyring_is_asked_again` |
 | A connection that is stored sets the marker; one held for this session only sets none and leaves an existing one | Pass: `a_session_only_connection_sets_no_marker`, `a_session_only_connect_keeps_an_existing_marker` |
-| The name field must not be empty; the form's messages and effects reach the backend | Pass: `drive_messages_from_the_user`, `drive_effects_reach_the_backend`, `submit_does_nothing_after_an_upload_or_a_local_save`, `a_failed_upload_can_be_submitted_again`, `drive_error_goes_when_the_form_is_left` |
+| The name field must not be empty (`export_to_drive_seals_then_uploads`); the form's messages and effects reach the backend | Pass: `drive_messages_from_the_user`, `drive_effects_reach_the_backend`, `submit_does_nothing_after_an_upload_or_a_local_save`, `a_failed_upload_can_be_submitted_again`, `drive_error_goes_when_the_form_is_left` |
 | The form's Drive row and outcome per state; nothing of Drive under the File destination | Pass: `drive_row_per_link`, `drive_outcome_per_state`, `no_drive_row_for_the_file_destination`, `the_file_destination_shows_nothing_of_a_drive_outcome` |
 | Settings → Backup shows the line from the marker or a live connection, only in a build with Drive; a failure shows without the marker | Pass: `drive_line_follows_the_marker_and_the_build`, `drive_line_also_follows_a_live_connection`, `drive_error_shows_without_the_marker_but_only_in_a_drive_build` |
 | Every new text in English, pt-BR and Turkish | Pass: `every_en_key_is_used`, `same_keys_and_variables_in_both_languages`, `error_codes_exist_in_both_catalogs`, `pt_br_values_differ_from_english`, `tr_values_differ_from_english` |
@@ -133,7 +133,7 @@ otherwise. Use a vault with a site that has a saved password.
    above saw no unverified-app screen, only an informational box about missing Privacy Policy
    or Terms links: note whether that is still so, and with which account type.) After allowing,
    the browser tab says "Google sent the answer to hoprs. Go back to hoprs to see the result;
-   you can close this tab." and hoprs shows the account (its email, or "Connected"). Do it
+   you can close this tab." and hoprs shows the account (its email, or "Connected": record which). Do it
    with Português and Türkçe too (the tab's page is in the app's language).
 2. **Export and find the file.** Type the password twice and Export. The screen says
    "Uploaded to Google Drive: …". In Drive there is a folder `hoprs` holding the file. "Open in
@@ -144,14 +144,12 @@ otherwise. Use a vault with a site that has a saved password.
 4. **A second export** the same day, with the same name, gives a second file (nothing is
    overwritten).
 5. **Cancel and no browser.** Click Connect, then Cancel: the wait ends. Click Connect again
-   with no browser (for example `BROWSER=true` or no default browser) and use "Copy the link":
-   pasting it in a browser continues the connection. Leave one connect unanswered for 5
+   with no browser: on Linux start hoprs with a no-op `xdg-open` first on `PATH`, or just close the tab that opened. Then use "Copy the link" and paste it in another browser. Any browser on this computer completes the wait, since only the `state` matters. Leave one connect unanswered for 5
    minutes: "The browser did not answer in 5 minutes" (Linux is enough).
 6. **Offline.** Disconnect the network, Export: an error shows inline and the screen offers
-   "Try again" and "Save to this computer…". Reconnect, "Try again" uploads; or save to this
+   "Try again" and "Save to this computer…". Turn the network back on, then "Try again" uploads; or save to this
    computer and restore the saved file.
-7. **A file over 5 MB** (a vault with a few large saved key files is enough, or a debug build
-   with a smaller limit): the upload fails with "Could not upload to Google Drive" and "Save to
+7. **A file over 5 MB** (a throwaway config dir, for example `XDG_CONFIG_HOME=<dir>` on Linux, with a generated `sites.toml` of tens of thousands of sites copied from a real entry with distinct ids; export everything. First export to a file and check that it is over 5 MB; if not, add more sites. Key files are never in an export, and the limit has no debug override): the upload fails with "Could not upload to Google Drive" and "Save to
    this computer…" works (Linux is enough).
 8. **Disconnect** in the export screen, and again in Settings → Backup (connect first): the
    keyring entry goes, `settings.toml` loses `google_drive`, and the app disappears from
@@ -164,15 +162,14 @@ otherwise. Use a vault with a site that has a saved password.
     `refresh-token.hoprs/google-drive`), and `settings.toml` holds `google_drive = true` and
     nothing else about Google. Restart hoprs: Settings → Backup shows "Google Drive:
     connected"; pick Google Drive in an export: it shows the account and uploads without a new
-    sign-in. With the keyring locked or absent (Linux: stop the Secret Service): the screen
+    sign-in. With the keyring locked or absent (Linux: lock the login keyring and refuse the unlock prompt, or start hoprs with `env -u DBUS_SESSION_BUS_ADDRESS`): the screen
     says "The system keyring is unavailable: this connection lasts until hoprs closes.", no
     marker is written, and after a restart Connect is shown again.
 11. **A browser with large cookies for `127.0.0.1`** (visit a local dev server that sets big
     cookies first) still connects (Linux is enough).
 12. **A build without the client** (a source build, or the CI artifact of a pull request)
     shows no Destination row on the export screen and no Google line in Settings.
-13. **The log panel** shows lines such as `Google Drive: connected` and `Google Drive:
-    uploaded <name>`, and no token, code or secret.
+13. **The log panel** shows lines such as `Google Drive: connected` and `export uploaded to Google Drive name=<name>`, and no token, code or secret.
 14. **The window.** The run above never went through the app's window. Look at the Drive
     rows at 520 px (Account with Disconnect, Name, the "Waiting for the browser…" state with
     Cancel and "Copy the link"), that Export is disabled until connected, and that nothing

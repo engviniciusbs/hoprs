@@ -401,13 +401,15 @@ minutes.
 
 **Export.** Type a name for the file (it starts as `hoprs-<name>-<date>.hoprs`), the password
 twice, and press Export. hoprs encrypts the file on this computer, then uploads it to a folder
-named `hoprs` in your Drive (created if it is not there). Every export is a new file: hoprs
+named `hoprs` in your Drive (created if it is not there; hoprs sees only the folder it
+created, so one you made yourself is not used). Every export is a new file: hoprs
 never overwrites or deletes one, so two exports with the same name give two files. "Open in
 Drive" opens the file's page in the browser.
 
 **If the upload fails** (offline, a revoked access, a file larger than 5 MB) the screen says
-so, and the encrypted file is still in memory: "Try again" after fixing the cause, or "Save to
-this computer…". If you revoked hoprs at Google, Connect is shown again.
+so. The encrypted file is kept while the export screen stays open: "Try again" (after connecting
+again if the access was revoked), or "Save to this computer…", which is the only way for a file
+over 5 MB.
 
 **Restore.** hoprs does not read from Drive. Download the file from the `hoprs` folder in
 your browser, then use Settings → Backup → "Restore backup…". A file of one site or one
@@ -415,7 +417,8 @@ workspace restores with Merge only (see above).
 
 **Disconnect.** "Disconnect" in the export screen, or in Settings → Backup (which shows a
 "Google Drive: connected" line). hoprs revokes its access at Google (if that call fails it is
-only logged), deletes its keyring entry and forgets the connection. The files already in Drive
+only logged), deletes its keyring entry and forgets the connection; if the keyring refuses the deletion, the
+screen shows the error and Settings keeps the line. The files already in Drive
 stay; delete them in Drive. You can also remove hoprs at
 <https://myaccount.google.com/permissions>.
 
@@ -426,8 +429,8 @@ What it does and does not do:
   the clear. Besides that, the sign-in and the token exchange go to Google, with the OAuth
   client's id and secret. They are compiled into the release builds; a desktop app cannot keep
   such a secret from someone who reads the program, and Google does not treat it as one.
-- **Who hoprs talks to:** `oauth2.googleapis.com` and `www.googleapis.com`, only after you pick
-  Google Drive and click Connect, Export or Disconnect. The sign-in page itself is
+- **Who hoprs talks to:** `oauth2.googleapis.com` and `www.googleapis.com`, only when you click
+  Connect, Export to Google Drive, or Disconnect. The sign-in page itself is
   `accounts.google.com`, in your browser. While you wait, hoprs listens on `127.0.0.1` (this
   computer only), on a free port, until the browser answers, you cancel or 5 minutes pass.
   Proxy variables are honoured like for the update check. No redirect is followed.
@@ -437,8 +440,10 @@ What it does and does not do:
 - **What hoprs keeps:** a refresh token (and the account email) in one keyring entry, service
   `hoprs/google-drive`, account `refresh-token`. `settings.toml` gets `google_drive = true`
   as a marker so Settings can show the line without opening the keyring. hoprs reads the
-  keyring when you first pick Google Drive in a session, and on Connect, Export and Disconnect;
-  not when you open the form, and not when it starts.
+  keyring the first time you pick Google Drive in a session (again after a read that failed),
+  and on Disconnect if it was not read yet. Connect writes the entry; Disconnect deletes it,
+  and so does an export that Google refuses because the access was revoked. It never touches
+  the keyring when you open the form or when it starts.
 - **No usable keyring:** the connection is held in memory and lasts until hoprs closes. The
   screen says so, no marker is written, and after a restart you press Connect again.
 - **Not in the log:** tokens, codes and the client secret are never written to the log; it
@@ -690,8 +695,9 @@ official Rust SDK, for the protocol on stdio. It adds exactly ten packages to `C
 ### Google Drive in your own build
 
 The Google Drive destination is hidden unless the build carries an OAuth client. Release
-builds get the author's. To enable it in your build, create a Google Cloud project with an
-OAuth client of type "Desktop app" and the scope `drive.file`, and build with both
+builds get the author's. To enable it in your build, create a Google Cloud project, enable the
+Google Drive API, configure the OAuth consent screen (add yourself as a test user while it is
+in testing), create an OAuth client of type "Desktop app" with the scope `drive.file`, and build with both
 `HOPRS_GOOGLE_CLIENT_ID` and `HOPRS_GOOGLE_CLIENT_SECRET` set (an empty value counts as unset;
 both are read at build time). A debug build also reads them at run time, where they win, and
 `HOPRS_DRIVE_URL` (one `https://` base that replaces Google's endpoints) for tests. Without

@@ -11,7 +11,7 @@ You can export one site or one workspace, not only everything.
 You can export the encrypted file to your Google Drive.
 
 - On the export screen, Destination **Google Drive** replaces the File field. **Connect to Google Drive…** opens your browser once; after that, Export uploads the file into a folder named `hoprs` in your Drive. Each export is a new file; hoprs never overwrites or deletes one. "Open in Drive" opens it.
-- The only permission asked is `drive.file` ("See, edit, create, and delete only the specific Google Drive files you use with this app"): hoprs sees the files it created, not the rest of your Drive. Only the sealed file leaves your computer, protected by your password.
+- The only permission asked is `drive.file` ("See, edit, create, and delete only the specific Google Drive files you use with this app"): hoprs sees the files it created, not the rest of your Drive. Of your data, only the sealed file (and its name) goes to Google, protected by your password.
 - The connection is one keyring entry (service `hoprs/google-drive`) and the marker `google_drive = true` in `settings.toml`. Without a usable keyring it lasts until hoprs closes, and the screen says so.
 - A failed upload keeps the encrypted file: **Try again**, or **Save to this computer…**. The limit is 5 MB; a larger file is refused and can be saved to this computer.
 - **Disconnect** (on the export screen and in Settings → Backup) revokes the access at Google and deletes the keyring entry. Restoring is manual: download the file from Drive and use Restore backup….

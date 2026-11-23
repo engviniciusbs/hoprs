@@ -55,5 +55,5 @@ one, so nobody duplicates the work.
 
 - **Telemetry** of any kind in the app. hoprs collects no data. The only requests it makes on
   its own behalf are the update check to GitHub, which can be turned off (see
-  [Updates](../README.md#updates)), and Google, only when you connect Google Drive and export
-  there (see [Google Drive](../README.md#google-drive)).
+  [Updates](../README.md#updates)), and Google, only when you connect Google Drive, export
+  there or disconnect it (see [Google Drive](../README.md#google-drive)).
