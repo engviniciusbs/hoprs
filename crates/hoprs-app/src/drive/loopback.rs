@@ -88,9 +88,9 @@ fn respond(stream: &mut TcpStream, status: &str, body: &str) {
 }
 
 /// Reads the request line (up to the first `\r\n`, at most [`READ_LIMIT`] bytes, before
-/// `deadline`).
-/// `None` when it did not arrive complete. The headers are not needed: a browser with
-/// large cookies for `127.0.0.1` sends a head far over 8 KiB (see [`drain`]).
+/// `deadline`). `None` when it did not arrive complete. The headers are not needed: a
+/// browser with large cookies for `127.0.0.1` sends a whole head (request line and
+/// headers) far over 8 KiB, though its request line is short (see [`drain`]).
 fn read_request_line(stream: &mut TcpStream, deadline: Instant) -> Option<Vec<u8>> {
     let mut buf = Vec::with_capacity(512);
     let mut chunk = [0_u8; 1024];

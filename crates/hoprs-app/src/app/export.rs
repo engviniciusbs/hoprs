@@ -768,8 +768,9 @@ impl App {
                     };
                     return vec![Effect::OpenDrivePage(Redacted(url))];
                 }
-                // Cancelled (or the form left) before the backend's wait began, when the
-                // cancel could not reach it: cancelled again now that it can.
+                // Cancelled (or the form left) before the wait began. The backend
+                // remembers a cancel that came first and ends that attempt itself; this
+                // second cancel is a fallback, harmless if it is already over.
                 vec![Effect::DriveCancel {
                     attempt: self.drive_attempt,
                 }]
@@ -794,9 +795,9 @@ impl App {
         }
     }
 
-    /// Cancel while the browser is awaited. A cancel sent before the backend's wait began
-    /// is lost there: the `Waiting` that follows is then cancelled at once
-    /// ([`App::drive_connecting`]).
+    /// Cancel while the browser is awaited. The backend remembers a cancel that reaches it
+    /// before the attempt began to wait and ends the attempt itself; the `Waiting` that
+    /// follows is still cancelled again ([`App::drive_connecting`]), as a fallback.
     fn cancel_connect(&mut self) -> Vec<Effect> {
         if !matches!(self.drive_link, DriveLink::Waiting { .. }) {
             return Vec::new();

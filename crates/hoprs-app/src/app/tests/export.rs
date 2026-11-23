@@ -940,12 +940,20 @@ async fn second_connect_click_is_ignored() {
     assert!(export(&mut f.app, ExportMsg::Connect).is_empty());
 }
 
+/// The id of the attempt a `DriveConnect` effect starts.
+fn attempt_of(effects: &[Effect]) -> u64 {
+    match effects {
+        [Effect::DriveConnect { attempt }] => *attempt,
+        other => panic!("expected one DriveConnect, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn cancel_and_timeout_states() {
     let mut f = drive_fixture().await;
     on_drive(&mut f);
     export(&mut f.app, ExportMsg::DriveStatus(Ok(None)));
-    export(&mut f.app, ExportMsg::Connect);
+    let attempt = attempt_of(&export(&mut f.app, ExportMsg::Connect));
     export(
         &mut f.app,
         ExportMsg::Connecting(
@@ -957,7 +965,7 @@ async fn cancel_and_timeout_states() {
     );
     let effects = export(&mut f.app, ExportMsg::CancelConnect);
     assert!(
-        matches!(effects[..], [Effect::DriveCancel { .. }]),
+        matches!(effects[..], [Effect::DriveCancel { attempt: a }] if a == attempt),
         "{effects:?}"
     );
     assert_eq!(f.app.drive_link, DriveLink::Disconnected);
@@ -995,10 +1003,10 @@ async fn early_cancel_is_sent_again_once_the_wait_begins() {
     let mut f = drive_fixture().await;
     on_drive(&mut f);
     export(&mut f.app, ExportMsg::DriveStatus(Ok(None)));
-    export(&mut f.app, ExportMsg::Connect);
+    let attempt = attempt_of(&export(&mut f.app, ExportMsg::Connect));
     let effects = export(&mut f.app, ExportMsg::CancelConnect);
     assert!(
-        matches!(effects[..], [Effect::DriveCancel { .. }]),
+        matches!(effects[..], [Effect::DriveCancel { attempt: a }] if a == attempt),
         "{effects:?}"
     );
     assert_eq!(f.app.drive_link, DriveLink::Disconnected);
@@ -1012,7 +1020,7 @@ async fn early_cancel_is_sent_again_once_the_wait_begins() {
         ),
     );
     assert!(
-        matches!(effects[..], [Effect::DriveCancel { .. }]),
+        matches!(effects[..], [Effect::DriveCancel { attempt: a }] if a == attempt),
         "{effects:?}"
     );
     assert_eq!(f.app.drive_link, DriveLink::Disconnected);
