@@ -12,14 +12,15 @@ use std::time::{Duration, Instant};
 use hoprs_core::{Error, ErrorKind};
 use secrecy::SecretString;
 
-use super::oauth::{Callback, connect_failed, parse_callback};
+use super::oauth::{Callback, MAX_REQUEST_LINE, connect_failed, parse_callback};
 
 /// How long the browser has to come back.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 const POLL: Duration = Duration::from_millis(50);
-/// The request line alone.
-const READ_LIMIT: usize = 8 * 1024;
+/// The request line and its `\r\n`; a longer line is refused (the parser's own limit
+/// is the same).
+const READ_LIMIT: usize = MAX_REQUEST_LINE + 2;
 /// What is read and dropped of the rest of a request.
 const DRAIN_LIMIT: usize = 64 * 1024;
 const READ_TIME: Duration = Duration::from_secs(2);
@@ -86,7 +87,8 @@ fn respond(stream: &mut TcpStream, status: &str, body: &str) {
     let _ = stream.shutdown(Shutdown::Write);
 }
 
-/// Reads the request line (up to the first `\r\n`, at most 8 KiB, before `deadline`).
+/// Reads the request line (up to the first `\r\n`, at most [`READ_LIMIT`] bytes, before
+/// `deadline`).
 /// `None` when it did not arrive complete. The headers are not needed: a browser with
 /// large cookies for `127.0.0.1` sends a head far over 8 KiB (see [`drain`]).
 fn read_request_line(stream: &mut TcpStream, deadline: Instant) -> Option<Vec<u8>> {
@@ -105,7 +107,8 @@ fn read_request_line(stream: &mut TcpStream, deadline: Instant) -> Option<Vec<u8
             return None;
         }
         stream.set_read_timeout(Some(left)).ok()?;
-        match stream.read(&mut chunk) {
+        let room = chunk.len().min(READ_LIMIT - buf.len());
+        match stream.read(&mut chunk[..room]) {
             Ok(0) | Err(_) => return None,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
@@ -293,7 +296,16 @@ mod tests {
             "GET /?code=abc&state=S HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: {}\r\n\r\n",
             "a".repeat(32 * 1024)
         );
-        let answer = send(port, request.as_bytes());
+        // As `send`, but the read must end cleanly: a socket closed with unread data
+        // (the drain's job) would reset the connection before the page is read.
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).unwrap();
+        let answer = String::from_utf8_lossy(&out);
         assert_eq!(waiting.join().unwrap().unwrap().expose_secret(), "abc");
         assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
     }
