@@ -297,8 +297,8 @@ pub enum ExportMsg {
     DriveStatus(Result<Option<DriveAccount>, Error>),
     /// "Connect to Google Drive…".
     Connect,
-    /// What the connect reports (its `Debug` never shows the URL).
-    Connecting(ConnectEvent),
+    /// What the connect of that attempt reports (its `Debug` never shows the URL).
+    Connecting(u64, ConnectEvent),
     CancelConnect,
     /// "Copy the link" while the browser is awaited.
     CopyLink,
@@ -335,7 +335,7 @@ impl ExportMsg {
                 | ExportMsg::TargetChecked { .. }
                 | ExportMsg::Done(_)
                 | ExportMsg::DriveStatus(_)
-                | ExportMsg::Connecting(_)
+                | ExportMsg::Connecting(..)
                 | ExportMsg::Disconnected(_)
                 | ExportMsg::SealDone(_)
                 | ExportMsg::UploadDone(_)
@@ -361,7 +361,7 @@ impl App {
             && !self.backup.restore.running()
     }
 
-    fn export_shown(&self) -> bool {
+    pub(super) fn export_shown(&self) -> bool {
         matches!(self.form, Some(Form::Export))
     }
 
@@ -377,7 +377,9 @@ impl App {
             }
             // The connection outlives the form: its answers land wherever the user is.
             ExportMsg::DriveStatus(result) => return self.drive_status(result),
-            ExportMsg::Connecting(event) => return self.drive_connecting(event),
+            ExportMsg::Connecting(attempt, event) => {
+                return self.drive_connecting(attempt, event);
+            }
             ExportMsg::Disconnect => return self.drive_disconnect(),
             ExportMsg::Disconnected(result) => return self.drive_disconnected(result),
             ExportMsg::PageOpened(result) => {
@@ -406,7 +408,7 @@ impl App {
             | ExportMsg::Done(_)
             | ExportMsg::TargetChecked { .. }
             | ExportMsg::DriveStatus(_)
-            | ExportMsg::Connecting(_)
+            | ExportMsg::Connecting(..)
             | ExportMsg::Disconnect
             | ExportMsg::Disconnected(_)
             | ExportMsg::PageOpened(_)
@@ -630,10 +632,15 @@ impl App {
 
     /// The centre shows something else: a running export keeps its flow without the
     /// passwords and questions; any other goes (and its sealed bytes with it). A connect
-    /// that waits for the browser is cancelled.
-    pub(super) fn export_left(&mut self) -> Vec<Effect> {
+    /// that waits for the browser is cancelled. An error the form showed (`was_shown`: it
+    /// was on screen before this update) goes with it, so Settings does not show it later
+    /// with no context.
+    pub(super) fn export_left(&mut self, was_shown: bool) -> Vec<Effect> {
         if self.export_shown() {
             return Vec::new();
+        }
+        if was_shown {
+            self.drive_error = None;
         }
         match self.export.as_mut() {
             Some(flow) if flow.running() => flow.forget_passwords(),
@@ -696,8 +703,10 @@ impl App {
         self.drive_unreadable = false;
         match result {
             Ok(Some(account)) => {
+                // A link held for this session only is no stored connection.
+                let stored = account.stored;
                 self.drive_link = DriveLink::Connected(account);
-                self.set_drive_marker(true)
+                self.set_drive_marker(stored)
             }
             Ok(None) => {
                 self.drive_link = DriveLink::Disconnected;
@@ -727,10 +736,17 @@ impl App {
         }
         self.drive_link = DriveLink::Waiting { url: None };
         self.drive_error = None;
-        vec![Effect::DriveConnect]
+        self.drive_attempt += 1;
+        vec![Effect::DriveConnect {
+            attempt: self.drive_attempt,
+        }]
     }
 
-    fn drive_connecting(&mut self, event: ConnectEvent) -> Vec<Effect> {
+    fn drive_connecting(&mut self, attempt: u64, event: ConnectEvent) -> Vec<Effect> {
+        // An earlier attempt's event: it says nothing about this one.
+        if attempt != self.drive_attempt {
+            return Vec::new();
+        }
         match event {
             ConnectEvent::Waiting { url } => {
                 if self.drive_link == (DriveLink::Waiting { url: None }) {
@@ -745,10 +761,11 @@ impl App {
             }
             // A success that raced a cancel is kept.
             ConnectEvent::Done(Ok(account)) => {
+                let stored = account.stored;
                 self.drive_link = DriveLink::Connected(account);
                 self.drive_unreadable = false;
                 self.drive_error = None;
-                self.set_drive_marker(true)
+                self.set_drive_marker(stored)
             }
             ConnectEvent::Done(Err(error)) => {
                 if matches!(self.drive_link, DriveLink::Waiting { .. }) {
@@ -786,15 +803,20 @@ impl App {
     }
 
     /// Disconnected: whatever the outcome, the connection is gone here (a failure to
-    /// delete the entry shows).
+    /// delete the entry shows, and the marker stays: the entry may still be there).
     fn drive_disconnected(&mut self, result: Result<(), Error>) -> Vec<Effect> {
         if !matches!(self.drive_link, DriveLink::Waiting { .. }) {
             self.drive_link = DriveLink::Disconnected;
         }
         // A failure may have left the entry there: the next pick reads it again.
         self.drive_unreadable = result.is_err();
+        let failed = result.is_err();
         self.drive_error = result.err();
-        self.set_drive_marker(false)
+        if failed {
+            Vec::new()
+        } else {
+            self.set_drive_marker(false)
+        }
     }
 
     /// Export to Google Drive: connected, the name, then the passwords as for a file;

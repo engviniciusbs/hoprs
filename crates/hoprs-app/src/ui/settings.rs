@@ -13,6 +13,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Element, Length, Padding};
 
+use crate::app::export::DriveLink;
 use crate::app::settings::{
     Backup, BackupMsg, BackupPanel, BackupState, SettingsMsg, SettingsSection, SettingsTab,
 };
@@ -657,13 +658,15 @@ pub fn view<'a>(app: &'a App, tab: &SettingsTab) -> Element<'a, Message> {
 }
 
 /// The Backup line for a Google Drive connection: from the marker in `settings.toml`
-/// (no keyring read), only in a build that offers Google Drive.
+/// (no keyring read) or a live connection (one held for this session only has no
+/// marker), only in a build that offers Google Drive.
 pub fn drive_line(app: &App) -> Option<&'static str> {
-    (app.drive_available && app.settings.google_drive).then(strings::drive_settings_line)
+    let connected = app.settings.google_drive || matches!(app.drive_link, DriveLink::Connected(_));
+    (app.drive_available && connected).then(strings::drive_settings_line)
 }
 
 /// The last Google Drive failure, in a build that offers Google Drive: shown whether or
-/// not the marker is still there (a failed Disconnect clears it).
+/// not the marker is there (a connect that failed leaves none).
 pub fn drive_error(app: &App) -> Option<&hoprs_core::Error> {
     app.drive_available.then_some(app.drive_error.as_ref())?
 }
@@ -1002,6 +1005,21 @@ mod tests {
             app.settings.google_drive = marker;
             assert_eq!(drive_line(&app), line, "{available} {marker}");
         }
+    }
+
+    #[test]
+    fn drive_line_also_follows_a_live_connection() {
+        set_language(Language::En);
+        let mut app = App::new();
+        app.drive_available = true;
+        app.settings.google_drive = false;
+        app.drive_link = DriveLink::Connected(crate::drive::DriveAccount {
+            email: None,
+            stored: false,
+        });
+        assert_eq!(drive_line(&app), Some("Google Drive: connected"));
+        app.drive_link = DriveLink::Disconnected;
+        assert_eq!(drive_line(&app), None);
     }
 
     #[test]
