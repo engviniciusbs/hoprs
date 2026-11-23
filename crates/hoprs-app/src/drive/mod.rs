@@ -455,7 +455,6 @@ impl Drive {
             Err(err) if client::unauthorized(&err) => send(&self.access(client, true)?),
             other => other,
         }?;
-        tracing::info!("Google Drive: uploaded {}", file.name);
         Ok(file)
     }
 }
