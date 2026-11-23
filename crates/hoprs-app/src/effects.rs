@@ -296,9 +296,9 @@ pub fn run(
             password,
         } => Task::future(export_backup(backend, scope, path, password)),
         Effect::DriveStatus => Task::future(drive_status(backend)),
-        Effect::DriveConnect => Task::run(drive_connect(backend), |m| m),
-        Effect::DriveCancel => {
-            backend.drive_cancel();
+        Effect::DriveConnect { attempt } => Task::run(drive_connect(backend, attempt), |m| m),
+        Effect::DriveCancel { attempt } => {
+            backend.drive_cancel(attempt);
             Task::none()
         }
         Effect::DriveDisconnect => Task::future(drive_disconnect(backend)),
@@ -607,14 +607,17 @@ pub async fn drive_status(backend: Arc<dyn BackendApi>) -> Message {
 }
 
 /// Signs in through the browser; the pages it shows afterwards are in the app's language.
-pub fn drive_connect(backend: Arc<dyn BackendApi>) -> impl Stream<Item = Message> + use<> {
+pub fn drive_connect(
+    backend: Arc<dyn BackendApi>,
+    attempt: u64,
+) -> impl Stream<Item = Message> + use<> {
     let pages = Pages {
         connected: strings::drive_page_connected().to_owned(),
         failed: strings::drive_page_failed().to_owned(),
     };
     backend
-        .drive_connect(pages)
-        .map(|event| Message::Export(ExportMsg::Connecting(event)))
+        .drive_connect(attempt, pages)
+        .map(move |event| Message::Export(ExportMsg::Connecting(attempt, event)))
 }
 
 pub async fn drive_disconnect(backend: Arc<dyn BackendApi>) -> Message {

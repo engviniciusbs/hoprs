@@ -655,7 +655,7 @@ pick-restore = Choose a hoprs backup
 export-done = Exported { $sites }, { $workspaces } and { $secrets }.
 drive-name-required = Enter a name for the file
 # The pages the browser shows after connecting to Google Drive.
-drive-page-connected = hoprs is connected. You can close this tab.
+drive-page-connected = Google sent the answer to hoprs. Go back to hoprs to see the result; you can close this tab.
 drive-page-failed = hoprs could not connect. Go back to hoprs and try again.
 export-destination = Destination
 export-destination-file = A file on this computer

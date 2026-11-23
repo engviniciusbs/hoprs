@@ -12,13 +12,17 @@ use std::time::{Duration, Instant};
 use hoprs_core::{Error, ErrorKind};
 use secrecy::SecretString;
 
-use super::oauth::{Callback, connect_failed, parse_callback};
+use super::oauth::{Callback, MAX_REQUEST_LINE, connect_failed, parse_callback};
 
 /// How long the browser has to come back.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 const POLL: Duration = Duration::from_millis(50);
-const READ_LIMIT: usize = 8 * 1024;
+/// The request line and its `\r\n`; a longer line is refused (the parser's own limit
+/// is the same).
+const READ_LIMIT: usize = MAX_REQUEST_LINE + 2;
+/// What is read and dropped of the rest of a request.
+const DRAIN_LIMIT: usize = 64 * 1024;
 const READ_TIME: Duration = Duration::from_secs(2);
 const DENIED_DETAIL_MAX: usize = 100;
 
@@ -83,15 +87,16 @@ fn respond(stream: &mut TcpStream, status: &str, body: &str) {
     let _ = stream.shutdown(Shutdown::Write);
 }
 
-/// Reads the request head (up to the blank line, at most 8 KiB, at most 2 s in all).
-/// `None` when it did not arrive complete.
-fn read_head(stream: &mut TcpStream) -> Option<Vec<u8>> {
-    let deadline = Instant::now() + READ_TIME;
+/// Reads the request line (up to the first `\r\n`, at most [`READ_LIMIT`] bytes, before
+/// `deadline`). `None` when it did not arrive complete. The headers are not needed: a
+/// browser with large cookies for `127.0.0.1` sends a whole head (request line and
+/// headers) far over 8 KiB, though its request line is short (see [`drain`]).
+fn read_request_line(stream: &mut TcpStream, deadline: Instant) -> Option<Vec<u8>> {
     let mut buf = Vec::with_capacity(512);
     let mut chunk = [0_u8; 1024];
     loop {
-        if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
-            buf.truncate(end + 4);
+        if let Some(end) = buf.windows(2).position(|w| w == b"\r\n") {
+            buf.truncate(end + 2);
             return Some(buf);
         }
         if buf.len() >= READ_LIMIT {
@@ -102,9 +107,28 @@ fn read_head(stream: &mut TcpStream) -> Option<Vec<u8>> {
             return None;
         }
         stream.set_read_timeout(Some(left)).ok()?;
-        match stream.read(&mut chunk) {
+        let room = chunk.len().min(READ_LIMIT - buf.len());
+        match stream.read(&mut chunk[..room]) {
             Ok(0) | Err(_) => return None,
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
+        }
+    }
+}
+
+/// Reads and drops the rest of the request (at most [`DRAIN_LIMIT`] bytes, before
+/// `deadline`), so closing the socket does not reset the browser's connection before it
+/// has read the page.
+fn drain(stream: &mut TcpStream, deadline: Instant) {
+    let mut chunk = [0_u8; 4096];
+    let mut total = 0;
+    while total < DRAIN_LIMIT {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() || stream.set_read_timeout(Some(left)).is_err() {
+            return;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => total += n,
         }
     }
 }
@@ -116,11 +140,13 @@ fn handle(
 ) -> Option<Result<SecretString, Error>> {
     // Accepted sockets may inherit the listener's non-blocking mode.
     stream.set_nonblocking(false).ok()?;
-    let Some(head) = read_head(&mut stream) else {
+    let deadline = Instant::now() + READ_TIME;
+    let Some(head) = read_request_line(&mut stream, deadline) else {
         respond(&mut stream, "400 Bad Request", &page(&pages.failed));
+        drain(&mut stream, deadline);
         return None;
     };
-    match parse_callback(&head, state) {
+    let outcome = match parse_callback(&head, state) {
         Callback::Code(code) => {
             respond(&mut stream, "200 OK", &page(&pages.connected));
             Some(Ok(SecretString::from(code)))
@@ -139,7 +165,9 @@ fn handle(
             respond(&mut stream, "400 Bad Request", &page(&pages.failed));
             None
         }
-    }
+    };
+    drain(&mut stream, deadline);
+    outcome
 }
 
 impl Listener {
@@ -256,6 +284,46 @@ mod tests {
         assert!(answer.contains("Cache-Control: no-store"));
         assert!(answer.contains("Connection: close"));
         assert!(answer.contains("Connected &lt;ok&gt;"));
+    }
+
+    /// Cookies are per host, not per port: the browser may send a head far over 8 KiB.
+    #[test]
+    fn a_big_request_head_does_not_matter() {
+        let listener = Listener::bind().unwrap();
+        let port = port_of(&listener);
+        let waiting = run(listener, "S", Duration::from_secs(20));
+        let request = format!(
+            "GET /?code=abc&state=S HTTP/1.1\r\nHost: 127.0.0.1\r\nCookie: {}\r\n\r\n",
+            "a".repeat(32 * 1024)
+        );
+        // As `send`, but the read must end cleanly: a socket closed with unread data
+        // (the drain's job) would reset the connection before the page is read.
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).unwrap();
+        let answer = String::from_utf8_lossy(&out);
+        assert_eq!(waiting.join().unwrap().unwrap().expose_secret(), "abc");
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    }
+
+    #[test]
+    fn a_long_request_line_is_refused() {
+        let listener = Listener::bind().unwrap();
+        let port = port_of(&listener);
+        let waiting = run(listener, "S", Duration::from_secs(30));
+        let long = format!("GET /?code=abc&x={} HTTP/1.1\r\n\r\n", "a".repeat(9 * 1024));
+        let answer = send(port, long.as_bytes());
+        assert!(
+            answer.is_empty() || answer.starts_with("HTTP/1.1 400"),
+            "{answer}"
+        );
+        let answer = send(port, b"GET /?code=abc&state=S HTTP/1.1\r\n\r\n");
+        assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+        assert_eq!(waiting.join().unwrap().unwrap().expose_secret(), "abc");
     }
 
     #[test]

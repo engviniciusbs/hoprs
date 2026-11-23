@@ -832,7 +832,10 @@ async fn unreadable_keyring_is_asked_again() {
         ExportMsg::DriveStatus(Err(Error::new(ErrorKind::Io, "locked"))),
     );
     let effects = export(&mut f.app, ExportMsg::Connect);
-    assert!(matches!(effects[..], [Effect::DriveConnect]), "{effects:?}");
+    assert!(
+        matches!(effects[..], [Effect::DriveConnect { .. }]),
+        "{effects:?}"
+    );
     assert_eq!(f.app.drive_error, None);
 }
 
@@ -842,13 +845,19 @@ async fn connect_waits_then_connects() {
     on_drive(&mut f);
     export(&mut f.app, ExportMsg::DriveStatus(Ok(None)));
     let effects = export(&mut f.app, ExportMsg::Connect);
-    assert!(matches!(effects[..], [Effect::DriveConnect]), "{effects:?}");
+    assert!(
+        matches!(effects[..], [Effect::DriveConnect { .. }]),
+        "{effects:?}"
+    );
     assert_eq!(f.app.drive_link, DriveLink::Waiting { url: None });
     let effects = export(
         &mut f.app,
-        ExportMsg::Connecting(ConnectEvent::Waiting {
-            url: AUTH_URL.into(),
-        }),
+        ExportMsg::Connecting(
+            1,
+            ConnectEvent::Waiting {
+                url: AUTH_URL.into(),
+            },
+        ),
     );
     match &effects[..] {
         [Effect::OpenDrivePage(url)] => assert_eq!(url.0, AUTH_URL),
@@ -873,7 +882,7 @@ async fn connect_waits_then_connects() {
 
     let effects = export(
         &mut f.app,
-        ExportMsg::Connecting(ConnectEvent::Done(Ok(account()))),
+        ExportMsg::Connecting(1, ConnectEvent::Done(Ok(account()))),
     );
     assert_eq!(f.app.drive_link, DriveLink::Connected(account()));
     assert!(f.app.settings.google_drive);
@@ -888,9 +897,12 @@ async fn debug_never_shows_the_url() {
     let link = DriveLink::Waiting {
         url: Some(AUTH_URL.into()),
     };
-    let message = Message::Export(ExportMsg::Connecting(ConnectEvent::Waiting {
-        url: AUTH_URL.into(),
-    }));
+    let message = Message::Export(ExportMsg::Connecting(
+        1,
+        ConnectEvent::Waiting {
+            url: AUTH_URL.into(),
+        },
+    ));
     let mut f = drive_fixture().await;
     on_drive(&mut f);
     export(&mut f.app, ExportMsg::DriveStatus(Ok(None)));
@@ -912,9 +924,12 @@ async fn second_connect_click_is_ignored() {
     assert!(export(&mut f.app, ExportMsg::Connect).is_empty());
     export(
         &mut f.app,
-        ExportMsg::Connecting(ConnectEvent::Waiting {
-            url: AUTH_URL.into(),
-        }),
+        ExportMsg::Connecting(
+            1,
+            ConnectEvent::Waiting {
+                url: AUTH_URL.into(),
+            },
+        ),
     );
     assert!(export(&mut f.app, ExportMsg::Connect).is_empty());
     // Not from Reading or Connected either.
@@ -925,24 +940,38 @@ async fn second_connect_click_is_ignored() {
     assert!(export(&mut f.app, ExportMsg::Connect).is_empty());
 }
 
+/// The id of the attempt a `DriveConnect` effect starts.
+fn attempt_of(effects: &[Effect]) -> u64 {
+    match effects {
+        [Effect::DriveConnect { attempt }] => *attempt,
+        other => panic!("expected one DriveConnect, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn cancel_and_timeout_states() {
     let mut f = drive_fixture().await;
     on_drive(&mut f);
     export(&mut f.app, ExportMsg::DriveStatus(Ok(None)));
-    export(&mut f.app, ExportMsg::Connect);
+    let attempt = attempt_of(&export(&mut f.app, ExportMsg::Connect));
     export(
         &mut f.app,
-        ExportMsg::Connecting(ConnectEvent::Waiting {
-            url: AUTH_URL.into(),
-        }),
+        ExportMsg::Connecting(
+            1,
+            ConnectEvent::Waiting {
+                url: AUTH_URL.into(),
+            },
+        ),
     );
     let effects = export(&mut f.app, ExportMsg::CancelConnect);
-    assert!(matches!(effects[..], [Effect::DriveCancel]), "{effects:?}");
+    assert!(
+        matches!(effects[..], [Effect::DriveCancel { attempt: a }] if a == attempt),
+        "{effects:?}"
+    );
     assert_eq!(f.app.drive_link, DriveLink::Disconnected);
     let effects = export(
         &mut f.app,
-        ExportMsg::Connecting(ConnectEvent::Done(Err(coded("drive-connect-cancelled")))),
+        ExportMsg::Connecting(1, ConnectEvent::Done(Err(coded("drive-connect-cancelled")))),
     );
     assert!(effects.is_empty(), "{effects:?}");
     assert_eq!(f.app.drive_link, DriveLink::Disconnected);
@@ -955,14 +984,14 @@ async fn cancel_and_timeout_states() {
     let timed_out = coded("drive-connect-timed-out");
     export(
         &mut f.app,
-        ExportMsg::Connecting(ConnectEvent::Done(Err(timed_out.clone()))),
+        ExportMsg::Connecting(2, ConnectEvent::Done(Err(timed_out.clone()))),
     );
     assert_eq!(f.app.drive_link, DriveLink::Disconnected);
     assert_eq!(f.app.drive_error, Some(timed_out.clone()));
     // A late failure while not waiting is ignored.
     export(
         &mut f.app,
-        ExportMsg::Connecting(ConnectEvent::Done(Err(coded("drive-connect-denied")))),
+        ExportMsg::Connecting(2, ConnectEvent::Done(Err(coded("drive-connect-denied")))),
     );
     assert_eq!(f.app.drive_error, Some(timed_out));
 }
@@ -974,21 +1003,30 @@ async fn early_cancel_is_sent_again_once_the_wait_begins() {
     let mut f = drive_fixture().await;
     on_drive(&mut f);
     export(&mut f.app, ExportMsg::DriveStatus(Ok(None)));
-    export(&mut f.app, ExportMsg::Connect);
+    let attempt = attempt_of(&export(&mut f.app, ExportMsg::Connect));
     let effects = export(&mut f.app, ExportMsg::CancelConnect);
-    assert!(matches!(effects[..], [Effect::DriveCancel]), "{effects:?}");
+    assert!(
+        matches!(effects[..], [Effect::DriveCancel { attempt: a }] if a == attempt),
+        "{effects:?}"
+    );
     assert_eq!(f.app.drive_link, DriveLink::Disconnected);
     let effects = export(
         &mut f.app,
-        ExportMsg::Connecting(ConnectEvent::Waiting {
-            url: AUTH_URL.into(),
-        }),
+        ExportMsg::Connecting(
+            1,
+            ConnectEvent::Waiting {
+                url: AUTH_URL.into(),
+            },
+        ),
     );
-    assert!(matches!(effects[..], [Effect::DriveCancel]), "{effects:?}");
+    assert!(
+        matches!(effects[..], [Effect::DriveCancel { attempt: a }] if a == attempt),
+        "{effects:?}"
+    );
     assert_eq!(f.app.drive_link, DriveLink::Disconnected);
     export(
         &mut f.app,
-        ExportMsg::Connecting(ConnectEvent::Done(Err(coded("drive-connect-cancelled")))),
+        ExportMsg::Connecting(1, ConnectEvent::Done(Err(coded("drive-connect-cancelled")))),
     );
     assert_eq!(f.app.drive_link, DriveLink::Disconnected);
     assert_eq!(f.app.drive_error, None);
@@ -1003,14 +1041,17 @@ async fn late_success_after_cancel_is_kept() {
     export(&mut f.app, ExportMsg::Connect);
     export(
         &mut f.app,
-        ExportMsg::Connecting(ConnectEvent::Waiting {
-            url: AUTH_URL.into(),
-        }),
+        ExportMsg::Connecting(
+            1,
+            ConnectEvent::Waiting {
+                url: AUTH_URL.into(),
+            },
+        ),
     );
     export(&mut f.app, ExportMsg::CancelConnect);
     let effects = export(
         &mut f.app,
-        ExportMsg::Connecting(ConnectEvent::Done(Ok(account()))),
+        ExportMsg::Connecting(1, ConnectEvent::Done(Ok(account()))),
     );
     assert_eq!(f.app.drive_link, DriveLink::Connected(account()));
     assert!(f.app.settings.google_drive);
@@ -1025,13 +1066,18 @@ async fn leaving_while_waiting_cancels() {
     export(&mut f.app, ExportMsg::Connect);
     export(
         &mut f.app,
-        ExportMsg::Connecting(ConnectEvent::Waiting {
-            url: AUTH_URL.into(),
-        }),
+        ExportMsg::Connecting(
+            1,
+            ConnectEvent::Waiting {
+                url: AUTH_URL.into(),
+            },
+        ),
     );
     let effects = f.app.update(Message::ConnectSite(f.a.id.clone()));
     assert!(
-        effects.iter().any(|e| matches!(e, Effect::DriveCancel)),
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::DriveCancel { .. })),
         "{effects:?}"
     );
     assert_eq!(f.app.drive_link, DriveLink::Disconnected);
@@ -1039,7 +1085,9 @@ async fn leaving_while_waiting_cancels() {
     // Once only.
     let effects = f.app.update(Message::OpenSettings);
     assert!(
-        !effects.iter().any(|e| matches!(e, Effect::DriveCancel)),
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::DriveCancel { .. })),
         "{effects:?}"
     );
 }
@@ -1221,13 +1269,16 @@ async fn refused_authorisation_asks_to_connect_again() {
     export(&mut f.app, ExportMsg::Connect);
     export(
         &mut f.app,
-        ExportMsg::Connecting(ConnectEvent::Waiting {
-            url: AUTH_URL.into(),
-        }),
+        ExportMsg::Connecting(
+            1,
+            ConnectEvent::Waiting {
+                url: AUTH_URL.into(),
+            },
+        ),
     );
     export(
         &mut f.app,
-        ExportMsg::Connecting(ConnectEvent::Done(Ok(account()))),
+        ExportMsg::Connecting(1, ConnectEvent::Done(Ok(account()))),
     );
     let effects = export(&mut f.app, ExportMsg::TryAgain);
     match &effects[..] {
@@ -1413,8 +1464,9 @@ async fn disconnect_clears_the_marker() {
     export(&mut f.app, ExportMsg::Disconnect);
     let effects = export(&mut f.app, ExportMsg::Disconnected(Err(error.clone())));
     assert_eq!(f.app.drive_link, DriveLink::Disconnected);
-    assert!(!f.app.settings.google_drive);
-    assert!(saves_settings(&effects), "{effects:?}");
+    // The entry may still be there, not revoked: the marker stays.
+    assert!(f.app.settings.google_drive);
+    assert!(!saves_settings(&effects), "{effects:?}");
     assert_eq!(f.app.drive_error, Some(error));
 
     // From Settings, with the form never opened (the marker draws the line there).
@@ -1454,7 +1506,7 @@ fn drive_messages_from_the_user() {
     }
     for msg in [
         ExportMsg::DriveStatus(Ok(None)),
-        ExportMsg::Connecting(ConnectEvent::Done(Ok(account()))),
+        ExportMsg::Connecting(1, ConnectEvent::Done(Ok(account()))),
         ExportMsg::Disconnected(Ok(())),
         ExportMsg::SealDone(Err(Error::new(ErrorKind::Io, "x"))),
         ExportMsg::UploadDone(Ok(uploaded_file())),
@@ -1487,13 +1539,13 @@ async fn drive_effects_reach_the_backend() {
         },
         ConnectEvent::Done(Ok(account())),
     ]);
-    let messages: Vec<Message> = effects::drive_connect(backend.clone()).collect().await;
+    let messages: Vec<Message> = effects::drive_connect(backend.clone(), 7).collect().await;
     assert!(
         matches!(
             messages.as_slice(),
             [
-                Message::Export(ExportMsg::Connecting(ConnectEvent::Waiting { .. })),
-                Message::Export(ExportMsg::Connecting(ConnectEvent::Done(Ok(_)))),
+                Message::Export(ExportMsg::Connecting(7, ConnectEvent::Waiting { .. })),
+                Message::Export(ExportMsg::Connecting(7, ConnectEvent::Done(Ok(_)))),
             ]
         ),
         "{messages:?}"
@@ -1505,7 +1557,7 @@ async fn drive_effects_reach_the_backend() {
         "{message:?}"
     );
     let runs = effects::CompareRuns::default();
-    let _ = effects::run(backend.clone(), &runs, Effect::DriveCancel);
+    let _ = effects::run(backend.clone(), &runs, Effect::DriveCancel { attempt: 1 });
     assert_eq!(fake.drive_cancels(), 1);
 
     let message = effects::seal_export(
@@ -1630,4 +1682,144 @@ async fn a_failed_upload_can_be_submitted_again() {
         matches!(effects[..], [Effect::SealExport { .. }]),
         "{effects:?}"
     );
+}
+
+fn waiting_event(url: &str) -> ConnectEvent {
+    ConnectEvent::Waiting { url: url.into() }
+}
+
+/// An event of an earlier Connect says nothing about the current one.
+#[tokio::test]
+async fn events_of_an_earlier_attempt_are_dropped() {
+    let mut f = drive_fixture().await;
+    on_drive(&mut f);
+    export(&mut f.app, ExportMsg::DriveStatus(Ok(None)));
+    export(&mut f.app, ExportMsg::Connect);
+    export(&mut f.app, ExportMsg::CancelConnect);
+    let effects = export(&mut f.app, ExportMsg::Connect);
+    assert!(
+        matches!(effects[..], [Effect::DriveConnect { attempt: 2 }]),
+        "{effects:?}"
+    );
+    let fresh = DriveLink::Waiting { url: None };
+    assert_eq!(f.app.drive_link, fresh);
+
+    // A late Done, success or failure, of attempt 1.
+    for done in [
+        ConnectEvent::Done(Ok(account())),
+        ConnectEvent::Done(Err(coded("drive-connect-denied"))),
+    ] {
+        let effects = export(&mut f.app, ExportMsg::Connecting(1, done));
+        assert!(effects.is_empty(), "{effects:?}");
+        assert_eq!(f.app.drive_link, fresh);
+        assert_eq!(f.app.drive_error, None);
+        assert!(!f.app.settings.google_drive);
+    }
+    // A late Waiting of attempt 1 neither opens the browser nor cancels attempt 2.
+    let effects = export(&mut f.app, ExportMsg::Connecting(1, waiting_event("late")));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(f.app.drive_link, fresh);
+
+    // The current one's Waiting, then a late one that does not replace its URL.
+    export(
+        &mut f.app,
+        ExportMsg::Connecting(2, waiting_event(AUTH_URL)),
+    );
+    let effects = export(&mut f.app, ExportMsg::Connecting(1, waiting_event("late")));
+    assert!(effects.is_empty(), "{effects:?}");
+    assert_eq!(
+        f.app.drive_link,
+        DriveLink::Waiting {
+            url: Some(AUTH_URL.into())
+        }
+    );
+    export(
+        &mut f.app,
+        ExportMsg::Connecting(2, ConnectEvent::Done(Ok(account()))),
+    );
+    assert_eq!(f.app.drive_link, DriveLink::Connected(account()));
+}
+
+/// A connection held for this session only is not persisted as connected.
+#[tokio::test]
+async fn a_session_only_connection_sets_no_marker() {
+    let session_only = DriveAccount {
+        email: None,
+        stored: false,
+    };
+    let mut f = drive_fixture().await;
+    on_drive(&mut f);
+    export(&mut f.app, ExportMsg::DriveStatus(Ok(None)));
+    export(&mut f.app, ExportMsg::Connect);
+    let effects = export(
+        &mut f.app,
+        ExportMsg::Connecting(1, ConnectEvent::Done(Ok(session_only.clone()))),
+    );
+    assert_eq!(f.app.drive_link, DriveLink::Connected(session_only.clone()));
+    assert!(!f.app.settings.google_drive);
+    assert!(!saves_settings(&effects), "{effects:?}");
+
+    // The same when a status read answers from memory.
+    let mut f = drive_fixture().await;
+    on_drive(&mut f);
+    let effects = export(&mut f.app, ExportMsg::DriveStatus(Ok(Some(session_only))));
+    assert!(!f.app.settings.google_drive);
+    assert!(!saves_settings(&effects), "{effects:?}");
+}
+
+/// A denied or timed-out connect is the form's: it does not follow the user to Settings.
+#[tokio::test]
+async fn drive_error_goes_when_the_form_is_left() {
+    for leave in 0..3 {
+        let mut f = drive_fixture().await;
+        on_drive(&mut f);
+        export(&mut f.app, ExportMsg::DriveStatus(Ok(None)));
+        export(&mut f.app, ExportMsg::Connect);
+        export(
+            &mut f.app,
+            ExportMsg::Connecting(1, ConnectEvent::Done(Err(coded("drive-connect-denied")))),
+        );
+        assert!(f.app.drive_error.is_some());
+        match leave {
+            0 => drop(export(&mut f.app, ExportMsg::Close)),
+            1 => drop(f.app.update(Message::OpenSettings)),
+            _ => drop(f.app.update(Message::ConnectSite(f.a.id.clone()))),
+        }
+        assert_eq!(f.app.drive_error, None, "{leave}");
+    }
+
+    // An error Settings itself raised stays while it is shown.
+    let mut f = drive_fixture().await;
+    f.app.settings.google_drive = true;
+    f.app.update(Message::OpenSettings);
+    let error = Error::new(ErrorKind::Io, "keyring");
+    export(&mut f.app, ExportMsg::Disconnect);
+    export(&mut f.app, ExportMsg::Disconnected(Err(error.clone())));
+    f.app.update(Message::SettingsSaved(Ok(())));
+    assert_eq!(f.app.drive_error, Some(error));
+}
+
+/// A connection held for this session only does not take away a marker an earlier
+/// session set (the keyring is locked today, and may hold a valid entry).
+#[tokio::test]
+async fn a_session_only_connect_keeps_an_existing_marker() {
+    let session_only = DriveAccount {
+        email: None,
+        stored: false,
+    };
+    let mut f = drive_fixture().await;
+    f.app.settings.google_drive = true;
+    on_drive(&mut f);
+    export(
+        &mut f.app,
+        ExportMsg::DriveStatus(Err(Error::new(ErrorKind::Io, "locked"))),
+    );
+    export(&mut f.app, ExportMsg::Connect);
+    let effects = export(
+        &mut f.app,
+        ExportMsg::Connecting(1, ConnectEvent::Done(Ok(session_only.clone()))),
+    );
+    assert_eq!(f.app.drive_link, DriveLink::Connected(session_only));
+    assert!(f.app.settings.google_drive);
+    assert!(!saves_settings(&effects), "{effects:?}");
 }
