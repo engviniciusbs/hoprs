@@ -1,10 +1,13 @@
 //! hoprs: desktop SSH + SFTP + FTP/FTPS client.
 //!
 //! The binary only calls [`run`], which owns the process-level concerns: the
-//! single-instance lock, logging and handing the [`App`] to iced. The crate is a
+//! single-instance lock, logging and handing the [`App`] to iced, or [`run_mcp`] for
+//! `hoprs mcp`, the relay an MCP client starts (none of that, and nothing on stdout but
+//! the protocol). The crate is a
 //! library so that the benchmarks in `benches/` reach the view ([`bench`]) and the
 //! start-up probe; nothing else is public.
 
+mod agent;
 mod app;
 mod backend;
 #[doc(hidden)]
@@ -57,6 +60,10 @@ const SUPPAFTP_CAP: &str = "debug";
 /// and trace: never above warn, whatever `RUST_LOG` says.
 const TERMINAL_LOG_CRATES: [&str; 2] = ["vte", "alacritty_terminal"];
 const TERMINAL_LOG_CAP: &str = "warn";
+/// The MCP SDK's target: never above info, whatever `RUST_LOG` says. At debug it logs
+/// every request and every unparsable input line verbatim, and a line of an agent's
+/// input can carry a whole `write_file` content.
+const RMCP_LOG_CRATE: &str = "rmcp";
 
 /// Runs hoprs until its window closes. With `HOPRS_PROBE_STARTUP=1` it runs the start-up
 /// probe instead (see `probe`): the same start-up, then two lines on stdout, then exit.
@@ -70,20 +77,25 @@ pub fn run() -> iced::Result {
     init_logging(&filter, log.clone());
     tracing::info!("{}", renderer.0);
 
-    let _instance = match acquire_first_instance_lock(&instance_lock_paths()) {
-        Ok(Some(lock)) => Some(lock),
+    let (_instance, lock_dir) = match acquire_first_instance_lock(&instance_lock_paths()) {
+        Ok(Some((lock, dir))) => (Some(lock), Some(dir)),
         Ok(None) => {
             println!("{}", ui::strings::already_running());
             std::process::exit(0);
         }
         Err(err) => {
-            // No usable location at all: start anyway, unprotected.
+            // No usable location at all: start anyway, unprotected (and without the
+            // agent channel, which lives beside the lock).
             tracing::warn!(%err, "could not take the single-instance lock anywhere");
-            None
+            (None, None)
         }
     };
+    // The agent channel's directory: the one this run locked (a debug build may name
+    // another with HOPRS_AGENT_DIR).
+    let agent_dir = agent::channel::override_dir().or(lock_dir);
 
-    iced::application(move || boot(log.clone(), probe), update, view)
+    let start = move || boot(log.clone(), probe, agent_dir.clone());
+    iced::application(start, update, view)
         .subscription(subscription)
         .title(ui::strings::app_title())
         .theme(|_: &Hoprs| ui::theme::theme())
@@ -103,6 +115,46 @@ pub fn run() -> iced::Result {
             ..iced::window::Settings::default()
         })
         .run()
+}
+
+/// Runs `hoprs mcp`: the relay between an MCP client (on stdin and stdout) and the
+/// running hoprs (over the agent channel), until the client closes stdin. Returns the
+/// exit status: 0 when the input ended, 1 when the streams could not be used.
+///
+/// Nothing of the app starts: no instance lock (several clients each start their own
+/// relay while hoprs runs), no window, no renderer, no backend. The log goes to stderr
+/// only: stdout carries protocol messages and nothing else.
+pub fn run_mcp() -> i32 {
+    use tracing_subscriber::util::SubscriberInitExt;
+    let filter = log_filter(std::env::var("RUST_LOG").ok().as_deref());
+    // The panel's buffer is never shown here; the subscriber wants one. No colour codes
+    // into a pipe or a file (an MCP client keeps the relay's stderr as text).
+    let ansi = io::IsTerminal::is_terminal(&io::stderr());
+    log_subscriber(&filter, logbuf::LogBuffer::new(), io::stderr, ansi).init();
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            tracing::error!(%err, "hoprs mcp could not start its runtime");
+            return 1;
+        }
+    };
+    let served = runtime.block_on(agent::relay::serve(
+        rmcp::transport::stdio(),
+        agent::relay::Dial::standard(),
+    ));
+    // A read of stdin still pending on the blocking pool (the streams failed before
+    // the input ended) must not hold the exit.
+    runtime.shutdown_background();
+    match served {
+        Ok(()) => 0,
+        Err(err) => {
+            tracing::error!(%err, "hoprs mcp stopped: its standard streams could not be used");
+            1
+        }
+    }
 }
 
 /// On Linux the window's app id (Wayland `app_id`, X11 `WM_CLASS`) is what the dock
@@ -141,8 +193,12 @@ enum Root {
     Probe(probe::Step),
 }
 
-fn boot(log: logbuf::LogBuffer, probe: Option<probe::Probe>) -> (Hoprs, Task<Root>) {
-    let backend = match open_backend() {
+fn boot(
+    log: logbuf::LogBuffer,
+    probe: Option<probe::Probe>,
+    agent_dir: Option<PathBuf>,
+) -> (Hoprs, Task<Root>) {
+    let backend = match open_backend(agent_dir) {
         Ok(backend) => backend,
         Err(err) => {
             // No profiles, no app: there is nothing to show yet without them.
@@ -169,15 +225,17 @@ fn boot(log: logbuf::LogBuffer, probe: Option<probe::Probe>) -> (Hoprs, Task<Roo
     )
 }
 
-/// The real backend at the standard locations, secrets in the system keyring.
-fn open_backend() -> hoprs_core::Result<Backend> {
-    let config = BackendConfig::standard().ok_or_else(|| {
+/// The real backend at the standard locations, secrets in the system keyring, the agent
+/// channel in `agent_dir` (none without it).
+fn open_backend(agent_dir: Option<PathBuf>) -> hoprs_core::Result<Backend> {
+    let mut config = BackendConfig::standard().ok_or_else(|| {
         hoprs_core::Error::coded(
             hoprs_core::ErrorKind::Io,
             "app-no-config-dir",
             "No configuration directory",
         )
     })?;
+    config.agent_dir = agent_dir;
     let keyring = Arc::new(LazyKeyringStore::new());
     Ok(Backend::open(config, keyring.clone())?.with_app_secrets(keyring))
 }
@@ -236,6 +294,9 @@ fn app_subscription(state: &Hoprs) -> iced::Subscription<Message> {
         }),
         iced::Subscription::run_with(PromptFeed(Arc::clone(&state.backend)), |feed| {
             effects::prompt_feed(feed.0.as_ref())
+        }),
+        iced::Subscription::run_with(AgentFeed(Arc::clone(&state.backend)), |feed| {
+            effects::agent_feed(feed.0.as_ref())
         }),
         iced::Subscription::run_with(EditFeed(Arc::clone(&state.backend)), |feed| {
             effects::edit_feed(feed.0.as_ref())
@@ -315,6 +376,16 @@ impl std::hash::Hash for PromptFeed {
     }
 }
 
+/// The backend, as the identity of the agent side's events (one for the whole run: the
+/// backend hands its channel out once).
+struct AgentFeed(Arc<dyn BackendApi>);
+
+impl std::hash::Hash for AgentFeed {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        "agent-feed".hash(state);
+    }
+}
+
 /// The backend, as the identity of the remote edits' events (one for the whole run).
 struct EditFeed(Arc<dyn BackendApi>);
 
@@ -335,8 +406,8 @@ impl std::hash::Hash for TransferFeed {
 }
 
 /// Where the lock may live, in order: `$XDG_RUNTIME_DIR/hoprs/`, the
-/// config directory, the temp directory.
-fn instance_lock_paths() -> Vec<PathBuf> {
+/// config directory, the temp directory. The agent channel lives beside it.
+pub(crate) fn instance_lock_paths() -> Vec<PathBuf> {
     [
         dirs::runtime_dir(),
         dirs::config_dir(),
@@ -348,14 +419,17 @@ fn instance_lock_paths() -> Vec<PathBuf> {
     .collect()
 }
 
-/// Takes the lock at the first location that works. A location that fails
-/// (can't be created, opened or locked) falls through to the next one;
-/// one held by another instance stops the search with `Ok(None)`.
-fn acquire_first_instance_lock(paths: &[PathBuf]) -> io::Result<Option<File>> {
+/// Takes the lock at the first location that works, and says in which directory. A
+/// location that fails (can't be created, opened or locked) falls through to the next
+/// one; one held by another instance stops the search with `Ok(None)`.
+fn acquire_first_instance_lock(paths: &[PathBuf]) -> io::Result<Option<(File, PathBuf)>> {
     let mut last_err = io::Error::new(io::ErrorKind::NotFound, "no lock location");
     for path in paths {
         match acquire_instance_lock(path) {
-            Ok(lock) => return Ok(lock),
+            Ok(lock) => {
+                let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+                return Ok(lock.map(|file| (file, dir)));
+            }
             Err(err) => {
                 tracing::warn!(%err, path = %path.display(), "lock location unusable; trying the next");
                 last_err = err;
@@ -488,13 +562,17 @@ fn level_rank(level: &str) -> Option<u8> {
 }
 
 /// A hard per-target cap on top of the `EnvFilter`: the terminal crates
-/// stay at warn even inside a span a `[span]=debug` directive enables.
+/// stay at warn, and the MCP SDK ([`RMCP_LOG_CRATE`]) at info, even inside a
+/// span a `[span]=debug` directive enables.
 fn terminal_log_cap() -> tracing_subscriber::filter::Targets {
-    TERMINAL_LOG_CRATES.iter().fold(
-        tracing_subscriber::filter::Targets::new()
-            .with_default(tracing_subscriber::filter::LevelFilter::TRACE),
-        |targets, name| targets.with_target(*name, tracing::Level::WARN),
-    )
+    TERMINAL_LOG_CRATES
+        .iter()
+        .fold(
+            tracing_subscriber::filter::Targets::new()
+                .with_default(tracing_subscriber::filter::LevelFilter::TRACE),
+            |targets, name| targets.with_target(*name, tracing::Level::WARN),
+        )
+        .with_target(RMCP_LOG_CRATE, tracing::Level::INFO)
 }
 
 /// The subscriber's filter: `RUST_LOG` (as rewritten by [`log_filter`])
@@ -509,23 +587,27 @@ where
 
 /// What `main` logs to: the terminal output (`writer`) and the log panel's
 /// `buffer`, each behind the same filter ([`subscriber_filter`]), so the panel
-/// never shows what the terminal wouldn't.
+/// never shows what the terminal wouldn't. Without `ansi` the terminal output has no
+/// colour codes; with it, the fmt layer's default (colours unless `NO_COLOR`).
 fn log_subscriber<W>(
     filter: &LogFilter,
     buffer: logbuf::LogBuffer,
     writer: W,
+    ansi: bool,
 ) -> impl tracing::Subscriber + Send + Sync + 'static
 where
     W: for<'w> tracing_subscriber::fmt::MakeWriter<'w> + Send + Sync + 'static,
 {
     use tracing_subscriber::Layer;
     use tracing_subscriber::layer::SubscriberExt;
+    let output = tracing_subscriber::fmt::layer().with_writer(writer);
+    let output = if ansi {
+        output
+    } else {
+        output.with_ansi(false)
+    };
     tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(writer)
-                .with_filter(subscriber_filter(filter)),
-        )
+        .with(output.with_filter(subscriber_filter(filter)))
         .with(buffer.with_filter(subscriber_filter(filter)))
 }
 
@@ -533,7 +615,7 @@ fn init_logging(filter: &LogFilter, buffer: logbuf::LogBuffer) {
     use tracing_subscriber::util::SubscriberInitExt;
     // `init` also installs the `log` bridge, through which vte and
     // alacritty_terminal log.
-    log_subscriber(filter, buffer, io::stdout).init();
+    log_subscriber(filter, buffer, io::stdout, true).init();
     if filter.capped {
         tracing::warn!(
             "RUST_LOG would log suppaftp at trace, where it logs passwords; lowered to debug"
@@ -562,7 +644,7 @@ fn subscriber_test_lock() -> std::sync::MutexGuard<'static, ()> {
 #[cfg(test)]
 fn capture_log(filter: &LogFilter) -> (logbuf::LogBuffer, LogCapture) {
     let buffer = logbuf::LogBuffer::new();
-    let dispatch = tracing::Dispatch::new(log_subscriber(filter, buffer.clone(), io::sink));
+    let dispatch = tracing::Dispatch::new(log_subscriber(filter, buffer.clone(), io::sink, true));
     let capture = LogCapture {
         _default: tracing::dispatcher::set_default(&dispatch),
         dispatch,
@@ -724,6 +806,21 @@ mod tests {
     }
 
     #[test]
+    fn the_lock_reports_its_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        fs::write(&blocker, b"").unwrap();
+        let usable = dir.path().join("config").join("hoprs");
+        let candidates = [
+            blocker.join("hoprs").join("instance.lock"),
+            usable.join("instance.lock"),
+            dir.path().join("later").join("hoprs").join("instance.lock"),
+        ];
+        let (_lock, locked_in) = acquire_first_instance_lock(&candidates).unwrap().unwrap();
+        assert_eq!(locked_in, usable, "the directory of the first usable path");
+    }
+
+    #[test]
     fn trace_for_suppaftp_is_capped() {
         // Absent or empty: the default.
         for unset in [None, Some(""), Some("  ")] {
@@ -866,7 +963,7 @@ mod tests {
     /// enables a debug event from `target`, optionally inside a span `span`.
     fn debug_enabled(rust_log: Option<&str>, target: &str, in_span: bool) -> bool {
         let filter = log_filter(rust_log);
-        let subscriber = log_subscriber(&filter, logbuf::LogBuffer::new(), io::sink);
+        let subscriber = log_subscriber(&filter, logbuf::LogBuffer::new(), io::sink, true);
         tracing::subscriber::with_default(subscriber, || {
             let span = in_span.then(|| tracing::info_span!("connect").entered());
             let enabled = match target {
@@ -877,6 +974,11 @@ mod tests {
                 }
                 "vte::warn" => tracing::enabled!(target: "vte", tracing::Level::WARN),
                 "hoprs_app" => tracing::enabled!(target: "hoprs_app", tracing::Level::DEBUG),
+                "rmcp" => tracing::enabled!(target: "rmcp", tracing::Level::DEBUG),
+                "rmcp::service" => {
+                    tracing::enabled!(target: "rmcp::service", tracing::Level::DEBUG)
+                }
+                "rmcp::info" => tracing::enabled!(target: "rmcp", tracing::Level::INFO),
                 other => panic!("no callsite for {other}"),
             };
             drop(span);
@@ -922,6 +1024,71 @@ mod tests {
             let _span = tracing::info_span!("connect").entered();
             assert!(tracing::enabled!(target: "vte", tracing::Level::DEBUG));
         });
+    }
+
+    /// The relay's log off a terminal (`ansi` false) carries no colour codes: an MCP client
+    /// keeps its stderr as text. With `ansi` the same line is coloured.
+    #[test]
+    fn relay_log_has_no_colour_codes_off_a_terminal() {
+        #[derive(Clone, Default)]
+        struct Out(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl io::Write for Out {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let _lock = subscriber_test_lock();
+        let written = |ansi: bool| {
+            let out = Out::default();
+            let writer = out.clone();
+            let subscriber = log_subscriber(
+                &log_filter(None),
+                logbuf::LogBuffer::new(),
+                move || writer.clone(),
+                ansi,
+            );
+            tracing::subscriber::with_default(subscriber, || {
+                tracing::warn!(app = "1.6.0", "hoprs runs another version");
+            });
+            let bytes = out.0.lock().unwrap().clone();
+            String::from_utf8(bytes).unwrap()
+        };
+        let plain = written(false);
+        assert!(plain.contains("hoprs runs another version"), "{plain}");
+        assert!(!plain.contains('\x1b'), "{plain:?}");
+        if std::env::var_os("NO_COLOR").is_none() {
+            assert!(written(true).contains('\x1b'), "not vacuous");
+        }
+    }
+
+    /// The MCP SDK logs requests and unparsable input lines verbatim at debug: never
+    /// enabled, whatever `RUST_LOG` says (L11 of Plan 17).
+    #[test]
+    fn real_filter_never_logs_rmcp_debug() {
+        let _lock = subscriber_test_lock();
+        for rust_log in [
+            None,
+            Some("debug"),
+            Some("trace"),
+            Some("rmcp=trace"),
+            Some("rmcp::service=debug"),
+            Some("info,[connect]=trace"),
+        ] {
+            for target in ["rmcp", "rmcp::service"] {
+                for in_span in [false, true] {
+                    assert!(
+                        !debug_enabled(rust_log, target, in_span),
+                        "{rust_log:?} enables debug for {target} (span: {in_span})"
+                    );
+                }
+            }
+        }
+        // Not vacuous: its info lines pass.
+        assert!(debug_enabled(Some("rmcp=trace"), "rmcp::info", false));
     }
 
     /// The panel's buffer sits behind the terminal's filter: the suppaftp cap (at

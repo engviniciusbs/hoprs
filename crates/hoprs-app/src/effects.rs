@@ -261,6 +261,7 @@ pub fn run(
         Effect::SetPolicy(policy) => {
             Task::future(async move { backend.set_policy(policy).await }).discard()
         }
+        Effect::SetAgents(on) => Task::future(set_agents(backend, on)).discard(),
         Effect::SetWorkers(workers) => {
             backend.set_workers(workers);
             Task::none()
@@ -651,6 +652,11 @@ pub async fn restore_backup(
     Message::BackupRestored(backend.restore_backup(path, password, mode).await)
 }
 
+/// Tells the backend the master switch for agents.
+pub async fn set_agents(backend: Arc<dyn BackendApi>, on: bool) {
+    backend.set_agents_enabled(on).await;
+}
+
 pub async fn save_settings(backend: Arc<dyn BackendApi>, settings: Settings) -> Message {
     Message::SettingsSaved(backend.save_settings(settings).await)
 }
@@ -1016,6 +1022,18 @@ pub fn prompt_feed(backend: &dyn BackendApi) -> impl Stream<Item = Message> + Se
         let mut events = events?;
         let event = events.recv().await?;
         Some((Message::Prompt(event), Some(events)))
+    })
+}
+
+/// What the agent side reports, for the UI's subscription: each event as
+/// [`Message::Agent`]. The backend hands its channel out once; without it (a second
+/// subscription) the stream is empty.
+pub fn agent_feed(backend: &dyn BackendApi) -> impl Stream<Item = Message> + Send + use<> {
+    let events = backend.agent_events();
+    stream::unfold(events, |events| async move {
+        let mut events = events?;
+        let event = events.recv().await?;
+        Some((Message::Agent(event), Some(events)))
     })
 }
 

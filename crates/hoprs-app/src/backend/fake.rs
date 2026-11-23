@@ -96,6 +96,7 @@ use super::{
     ProfileSnapshot, PromptAnswer, PromptId, SessionId, ShellId, ShellOutput, Side,
     TransferSnapshot, WorkspaceTabs,
 };
+use crate::agent::AgentEvent;
 use crate::drive::{ConnectEvent, DriveAccount, DriveFile, Pages, Sealed};
 use crate::settings::{Settings, SettingsLoad};
 use crate::update::Release;
@@ -130,6 +131,8 @@ pub enum BackupCall {
     SetPolicy(ConflictPolicy),
     SetWorkers(usize),
     SetKeepalive(u64),
+    /// `set_agents_enabled`.
+    SetAgents(bool),
 }
 
 /// A recorded backend call, in [`FakeBackend::calls`].
@@ -204,6 +207,9 @@ fn fake_output(rx: mpsc::UnboundedReceiver<ShellOutput>) -> BoxStream<'static, S
     .boxed()
 }
 
+/// How many agent events the fake keeps unread.
+const AGENT_EVENTS_KEPT: usize = 65_536;
+
 /// See the module docs.
 pub struct FakeBackend {
     /// Shared with the streams that change it (a connect that ends connected).
@@ -212,6 +218,8 @@ pub struct FakeBackend {
     next_transfer: AtomicI64,
     events: mpsc::UnboundedSender<BrokerEvent>,
     receiver: Mutex<Option<mpsc::UnboundedReceiver<BrokerEvent>>>,
+    agent_events: mpsc::Sender<AgentEvent>,
+    agent_receiver: Mutex<Option<mpsc::Receiver<AgentEvent>>>,
     /// Engine events the test sends with [`FakeBackend::send_transfer_event`].
     transfer_events: broadcast::Sender<Event>,
     shells: Shells,
@@ -324,12 +332,17 @@ impl Default for FakeBackend {
 impl FakeBackend {
     pub fn new() -> Self {
         let (events, receiver) = mpsc::unbounded_channel();
+        // Room for any test: the fake delivers every event, in order, unlike the real
+        // backend's latest-state queue.
+        let (agent_events, agent_receiver) = mpsc::channel(AGENT_EVENTS_KEPT);
         Self {
             state: Arc::new(Mutex::new(State::default())),
             next_session: AtomicU64::new(1),
             next_transfer: AtomicI64::new(1),
             events,
             receiver: Mutex::new(Some(receiver)),
+            agent_events,
+            agent_receiver: Mutex::new(Some(agent_receiver)),
             transfer_events: broadcast::channel(16).0,
             shells: Shells::default(),
             edits: OnceLock::new(),
@@ -387,6 +400,17 @@ impl FakeBackend {
     /// The import, backup and settings calls, in order.
     pub fn backup_calls(&self) -> Vec<BackupCall> {
         self.state().backup_calls.clone()
+    }
+
+    /// The values `set_agents_enabled` was called with, in order.
+    pub fn agent_switches(&self) -> Vec<bool> {
+        self.backup_calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                BackupCall::SetAgents(on) => Some(on),
+                _ => None,
+            })
+            .collect()
     }
 
     fn record(&self, call: BackupCall) {
@@ -546,6 +570,15 @@ impl FakeBackend {
     /// The local side (shared with the backend).
     pub fn local_fs(&self) -> MemFs {
         self.state().local.clone()
+    }
+
+    /// Sends an agent event to the UI's subscription. The fake delivers every event it is
+    /// given, in order, nothing coalesced (up to [`AGENT_EVENTS_KEPT`] unread, far more
+    /// than a test pushes).
+    pub fn push_agent_event(&self, event: AgentEvent) {
+        self.agent_events
+            .try_send(event)
+            .expect("the test reads the agent events it pushes");
     }
 
     /// Sends a broker event to the UI's subscription.
@@ -1501,6 +1534,17 @@ impl BackendApi for FakeBackend {
         self.record(BackupCall::SetWorkers(workers));
     }
 
+    async fn set_agents_enabled(&self, on: bool) {
+        self.record(BackupCall::SetAgents(on));
+    }
+
+    fn agent_events(&self) -> Option<mpsc::Receiver<AgentEvent>> {
+        self.agent_receiver
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
     fn set_keepalive(&self, secs: u64) {
         self.record(BackupCall::SetKeepalive(secs));
     }
@@ -1887,6 +1931,7 @@ mod tests {
         fake.fail_next_connect(&site.id, Error::new(ErrorKind::Auth, "Denied"));
         let ask = |id: u64, kind: PromptKind| {
             fake.push_prompt(BrokerEvent::Request(PromptRequest {
+                by_agent: false,
                 id: PromptId(id),
                 session: SessionId(1),
                 site: site.id.clone(),

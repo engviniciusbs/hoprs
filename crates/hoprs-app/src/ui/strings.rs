@@ -426,6 +426,67 @@ pub fn start_folders() -> &'static str {
 pub fn remote_dir() -> &'static str {
     tr("remote-dir")
 }
+pub fn agents_section() -> &'static str {
+    tr("agents-section")
+}
+pub fn agent_access_none() -> &'static str {
+    tr("agent-access-none")
+}
+pub fn agent_access_read() -> &'static str {
+    tr("agent-access-read")
+}
+pub fn agent_access_all() -> &'static str {
+    tr("agent-access-all")
+}
+pub fn agent_access_read_hint() -> &'static str {
+    tr("agent-access-read-hint")
+}
+pub fn agent_access_all_hint_ssh() -> &'static str {
+    tr("agent-access-all-hint-ssh")
+}
+pub fn agent_access_all_hint_ftp() -> &'static str {
+    tr("agent-access-all-hint-ftp")
+}
+pub fn settings_agents_description() -> &'static str {
+    tr("settings-agents-description")
+}
+pub fn agents_allow() -> &'static str {
+    tr("agents-allow")
+}
+pub fn agents_allow_hint() -> &'static str {
+    tr("agents-allow-hint")
+}
+pub fn agents_claude_code() -> &'static str {
+    tr("agents-claude-code")
+}
+pub fn agents_other_clients() -> &'static str {
+    tr("agents-other-clients")
+}
+pub fn agents_levels(read: usize, all: usize) -> String {
+    tr_args(
+        "agents-levels",
+        &[("read", read.into()), ("all", all.into())],
+    )
+}
+/// The status bar's indicator while an agent is connected.
+pub fn agent_connected() -> &'static str {
+    tr("agent-connected")
+}
+pub fn agent_connected_tip(count: usize) -> String {
+    tr_args("agent-connected-tip", &[("count", count.into())])
+}
+/// The tag of an agent's transfer in the queue.
+pub fn queue_agent_tag() -> &'static str {
+    tr("queue-agent-tag")
+}
+/// A line of a security dialog whose connection an agent asked for.
+pub fn prompt_by_agent() -> &'static str {
+    tr("prompt-by-agent")
+}
+/// The tooltip of a site only an agent's session holds.
+pub fn site_connected_by_agent() -> &'static str {
+    tr("site-connected-by-agent")
+}
 pub fn local_dir() -> &'static str {
     tr("local-dir")
 }

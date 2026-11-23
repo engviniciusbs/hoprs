@@ -28,3 +28,20 @@ Out of scope: vulnerabilities in the servers you connect to, and the known, docu
 choices (plain FTP is allowed and labelled unencrypted; the macOS and Windows builds are
 not code-signed yet). The test keys and certificates under `docker/fixtures/` and
 `crates/*/tests/fixtures/` exist only for the test servers and protect nothing.
+
+## The channel for agents
+
+With Settings › Agents (MCP) on, hoprs listens on a local socket (`agent.sock`; a named pipe
+on Windows) that admits the same user only. Any program running as that user can connect and
+use the sites whose level allows it, which is the bar the app accepts: such a program can
+already read `sites.toml` and ask the keyring. That is why the switch is off by default and
+why each site starts at "No access". Nothing listens on the network.
+
+An agent with access can read and change whatever the remote account can, and what it reads
+leaves through the agent (to wherever that agent sends it), not through hoprs.
+
+On this computer, `download` needs only "Allow reading" and can create or replace any file
+the user can write, except hoprs's own files (the program included), `~/.ssh` and the key
+files of saved sites. That includes files that run later (a shell start-up file, an
+autostart entry, the agent client's own settings), so a misled agent could run code as the
+user: the levels protect the servers, not this computer.

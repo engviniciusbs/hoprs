@@ -37,7 +37,7 @@ use std::path::Path;
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::{Aead, AeadInOut, Generate, KeyInit, Payload};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
-use hoprs_core::{Error, ErrorKind, Result, Site, SiteId, Workspace, WorkspaceId};
+use hoprs_core::{AgentAccess, Error, ErrorKind, Result, Site, SiteId, Workspace, WorkspaceId};
 use secrecy::{ExposeSecret, SecretString};
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
@@ -640,6 +640,9 @@ impl Vault {
         };
         for original in sites {
             let mut site = original.clone();
+            // The access level is a decision of this machine's user, by hand:
+            // no backup carries it.
+            site.agent_access = AgentAccess::None;
             for kind in KINDS {
                 let value = if flag(&site, kind) {
                     self.secrets.get(&site.id, kind).map_err(|err| {
@@ -740,6 +743,8 @@ impl Vault {
             let mut site = site.clone();
             site.has_password = false;
             site.has_key_passphrase = false;
+            // A file (possibly hand-edited) never grants agent access.
+            site.agent_access = AgentAccess::None;
             site
         };
         let mut report = BackupImportReport::default();
@@ -2058,5 +2063,131 @@ mod tests {
             let on_disk = fs::read(&path).unwrap();
             assert_eq!(plaintext_of(&on_disk), plaintext_of(&bytes), "{scope:?}");
         }
+    }
+
+    #[test]
+    fn export_never_carries_the_access_level() {
+        use hoprs_core::AgentAccess;
+        let mut src = source();
+        let mut a = src.vault.site(&src.a.id).unwrap().clone();
+        a.agent_access = AgentAccess::Read;
+        src.vault.upsert_site(a).unwrap();
+        let mut b = src.vault.site(&src.b.id).unwrap().clone();
+        b.agent_access = AgentAccess::All;
+        src.vault.upsert_site(b).unwrap();
+        assert_eq!(
+            src.vault.site(&src.b.id).unwrap().agent_access,
+            AgentAccess::All
+        );
+        for scope in [
+            ExportScope::All,
+            ExportScope::Site(src.a.id.clone()),
+            ExportScope::Site(src.b.id.clone()),
+            ExportScope::Workspace(src.ws.id.clone()),
+        ] {
+            let (_, bytes) = src
+                .vault
+                .export_bytes(&scope, &pw("correct horse"), LOW)
+                .unwrap();
+            let text = plaintext_of(&bytes);
+            assert!(!text.contains("agent_access"), "{scope:?}: {text}");
+        }
+        // The exporting vault itself is untouched.
+        assert_eq!(
+            src.vault.site(&src.a.id).unwrap().agent_access,
+            AgentAccess::Read
+        );
+        assert_eq!(
+            src.vault.site(&src.b.id).unwrap().agent_access,
+            AgentAccess::All
+        );
+    }
+
+    /// A backup, as a hand-edited file would be: every site says `"all"`.
+    fn level_json(sites: &[&Site], partial: bool) -> String {
+        let sites: Vec<serde_json::Value> = sites
+            .iter()
+            .map(|s| {
+                let mut v = serde_json::to_value(s).unwrap();
+                v["agent_access"] = "all".into();
+                v
+            })
+            .collect();
+        let mut v = serde_json::json!({"sites": sites, "workspaces": [], "secrets": []});
+        if partial {
+            v["partial"] = true.into();
+        }
+        v.to_string()
+    }
+
+    fn write_sealed(json: &str, version: u16) -> (tempfile::TempDir, std::path::PathBuf) {
+        let out = tempfile::tempdir().unwrap();
+        let path = out.path().join("level.hoprs");
+        fs::write(
+            &path,
+            seal(json.as_bytes(), &pw("pw"), LOW, version).unwrap(),
+        )
+        .unwrap();
+        (out, path)
+    }
+
+    #[test]
+    fn restore_never_sets_the_access_level() {
+        use hoprs_core::AgentAccess;
+        let src = source();
+        for (partial, version) in [(false, FORMAT_FULL), (true, FORMAT_PARTIAL)] {
+            let json = level_json(&[&src.a, &src.b], partial);
+            assert!(json.contains("\"agent_access\":\"all\""));
+            let (_out, path) = write_sealed(&json, version);
+
+            // Merge into an empty vault.
+            let tmp = tempfile::tempdir().unwrap();
+            let mut empty = Vault::open(tmp.path(), Arc::new(MemoryStore::new())).unwrap();
+            empty
+                .import_backup(&path, &pw("pw"), ImportMode::Merge)
+                .unwrap();
+            assert_eq!(empty.sites().len(), 2);
+            assert!(empty.sites().iter().all(|s| s.agent_access.is_none()));
+            let on_disk = fs::read_to_string(tmp.path().join("sites.toml")).unwrap();
+            assert!(!on_disk.contains("agent_access"), "{on_disk}");
+
+            // Merge skips a site that exists: it keeps its own level.
+            let tmp = tempfile::tempdir().unwrap();
+            let mut vault = Vault::open(tmp.path(), Arc::new(MemoryStore::new())).unwrap();
+            let mut mine = src.a.clone();
+            mine.agent_access = AgentAccess::Read;
+            vault.upsert_site(mine).unwrap();
+            let report = vault
+                .import_backup(&path, &pw("pw"), ImportMode::Merge)
+                .unwrap();
+            assert_eq!(report.skipped_sites.len(), 1);
+            assert_eq!(
+                vault.site(&src.a.id).unwrap().agent_access,
+                AgentAccess::Read
+            );
+            assert_eq!(
+                vault.site(&src.b.id).unwrap().agent_access,
+                AgentAccess::None
+            );
+        }
+
+        // Replace (full files only) over a vault whose same-id site had All.
+        let (_out, path) = write_sealed(&level_json(&[&src.a, &src.b], false), FORMAT_FULL);
+        let tmp = tempfile::tempdir().unwrap();
+        let mut vault = Vault::open(tmp.path(), Arc::new(MemoryStore::new())).unwrap();
+        let mut mine = src.a.clone();
+        mine.agent_access = AgentAccess::All;
+        vault.upsert_site(mine).unwrap();
+        assert_eq!(
+            vault.site(&src.a.id).unwrap().agent_access,
+            AgentAccess::All
+        );
+        vault
+            .import_backup(&path, &pw("pw"), ImportMode::Replace)
+            .unwrap();
+        assert_eq!(vault.sites().len(), 2);
+        assert!(vault.sites().iter().all(|s| s.agent_access.is_none()));
+        let on_disk = fs::read_to_string(tmp.path().join("sites.toml")).unwrap();
+        assert!(!on_disk.contains("agent_access"), "{on_disk}");
     }
 }

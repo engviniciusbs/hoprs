@@ -7,7 +7,10 @@ use std::time::Duration;
 use common::*;
 use hoprs_core::{EntryKind, ErrorKind, RemoteEntry, RemotePath, Result};
 use hoprs_remote::{BoxAsyncRead, BoxAsyncWrite, FaultFs, MemFs, Op, RemoteFs};
-use hoprs_transfer::{Direction, EngineConfig, Event, EventKind, TransferItem, TransferState};
+use hoprs_transfer::{
+    ConflictPolicy, Direction, EngineConfig, EnqueueOptions, Event, EventKind, Origin,
+    TransferItem, TransferState,
+};
 use tokio::sync::broadcast::error::RecvError;
 
 const SYMLINK_SKIP: &str = "symlinks are not followed";
@@ -526,4 +529,207 @@ async fn retry_duplicate_name_conflicts() {
 
 fn item_by_id(snap: &[TransferItem], id: hoprs_transfer::TransferId) -> &TransferItem {
     snap.iter().find(|i| i.id == id).expect("item in snapshot")
+}
+
+/// `/w/site/{a.txt, sub/b.txt}` locally; both already exist remotely under
+/// `/srv/site` with other bytes.
+fn conflicting_tree(local: &MemFs, remote: &MemFs) {
+    local.add_file("/w/site/a.txt", b"new a", mtime());
+    local.add_file("/w/site/sub/b.txt", b"new b", mtime());
+    remote.add_file("/srv/site/a.txt", b"old a", mtime());
+    remote.add_file("/srv/site/sub/b.txt", b"old b", mtime());
+}
+
+fn awaiting(e: &EventKind) -> bool {
+    matches!(
+        e,
+        EventKind::StateChanged {
+            state: TransferState::AwaitingDecision(_),
+            ..
+        }
+    )
+}
+
+/// Waits until `id` is terminal, returning its state and every event seen.
+async fn run_to_end(
+    rx: &mut tokio::sync::broadcast::Receiver<Event>,
+    id: hoprs_transfer::TransferId,
+) -> (TransferState, Vec<EventKind>) {
+    let mut seen = Vec::new();
+    let end = wait_for(rx, |e| {
+        seen.push(e.clone());
+        matches!(e, EventKind::StateChanged { id: i, state } if *i == id && state.is_terminal())
+    })
+    .await;
+    let EventKind::StateChanged { state, .. } = end else {
+        unreachable!()
+    };
+    (state, seen)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn folder_policy_reaches_every_descendant() {
+    // The global policy is `Ask`.
+    let (engine, local, remote, mut rx) = engine_with_memfs(4).await;
+    conflicting_tree(&local, &remote);
+
+    let root = engine
+        .enqueue_with_policy(
+            spec(Direction::Upload, "/w/site", "/srv/site"),
+            ConflictPolicy::Overwrite,
+        )
+        .await
+        .unwrap();
+    let (state, seen) = run_to_end(&mut rx, root).await;
+    assert_eq!(state, TransferState::Done);
+    assert!(!seen.iter().any(awaiting), "{seen:?}");
+
+    assert_eq!(remote.read_file("/srv/site/a.txt").unwrap(), b"new a");
+    assert_eq!(remote.read_file("/srv/site/sub/b.txt").unwrap(), b"new b");
+    let snap = engine.snapshot().await;
+    assert_eq!(snap.len(), 4, "the folder, a.txt, sub, sub/b.txt");
+    for i in &snap {
+        assert_eq!(i.state, TransferState::Done, "{i:?}");
+        assert_eq!(i.tree_policy, Some(ConflictPolicy::Overwrite), "{i:?}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn folder_skip_policy_skips_what_exists() {
+    let (engine, local, remote, mut rx) = engine_with_memfs(4).await;
+    conflicting_tree(&local, &remote);
+    local.add_file("/w/site/new.txt", b"new", mtime());
+
+    let root = engine
+        .enqueue_with_policy(
+            spec(Direction::Upload, "/w/site", "/srv/site"),
+            ConflictPolicy::Skip,
+        )
+        .await
+        .unwrap();
+    let (state, seen) = run_to_end(&mut rx, root).await;
+    assert_eq!(state, TransferState::Done);
+    assert!(!seen.iter().any(awaiting), "{seen:?}");
+
+    let snap = engine.snapshot().await;
+    for skipped in ["/w/site/a.txt", "/w/site/sub/b.txt"] {
+        assert_eq!(
+            item(&snap, skipped).state,
+            TransferState::Skipped("exists".to_string()),
+            "{skipped}"
+        );
+    }
+    assert_eq!(item(&snap, "/w/site/new.txt").state, TransferState::Done);
+    assert_eq!(remote.read_file("/srv/site/new.txt").unwrap(), b"new");
+    assert_eq!(remote.read_file("/srv/site/a.txt").unwrap(), b"old a");
+    assert_eq!(remote.read_file("/srv/site/sub/b.txt").unwrap(), b"old b");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn plain_folder_still_asks() {
+    let (engine, local, remote, mut rx) = engine_with_memfs(4).await;
+    conflicting_tree(&local, &remote);
+
+    let root = engine
+        .enqueue(spec(Direction::Upload, "/w/site", "/srv/site"))
+        .await
+        .unwrap();
+    let asked = wait_for(&mut rx, awaiting).await;
+    let EventKind::StateChanged { id, .. } = asked else {
+        unreachable!()
+    };
+    assert_ne!(id, root, "a child asks");
+    let snap = engine.snapshot().await;
+    assert!(snap.iter().all(|i| i.tree_policy.is_none()), "{snap:?}");
+    assert_eq!(remote.read_file("/srv/site/a.txt").unwrap(), b"old a");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn retried_child_keeps_the_tree_policy() {
+    let local_mem = MemFs::new();
+    let remote = MemFs::new();
+    local_mem.add_file("/w/site/a.txt", b"new a", mtime());
+    remote.add_file("/srv/site/a.txt", b"old a", mtime());
+    let local = FaultFs::new(local_mem);
+    // Slow enough that the pause below reaches the folder while it is listed.
+    local.set_latency(Duration::from_millis(100));
+    let (engine, mut rx) = engine_with(
+        Arc::new(local.clone()),
+        Arc::new(remote.clone()),
+        1,
+        EngineConfig::default(),
+    )
+    .await;
+
+    let root = engine
+        .enqueue_with_policy(
+            spec(Direction::Upload, "/w/site", "/srv/site"),
+            ConflictPolicy::Overwrite,
+        )
+        .await
+        .unwrap();
+    // Paused while listing: the child is created paused, before any run.
+    engine.pause(root).await.unwrap();
+    wait_for(
+        &mut rx,
+        |e| matches!(e, EventKind::StateChanged { id, state: TransferState::Paused } if *id == root),
+    )
+    .await;
+    let snap = engine.snapshot().await;
+    let child = item(&snap, "/w/site/a.txt").id;
+    assert_eq!(item(&snap, "/w/site/a.txt").state, TransferState::Paused);
+
+    // The child's first run fails before its conflict is decided.
+    local.set_latency(Duration::ZERO);
+    local.fail_next(Op::Stat, ErrorKind::Permission);
+    engine.resume(root).await.unwrap();
+    match wait_terminal(&mut rx, child).await {
+        TransferState::Failed(e) => assert_eq!(e.kind, ErrorKind::Permission),
+        other => panic!("child ended {other:?}"),
+    }
+    assert!(matches!(
+        wait_terminal(&mut rx, root).await,
+        TransferState::Failed(_)
+    ));
+
+    engine.retry(child).await.unwrap();
+    let (state, seen) = run_to_end(&mut rx, child).await;
+    assert_eq!(state, TransferState::Done);
+    assert!(!seen.iter().any(awaiting), "{seen:?}");
+    assert_eq!(remote.read_file("/srv/site/a.txt").unwrap(), b"new a");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn origin_reaches_every_descendant() {
+    let (engine, local, remote, mut rx) = engine_with_memfs(4).await;
+    add_site(&local, "/w/site");
+    remote.add_dir("/srv");
+
+    let agent = engine
+        .enqueue_with(
+            spec(Direction::Upload, "/w/site", "/srv/agent"),
+            EnqueueOptions {
+                policy: Some(ConflictPolicy::Skip),
+                origin: Origin::Agent,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(wait_terminal(&mut rx, agent).await, TransferState::Done);
+    let user = engine
+        .enqueue(spec(Direction::Upload, "/w/site", "/srv/user"))
+        .await
+        .unwrap();
+    assert_eq!(wait_terminal(&mut rx, user).await, TransferState::Done);
+
+    let snap = engine.snapshot().await;
+    assert_eq!(snap.len(), 14, "two trees of seven");
+    for i in &snap {
+        let want = if i.spec.remote.as_str().starts_with("/srv/agent") {
+            Origin::Agent
+        } else {
+            Origin::User
+        };
+        assert_eq!(i.origin, want, "{i:?}");
+    }
 }

@@ -26,6 +26,7 @@ use crate::settings::{
     LanguageChoice, SettingsLoad, TerminalTheme, clamp_font_size, clamp_keepalive,
     clamp_scrollback, clamp_workers, round_panel_height, valid_editor,
 };
+use crate::terminal::Redacted;
 use crate::ui::site_form::Password;
 use crate::ui::strings;
 
@@ -50,6 +51,15 @@ pub enum SettingsMsg {
     CompareIgnore(String),
     /// "Check for updates automatically"; saved at once.
     UpdateCheck(bool),
+    /// The master switch for agents; saved at once.
+    Agents(bool),
+    /// Copies the `claude mcp add` command.
+    CopyAgentCommand,
+    /// Copies the JSON snippet for other MCP clients.
+    CopyAgentJson,
+    /// The read-only command and JSON lines are text inputs (so they can be selected);
+    /// an edit of them changes nothing.
+    AgentTextEdited,
     /// "Check now": asks for the latest release, the result shown inline.
     CheckNow,
     Backup(BackupMsg),
@@ -66,17 +76,19 @@ pub enum SettingsSection {
     Compare,
     Editing,
     Terminal,
+    Agents,
     Backup,
 }
 
 impl SettingsSection {
     /// The navigation's order.
-    pub const ALL: [SettingsSection; 6] = [
+    pub const ALL: [SettingsSection; 7] = [
         SettingsSection::General,
         SettingsSection::Transfers,
         SettingsSection::Compare,
         SettingsSection::Editing,
         SettingsSection::Terminal,
+        SettingsSection::Agents,
         SettingsSection::Backup,
     ];
 }
@@ -409,6 +421,22 @@ impl App {
                 self.settings.compare_ignore = names;
                 self.save_settings_effect().into_iter().collect()
             }
+            SettingsMsg::Agents(on) => {
+                if on == self.settings.agents_enabled {
+                    return Vec::new();
+                }
+                self.settings.agents_enabled = on;
+                let mut effects = vec![Effect::SetAgents(on)];
+                effects.extend(self.save_settings_effect());
+                effects
+            }
+            SettingsMsg::CopyAgentCommand => vec![Effect::WriteClipboard(Redacted(
+                crate::ui::settings::agent_command(self.agent_exe.as_deref()),
+            ))],
+            SettingsMsg::CopyAgentJson => vec![Effect::WriteClipboard(Redacted(
+                crate::ui::settings::agent_json(self.agent_exe.as_deref()),
+            ))],
+            SettingsMsg::AgentTextEdited => Vec::new(),
             SettingsMsg::UpdateCheck(on) => {
                 if on == self.settings.update_check {
                     return Vec::new();

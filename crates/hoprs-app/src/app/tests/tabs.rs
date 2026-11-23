@@ -139,6 +139,7 @@ async fn closing_one_tab_keeps_the_session_for_the_other() {
     let mut app = loaded(&fake).await;
     let sites = connect_effect(app.update(Message::ConnectSite(s.id.clone())));
     let request = PromptRequest {
+        by_agent: false,
         id: PromptId(1),
         session: SessionId(1),
         site: s.id.clone(),
@@ -154,6 +155,7 @@ async fn closing_one_tab_keeps_the_session_for_the_other() {
     app.update(Message::Dialog(DialogMsg::Cancel));
     assert!(closes(&app.update(Message::CloseTab(terminal))).is_empty());
     let again = PromptRequest {
+        by_agent: false,
         id: PromptId(2),
         session: SessionId(1),
         site: s.id.clone(),
@@ -190,6 +192,7 @@ async fn closing_the_last_tab_closes_the_session() {
     let mut app = loaded(&fake).await;
     app.update(Message::ConnectSite(t.id.clone()));
     let request = PromptRequest {
+        by_agent: false,
         id: PromptId(7),
         session: SessionId(9),
         site: t.id.clone(),
@@ -204,6 +207,7 @@ async fn closing_the_last_tab_closes_the_session() {
     let effects = app.update(Message::CloseTab(app.tabs[0].id));
     assert!(app.tabs.is_empty());
     let late = PromptRequest {
+        by_agent: false,
         id: PromptId(8),
         session: SessionId(9),
         site: t.id.clone(),
@@ -886,6 +890,7 @@ async fn settings_tab_not_restored_with_workspace() {
 async fn ctrl_comma_blocked_by_dialog() {
     let mut app = App::new();
     let request = PromptRequest {
+        by_agent: false,
         id: PromptId(1),
         session: SessionId(1),
         site: SiteId::new(),

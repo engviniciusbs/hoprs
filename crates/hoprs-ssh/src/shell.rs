@@ -90,6 +90,10 @@ pub(crate) trait ShellWriter: Send + Sync + 'static {
     async fn data(&self, data: Vec<u8>) -> std::result::Result<(), russh::Error>;
     async fn window_change(&self, cols: u32, rows: u32) -> std::result::Result<(), russh::Error>;
     async fn close(&self) -> std::result::Result<(), russh::Error>;
+    /// Best-effort `signal KILL` request (no reply wanted). Only exec channels use it.
+    async fn kill(&self) -> std::result::Result<(), russh::Error> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -104,6 +108,10 @@ impl ShellWriter for ChannelWriteHalf<Msg> {
 
     async fn close(&self) -> std::result::Result<(), russh::Error> {
         ChannelWriteHalf::close(self).await
+    }
+
+    async fn kill(&self) -> std::result::Result<(), russh::Error> {
+        self.signal(russh::Sig::KILL).await
     }
 }
 
@@ -288,19 +296,26 @@ fn close_detached(writer: &Arc<dyn ShellWriter>) {
     }
 }
 
+fn pty_refused() -> Error {
+    Error::coded(
+        ErrorKind::Protocol,
+        "ssh-pty-refused",
+        "Server refused the PTY/shell request",
+    )
+}
+
 /// Waits for the reply to a channel request (`Success`/`Failure`), skipping other messages.
-async fn expect_reply(reader: &mut ChannelReadHalf, what: &str) -> Result<()> {
+/// `refused` is the error for a `Failure`.
+pub(crate) async fn expect_reply(
+    reader: &mut ChannelReadHalf,
+    what: &str,
+    refused: Error,
+) -> Result<()> {
     let wait = async {
         loop {
             match reader.wait().await {
                 Some(ChannelMsg::Success) => return Ok(()),
-                Some(ChannelMsg::Failure) => {
-                    return Err(Error::coded(
-                        ErrorKind::Protocol,
-                        "ssh-pty-refused",
-                        "Server refused the PTY/shell request",
-                    ));
-                }
+                Some(ChannelMsg::Failure) => return Err(refused),
                 Some(ChannelMsg::Close | ChannelMsg::Eof) | None => {
                     return Err(Error::coded(
                         ErrorKind::Network,
@@ -461,7 +476,7 @@ impl SshSession {
             .request_pty(true, &req.term, req.cols, req.rows, 0, 0, &[])
             .await
             .map_err(map_russh_error)?;
-        expect_reply(&mut reader, "pty").await?;
+        expect_reply(&mut reader, "pty", pty_refused()).await?;
         for (name, value) in &req.env {
             // No reply asked: a refusal (the usual `AcceptEnv` default) is silently ignored.
             writer
@@ -470,7 +485,7 @@ impl SshSession {
                 .map_err(map_russh_error)?;
         }
         writer.request_shell(true).await.map_err(map_russh_error)?;
-        expect_reply(&mut reader, "shell").await?;
+        expect_reply(&mut reader, "shell", pty_refused()).await?;
         Ok(ShellChannel::start(
             Box::new(reader),
             Arc::new(writer),

@@ -7,14 +7,16 @@ mod dirs;
 mod recovery;
 mod worker;
 
+use std::fmt;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use hoprs_core::{Error, ErrorKind, Result, SiteId};
+use hoprs_core::{Error, ErrorKind, RemotePath, Result, SiteId};
 use hoprs_remote::RemoteFs;
 use tokio::sync::{broadcast, mpsc, oneshot};
 
-use crate::model::{ConflictPolicy, TransferId, TransferItem, TransferSpec, TransferState};
+use crate::model::{ConflictPolicy, Origin, TransferId, TransferItem, TransferSpec, TransferState};
 use crate::progress::ProgressUpdate;
 use crate::store::QueueStore;
 
@@ -30,6 +32,9 @@ pub struct EngineConfig {
     pub buf_size: usize,
     pub progress_interval: Duration,
     pub default_policy: ConflictPolicy,
+    /// Checks the local path of every item of [`Origin::Agent`] before the
+    /// item touches a filesystem. `None`: agent items are not checked.
+    pub agent_guard: Option<LocalGuard>,
 }
 
 impl Default for EngineConfig {
@@ -38,8 +43,52 @@ impl Default for EngineConfig {
             buf_size: 256 * 1024,
             progress_interval: Duration::from_millis(100),
             default_policy: ConflictPolicy::Ask,
+            agent_guard: None,
         }
     }
+}
+
+/// The future a [`LocalGuard`] check returns.
+type GuardFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+
+/// A check of the local path of an agent's item, run by the engine before
+/// any filesystem call of the item (each run, files and folders alike). An
+/// error fails the item with that error; nothing is listed, created or
+/// written. Items of [`Origin::User`] never reach it.
+#[derive(Clone)]
+pub struct LocalGuard(Arc<dyn Fn(RemotePath) -> GuardFuture + Send + Sync>);
+
+impl LocalGuard {
+    pub fn new(check: impl Fn(RemotePath) -> GuardFuture + Send + Sync + 'static) -> LocalGuard {
+        LocalGuard(Arc::new(check))
+    }
+
+    pub(crate) fn check(&self, local: RemotePath) -> GuardFuture {
+        (self.0)(local)
+    }
+}
+
+impl fmt::Debug for LocalGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("LocalGuard")
+    }
+}
+
+/// How [`TransferEngine::enqueue_with`] enqueues a transfer.
+///
+/// An agent's transfer never waits on a question meant for a person: with
+/// `origin: Origin::Agent`, `policy` must be a policy that never asks (not
+/// `None`, which is the global policy and may be `Ask`, and not
+/// `Some(ConflictPolicy::Ask)`). `enqueue_with` refuses anything else with a
+/// `Conflict` error and enqueues nothing.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnqueueOptions {
+    /// The conflict policy of the whole tree: the enqueued item's own run,
+    /// and every item under it that has no continuation of its own.
+    /// `None`: the global policy.
+    pub policy: Option<ConflictPolicy>,
+    /// Who asked; every item of the tree records it.
+    pub origin: Origin,
 }
 
 /// Filesystems and worker count of one site. `workers` is clamped to `1..=16`.
@@ -148,35 +197,65 @@ impl TransferEngine {
         .await;
     }
 
-    /// Adds a transfer to the queue and returns its id.
+    /// Adds a transfer of the user to the queue, under the global policy,
+    /// and returns its id.
     pub async fn enqueue(&self, spec: TransferSpec) -> Result<TransferId> {
-        self.enqueue_inner(spec, None).await
+        self.enqueue_with(spec, EnqueueOptions::default()).await
     }
 
-    /// Like `enqueue`, but the item's own conflict decision uses `policy`
-    /// instead of the global one. Stored as the item's `next_policy`, so it
-    /// also holds after a restart. Meant for file items (the compare panel
-    /// enqueues files with it). Items recovered at startup always come back
-    /// `Paused`, so after a restart the item runs under this policy once
-    /// resumed.
+    /// Like `enqueue`, but the transfer runs under `policy` instead of the
+    /// global one (see [`enqueue_with`](Self::enqueue_with)).
     pub async fn enqueue_with_policy(
         &self,
         spec: TransferSpec,
         policy: ConflictPolicy,
     ) -> Result<TransferId> {
-        self.enqueue_inner(spec, Some(policy)).await
+        self.enqueue_with(
+            spec,
+            EnqueueOptions {
+                policy: Some(policy),
+                origin: Origin::User,
+            },
+        )
+        .await
     }
 
-    async fn enqueue_inner(
+    /// Adds a transfer to the queue and returns its id.
+    ///
+    /// With `options.policy`, the item's own conflict decision uses it
+    /// instead of the global one: it is stored as the item's `next_policy`,
+    /// so it also holds after a restart. It is also the item's tree policy:
+    /// every item under an enqueued folder runs under it whenever it has no
+    /// continuation of its own (its first run, a resume before its copy
+    /// started, a retry of a run that never decided its copy, a run whose
+    /// continuation another item's write superseded), so a folder's items
+    /// never fall back to the global policy (which may be `Ask`). Items
+    /// recovered at startup always come back `Paused`, so after a restart
+    /// they run under these policies once resumed.
+    ///
+    /// `options.origin` is recorded on every item of the tree; the items of
+    /// [`Origin::Agent`] pass the engine's `agent_guard` before each run. An
+    /// agent's transfer without a policy that never asks is refused (see
+    /// [`EnqueueOptions`]).
+    pub async fn enqueue_with(
         &self,
         spec: TransferSpec,
-        policy: Option<ConflictPolicy>,
+        options: EnqueueOptions,
     ) -> Result<TransferId> {
+        if options.origin == Origin::Agent
+            && matches!(options.policy, None | Some(ConflictPolicy::Ask))
+        {
+            // A contract of the caller (the agent service), never shown in the UI.
+            return Err(Error::new(
+                ErrorKind::Conflict,
+                "An agent's transfer needs a conflict policy that never asks",
+            ));
+        }
         let (reply, rx) = oneshot::channel();
         self.commands
             .send(Command::Enqueue {
                 spec,
-                policy,
+                options,
                 reply,
             })
             .await
@@ -193,7 +272,7 @@ impl TransferEngine {
     /// Resumes a paused transfer (a folder: with its paused descendants). A
     /// file paused while copying continues from its partial destination (one
     /// that was replacing an existing file starts over); one paused before
-    /// its copy started runs under the global policy.
+    /// its copy started runs under its tree policy, else the global policy.
     pub async fn resume(&self, id: TransferId) -> Result<()> {
         self.control(id, Control::Resume).await
     }
@@ -213,7 +292,7 @@ impl TransferEngine {
     /// - a failed item whose run held any continuation (its copy had been
     ///   decided, or it ran under an override such as a user `resolve`)
     ///   gets `Overwrite`: it starts over;
-    /// - any other item runs under the global policy.
+    /// - any other item runs under its tree policy, else the global policy.
     ///
     /// A child that failed because its name repeats an earlier entry of
     /// its folder's listing is never retried: retrying it returns

@@ -9,7 +9,9 @@
 //! **What counts.** Every channel opened through
 //! [`SshSession::open_channel`](crate::SshSession::open_channel) holds one slot for as long
 //! as its [`ChannelSlot`] lives: the SFTP metadata channel, each SFTP stream channel and each
-//! PTY ([`SshSession::open_shell`](crate::SshSession::open_shell)). A shell gives its slot
+//! PTY ([`SshSession::open_shell`](crate::SshSession::open_shell)) and each exec channel
+//! ([`SshSession::exec`](crate::SshSession::exec), which counts like a PTY: it never takes
+//! the last slot). A shell and an exec give their slot
 //! back as soon as it ends (closed by us, by the server, or by a lost connection), without
 //! waiting for the server's reply to our close.
 //!

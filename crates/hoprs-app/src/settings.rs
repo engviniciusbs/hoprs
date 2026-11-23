@@ -174,10 +174,18 @@ pub struct Settings {
     /// Whether the Google Drive destination was connected on this computer (the token
     /// itself is in the keyring); written only when `true`.
     pub google_drive: bool,
+    /// Whether coding agents may connect to hoprs at all (the master switch of Settings
+    /// › Agents (MCP)); off by default, written only when `true`.
+    pub agents_enabled: bool,
 }
 
 /// Keys [`file_of`] leaves out when they hold their default.
-const OPTIONAL_KEYS: [&str; 3] = ["compare_height", "update_seen", "google_drive"];
+const OPTIONAL_KEYS: [&str; 4] = [
+    "compare_height",
+    "update_seen",
+    "google_drive",
+    "agents_enabled",
+];
 
 /// The largest height a saved panel size may have.
 const PANEL_HEIGHT_MAX: f32 = 10_000.0;
@@ -240,6 +248,7 @@ impl Default for Settings {
             update_check: true,
             update_seen: None,
             google_drive: false,
+            agents_enabled: false,
         }
     }
 }
@@ -326,6 +335,8 @@ struct File {
     update_seen: Option<toml::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     google_drive: Option<toml::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agents_enabled: Option<toml::Value>,
 }
 
 /// A bool key; anything else (or missing) is `false`.
@@ -454,6 +465,7 @@ pub fn parse(content: &str) -> Result<Settings> {
             .update_seen
             .and_then(|value| value.as_str().and_then(|text| text.parse().ok())),
         google_drive: flag(file.google_drive),
+        agents_enabled: flag(file.agents_enabled),
     })
 }
 
@@ -499,6 +511,9 @@ fn file_of(settings: &Settings) -> File {
             .as_ref()
             .map(|version| toml::Value::String(version.to_string())),
         google_drive: settings.google_drive.then_some(toml::Value::Boolean(true)),
+        agents_enabled: settings
+            .agents_enabled
+            .then_some(toml::Value::Boolean(true)),
     }
 }
 
@@ -1105,5 +1120,42 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("google_drive"), "{text}");
         assert!(text.contains("future_key = 1"), "{text}");
+    }
+
+    #[test]
+    fn agents_switch_roundtrip_and_invalid() {
+        let defaults = Settings::default();
+        assert!(!defaults.agents_enabled);
+        assert!(!render(&defaults).contains("agents_enabled"));
+        let on = Settings {
+            agents_enabled: true,
+            ..Settings::default()
+        };
+        assert!(render(&on).contains("agents_enabled = true"));
+        assert_eq!(parse(&render(&on)).unwrap(), on);
+        assert!(!parse("agents_enabled = \"yes\"").unwrap().agents_enabled);
+        assert!(!parse("agents_enabled = 1").unwrap().agents_enabled);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(FILE_NAME);
+        std::fs::write(
+            &path,
+            "future_key = 1\ngoogle_drive = true\nagents_enabled = true\n",
+        )
+        .unwrap();
+        let loaded = load(&path).settings;
+        assert!(loaded.agents_enabled && loaded.google_drive);
+        save(
+            &path,
+            &Settings {
+                agents_enabled: false,
+                ..loaded
+            },
+        )
+        .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("agents_enabled"), "{text}");
+        assert!(text.contains("future_key = 1"), "{text}");
+        assert!(text.contains("google_drive = true"), "{text}");
     }
 }

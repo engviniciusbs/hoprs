@@ -124,7 +124,8 @@ impl Actor {
     /// two items never write the same path. The directory stays `Active`
     /// until its children finish, or finishes right away if none is pending. If it was paused or cancelled
     /// while listing, its children are created (and it ends) paused or
-    /// cancelled.
+    /// cancelled. The children inherit the directory's tree policy and
+    /// origin.
     pub(super) fn expand(
         &mut self,
         id: TransferId,
@@ -147,6 +148,8 @@ impl Actor {
         dir.is_dir = Some(true);
         dir.size = None;
         let parent = dir.spec.clone();
+        // Every child is of its folder's tree: same policy, same origin.
+        let (tree_policy, origin) = (dir.tree_policy, dir.origin);
         let mut seen = HashSet::new();
         let children: Vec<NewChild> = entries
             .iter()
@@ -173,6 +176,8 @@ impl Actor {
                 } else {
                     initial.clone()
                 },
+                tree_policy,
+                origin,
             })
             .collect();
         let ids = match self.store.insert_children(id, &children) {
@@ -214,6 +219,8 @@ impl Actor {
                 size: child.size,
                 bytes_done: 0,
                 state: child.state,
+                origin: child.origin,
+                tree_policy: child.tree_policy,
             });
         }
         if !fresh_files.is_empty() {

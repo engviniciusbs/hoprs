@@ -190,7 +190,8 @@ impl Actor {
                 continue;
             }
             // An interrupted run continues under its stored continuation;
-            // anything else runs under the global policy again.
+            // anything else runs under its tree policy (applied at dispatch),
+            // else the global policy, again.
             match self.store.next_policy(i).ok().flatten() {
                 Some(policy) => self.overrides.insert(i, policy),
                 None => self.overrides.remove(&i),

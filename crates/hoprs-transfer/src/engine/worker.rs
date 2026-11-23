@@ -20,7 +20,7 @@ use hoprs_remote::RemoteFs;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::SiteEndpoints;
+use super::{LocalGuard, SiteEndpoints};
 use crate::conflict::{Decision, decide};
 use crate::copy::{CopyOutcome, copy_file};
 use crate::model::{ConflictPolicy, Direction, TransferId, TransferSpec};
@@ -72,6 +72,8 @@ pub(super) enum Prepared {
     },
     /// A symlink, which is never followed.
     Symlink,
+    /// Refused by the engine's agent guard before any filesystem call.
+    Refused(Error),
     /// Stopped by the item's cancellation token before the destination was
     /// opened for writing.
     Stopped,
@@ -118,11 +120,14 @@ where
 }
 
 /// Runs `prepare` until it finishes or `cancel` fires (then: `Stopped`).
+/// With `guard` (an agent's item: the guard and the item's local path), the
+/// guard is awaited first.
 pub(super) fn spawn_prepare(
     id: TransferId,
     route: Route,
     policy: ConflictPolicy,
     fresh_dst: bool,
+    guard: Option<(LocalGuard, RemotePath)>,
     cancel: CancellationToken,
     tx: mpsc::UnboundedSender<WorkerMsg>,
 ) {
@@ -133,7 +138,7 @@ pub(super) fn spawn_prepare(
             let result = tokio::select! {
                 biased;
                 () = cancel.cancelled() => Ok(Prepared::Stopped),
-                result = prepare(&route, policy, fresh_dst) => result,
+                result = guarded_prepare(&route, policy, fresh_dst, guard) => result,
             }
             .map(Box::new);
             WorkerMsg::Prepared { id, route, result }
@@ -144,6 +149,22 @@ pub(super) fn spawn_prepare(
             result: Err(panicked()),
         },
     );
+}
+
+/// Awaits `guard` (if any) before `prepare`: a refusal ends the phase with
+/// `Refused`, before any filesystem call.
+async fn guarded_prepare(
+    route: &Route,
+    policy: ConflictPolicy,
+    fresh_dst: bool,
+    guard: Option<(LocalGuard, RemotePath)>,
+) -> Result<Prepared> {
+    if let Some((guard, local)) = guard
+        && let Err(e) = guard.check(local).await
+    {
+        return Ok(Prepared::Refused(e));
+    }
+    prepare(route, policy, fresh_dst).await
 }
 
 /// With `fresh_dst` (the first attempt of a file under a folder this run

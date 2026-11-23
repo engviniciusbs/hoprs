@@ -2,6 +2,9 @@
 //! keepalive), the terminal (font size, scrollback, theme) and the encrypted backup.
 
 use std::fmt;
+use std::path::Path;
+
+use hoprs_core::{AgentAccess, Site};
 
 use hoprs_transfer::ConflictPolicy;
 use hoprs_vault::{BackupImportReport, ExportScope, ImportMode};
@@ -219,6 +222,7 @@ pub fn section_icon(section: SettingsSection) -> Icon {
         SettingsSection::Compare => Icon::GitDiff,
         SettingsSection::Editing => Icon::PencilSimple,
         SettingsSection::Terminal => Icon::TerminalWindow,
+        SettingsSection::Agents => Icon::PlugsConnected,
         SettingsSection::Backup => Icon::ShieldCheck,
     }
 }
@@ -230,6 +234,7 @@ fn section_title(section: SettingsSection) -> &'static str {
         SettingsSection::Compare => strings::settings_compare(),
         SettingsSection::Editing => strings::settings_editing(),
         SettingsSection::Terminal => strings::settings_terminal(),
+        SettingsSection::Agents => strings::agents_section(),
         SettingsSection::Backup => strings::backup(),
     }
 }
@@ -241,6 +246,7 @@ fn section_description(section: SettingsSection) -> &'static str {
         SettingsSection::Compare => strings::settings_compare_description(),
         SettingsSection::Editing => strings::settings_editing_description(),
         SettingsSection::Terminal => strings::settings_terminal_description(),
+        SettingsSection::Agents => strings::settings_agents_description(),
         SettingsSection::Backup => strings::settings_backup_description(),
     }
 }
@@ -432,6 +438,90 @@ fn terminal(app: &App) -> Element<'_, Message> {
     terminal.into()
 }
 
+/// The shell command that registers hoprs in Claude Code: the executable's path is quoted
+/// for the shell (on Unix `"`, `\`, `$` and `` ` `` get a backslash; on Windows the path
+/// goes in as is, no Windows path holds a `"`). Without a path, `hoprs`.
+pub fn agent_command(exe: Option<&Path>) -> String {
+    let path = exe.map_or_else(|| "hoprs".to_owned(), |p| p.to_string_lossy().into_owned());
+    let quoted = if cfg!(windows) {
+        path
+    } else {
+        let mut out = String::with_capacity(path.len());
+        for c in path.chars() {
+            if matches!(c, '"' | '\\' | '$' | '`') {
+                out.push('\\');
+            }
+            out.push(c);
+        }
+        out
+    };
+    format!("claude mcp add hoprs -- \"{quoted}\" mcp")
+}
+
+/// The same registration as the JSON other MCP clients take, written by `serde_json` so
+/// any path (a Windows one with backslashes, a quote) stays valid.
+pub fn agent_json(exe: Option<&Path>) -> String {
+    let path = exe.map_or_else(|| "hoprs".to_owned(), |p| p.to_string_lossy().into_owned());
+    serde_json::json!({ "command": path, "args": ["mcp"] }).to_string()
+}
+
+/// How many sites are at `Read` and at `All`.
+pub fn agent_levels(sites: &[Site]) -> (usize, usize) {
+    let count = |level| sites.iter().filter(|s| s.agent_access == level).count();
+    (count(AgentAccess::Read), count(AgentAccess::All))
+}
+
+/// A read-only, selectable line (a text input that ignores edits) with its Copy button.
+fn copyable<'a>(value: &str, copy: SettingsMsg) -> Element<'a, Message> {
+    row![
+        text_input("", value)
+            .on_input(|_| msg(SettingsMsg::AgentTextEdited))
+            .padding(Padding::from([theme::SPACE_2XS, theme::SPACE_XS]))
+            .style(theme::search)
+            .font(theme::MONO)
+            .size(theme::TEXT_MONO)
+            .width(Length::Fill),
+        outlined(strings::update_copy(), Some(msg(copy))),
+    ]
+    .spacing(theme::SPACE_SM)
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// Why the channel for agents could not open, as the line under the checkbox.
+fn agents_error(app: &App) -> Option<String> {
+    app.agents.error.as_ref().map(strings::error)
+}
+
+fn agents(app: &App) -> Element<'_, Message> {
+    let (read, all) = agent_levels(&app.sites);
+    let command = agent_command(app.agent_exe.as_deref());
+    let json = agent_json(app.agent_exe.as_deref());
+    let channel_error =
+        agents_error(app).map(|error| text(error).size(theme::TEXT_SM).color(palette().error));
+    column![
+        checkbox(app.settings.agents_enabled)
+            .label(strings::agents_allow())
+            .on_toggle(|on| msg(SettingsMsg::Agents(on)))
+            .style(theme::checkbox),
+        channel_error,
+        muted(strings::agents_allow_hint()),
+        field(
+            strings::agents_claude_code(),
+            copyable(&command, SettingsMsg::CopyAgentCommand),
+            None
+        ),
+        field(
+            strings::agents_other_clients(),
+            copyable(&json, SettingsMsg::CopyAgentJson),
+            None
+        ),
+        muted_owned(strings::agents_levels(read, all)),
+    ]
+    .spacing(theme::SPACE_SM)
+    .into()
+}
+
 fn editing(app: &App) -> Element<'_, Message> {
     let settings = &app.settings;
     let editor_value = app
@@ -548,6 +638,7 @@ pub fn view<'a>(app: &'a App, tab: &SettingsTab) -> Element<'a, Message> {
         SettingsSection::Compare => comparing(app),
         SettingsSection::Editing => editing(app),
         SettingsSection::Terminal => terminal(app),
+        SettingsSection::Agents => agents(app),
         SettingsSection::Backup => backup_view(app),
     });
 
@@ -815,6 +906,23 @@ mod tests {
     use crate::i18n::{Language, set_language};
 
     #[test]
+    fn agents_section_shows_the_channel_error() {
+        use hoprs_core::{Error, ErrorKind};
+
+        let mut app = App::new();
+        assert_eq!(agents_error(&app), None);
+        app.agents.error = Some(Error::coded(
+            ErrorKind::Io,
+            "agent-channel-failed",
+            "Could not open the channel for agents",
+        ));
+        assert_eq!(
+            agents_error(&app).as_deref(),
+            Some("Could not open the channel for agents")
+        );
+    }
+
+    #[test]
     fn every_section_has_title_description_and_icon() {
         for language in Language::ALL {
             set_language(language);
@@ -831,7 +939,11 @@ mod tests {
                 let mut sorted = list.to_vec();
                 sorted.sort_unstable();
                 sorted.dedup();
-                assert_eq!(sorted.len(), 6, "{language:?}: {list:?}");
+                assert_eq!(
+                    sorted.len(),
+                    SettingsSection::ALL.len(),
+                    "{language:?}: {list:?}"
+                );
             }
         }
         set_language(Language::En);
@@ -841,7 +953,7 @@ mod tests {
             .collect();
         icons.sort_unstable();
         icons.dedup();
-        assert_eq!(icons.len(), 6);
+        assert_eq!(icons.len(), SettingsSection::ALL.len());
     }
 
     #[test]
@@ -908,5 +1020,71 @@ mod tests {
         app.drive_available = true;
         app.drive_error = None;
         assert!(drive_error(&app).is_none());
+    }
+
+    #[test]
+    fn agent_command_quotes_the_path() {
+        let exe = |p: &str| agent_command(Some(Path::new(p)));
+        assert_eq!(
+            exe("/usr/bin/hoprs"),
+            "claude mcp add hoprs -- \"/usr/bin/hoprs\" mcp"
+        );
+        assert_eq!(
+            exe("/Applications/hoprs.app/Contents/MacOS/hoprs"),
+            "claude mcp add hoprs -- \"/Applications/hoprs.app/Contents/MacOS/hoprs\" mcp"
+        );
+        assert_eq!(agent_command(None), "claude mcp add hoprs -- \"hoprs\" mcp");
+        #[cfg(unix)]
+        for path in [
+            "/opt/my apps/hoprs",
+            "/opt/a\"b $HOME `x` \\y/hoprs",
+            "/opt/it's/hoprs",
+        ] {
+            let command = exe(path);
+            let words = shlex::split(&command).expect("a well-formed command");
+            assert_eq!(
+                words,
+                ["claude", "mcp", "add", "hoprs", "--", path, "mcp"],
+                "{command}"
+            );
+        }
+        #[cfg(windows)]
+        assert_eq!(
+            exe(r"C:\Program Files\hoprs\hoprs.exe"),
+            "claude mcp add hoprs -- \"C:\\Program Files\\hoprs\\hoprs.exe\" mcp"
+        );
+    }
+
+    #[test]
+    fn agent_json_is_valid_json() {
+        for path in [
+            Some(r"C:\Program Files\hoprs\hoprs.exe"),
+            Some("/usr/bin/hoprs"),
+            Some("/opt/a\"b c/hoprs"),
+            None,
+        ] {
+            let json = agent_json(path.map(Path::new));
+            let value: serde_json::Value = serde_json::from_str(&json).expect(&json);
+            assert_eq!(value["command"], path.unwrap_or("hoprs"), "{json}");
+            assert_eq!(value["args"], serde_json::json!(["mcp"]), "{json}");
+        }
+    }
+
+    #[test]
+    fn agent_levels_counts_each_level() {
+        use hoprs_core::{AgentAccess, Protocol};
+        let at = |access| {
+            let mut site = Site::new("s", "h.example", "u", Protocol::Ssh);
+            site.agent_access = access;
+            site
+        };
+        let sites = [
+            at(AgentAccess::None),
+            at(AgentAccess::Read),
+            at(AgentAccess::Read),
+            at(AgentAccess::All),
+        ];
+        assert_eq!(agent_levels(&sites), (2, 1));
+        assert_eq!(agent_levels(&[]), (0, 0));
     }
 }

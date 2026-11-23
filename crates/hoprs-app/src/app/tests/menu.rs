@@ -17,6 +17,7 @@ fn open() -> Message {
 
 pub(super) fn host_key_prompt(id: u64) -> Message {
     Message::Prompt(BrokerEvent::Request(PromptRequest {
+        by_agent: false,
         id: PromptId(id),
         session: SessionId(1),
         site: SiteId::new(),
@@ -124,8 +125,8 @@ fn menu_ignored_while_closing() {
 
 // ---- Plan 13 Task 13: the pane menus ----
 
+use crate::agent::paths::local_os_path;
 use crate::app::actions::{Busy, BusyKind, PaneAction};
-use crate::app::files::local_os_path;
 use crate::app::menu::{MenuAction, MenuItem};
 use crate::backend::ConnectError;
 

@@ -87,6 +87,9 @@ transfer queue behind it, in one quiet window that opens in under 100 ms and idl
 - **Language:** English, Brazilian Portuguese or Turkish. hoprs follows the OS language by default;
   Settings › Language switches it at once.
 - **Command palette:** Ctrl+K (Cmd+K on macOS) jumps to any tab, site, workspace or action.
+- **Agents (MCP):** Claude Code and other coding agents can work on the sites you allow, one
+  by one, at a level you choose (reading, or everything), through `hoprs mcp`. hoprs keeps the
+  passwords and shows what the agent does. Off by default; see [Agents (MCP)](#agents-mcp).
 - **Update notice:** hoprs tells you when a new version is out and, with one click,
   downloads it, checks it against the release's `SHA256SUMS` and opens the system
   installer. It can be turned off; see [Updates](#updates).
@@ -376,6 +379,116 @@ refused, because it would remove everything the file does not hold. Partial file
 hoprs 1.6.0 or newer; hoprs 1.5.0 and older answer "Unsupported backup version" and change
 nothing. A file of everything restores on every version, as before.
 
+### Agents (MCP)
+
+Coding agents such as Claude Code can use the sites you saved in hoprs: list folders, read
+and write files, transfer, and run commands, without their own credentials. hoprs does the
+work, keeps the passwords, and shows what the agent does.
+
+It works through `hoprs mcp`, a small program the MCP client starts (the same executable as
+the app, started with the argument `mcp`). It talks to the **running** hoprs over a channel
+that stays on your computer, so hoprs must be open. It is off until you turn it on, and
+every site starts at "No access".
+
+**Set it up**
+
+1. In hoprs, turn on Settings › Agents (MCP) › "Allow agents to connect to hoprs".
+2. Copy the command that section shows and run it in a terminal. For Claude Code it looks
+   like this, with the full path of the hoprs you are running (on macOS and Windows hoprs is
+   not on `PATH`, so the path matters; Windows paths look like
+   `C:\Program Files\hoprs\hoprs.exe`):
+
+   ```
+   claude mcp add hoprs -- "/usr/bin/hoprs" mcp
+   ```
+
+   Other MCP clients take the JSON snippet in the same section: for example `{"command":"/usr/bin/hoprs","args":["mcp"]}` (the section shows yours, with your path).
+3. Edit a site and choose its level under "Agents (MCP)".
+
+**The levels** (per site, in the site's form):
+
+| | No access | Allow reading | Allow everything |
+|---|---|---|---|
+| The agent sees the site and can tell it exists | no | yes | yes |
+| List folders, describe a path, read a text file, download | no | yes | yes |
+| Write a file, make a folder, rename, change permissions, upload, delete | no | no | yes |
+| Run a command | no | no | SSH sites only |
+
+`download` needs only "Allow reading", and it writes on this computer: it creates files, and
+with `overwrite` it replaces an existing one. The level protects the server; it does not
+confine the agent on this computer (see the protected paths below).
+
+"No access" is the default for every site, existing ones included. A site with no access is
+not listed, and an agent that asks for it gets the same answer as for a site that does not
+exist. A change of level takes effect on the next call. A backup, a partial export or the
+FileZilla import never carries a level: a restored or imported site is "No access", and you
+give access only by hand, in the site form.
+
+**What an agent can do.** Thirteen tools: `list_sites`, `list_directory`, `stat`,
+`read_file`, `download`, `transfer_status` (reading level); `write_file`, `make_directory`,
+`rename`, `set_permissions`, `upload`, `delete` and `run_command` (everything level).
+Listings come in pages of up to 5 000 entries, `read_file` and `write_file` move at most
+1 MiB a call (use `download` and `upload` for more, or for files that are not text), and a
+command stops after 60 seconds unless the agent asks for up to 600. `download` and `upload`
+take a file or a folder through the transfer queue and never ask what to do with an existing
+file: the agent says `overwrite` or the file is skipped. A call that needs a connection
+connects the site, with no tab, no focus change and no sound; it closes after 10 minutes
+without a call (never while it has an unfinished transfer).
+
+**What an agent cannot do**
+
+- See, or touch, a site with "No access", or learn that it exists.
+- See a password, a passphrase, a key file or the path of one.
+- Answer a host-key, certificate or password question. These appear in the hoprs window,
+  marked "An agent asked for this connection."; the agent waits up to two minutes, then
+  hears that the user has to answer. A changed host key is always an error for the agent.
+- Change its own access, manage sites or workspaces, change settings, or export backups.
+- Transfer to or from hoprs's own files and folders (the program itself included), `~/.ssh`,
+  the `known_hosts` file hoprs uses, or any key file a saved site names. This holds for a
+  file, for a folder that contains one, and through symbolic links. Every path an agent
+  gives must be absolute and contain no `..`.
+
+  Nothing else on this computer is protected. A `download` (at "Allow reading") may write
+  into any other place you can write, including files that run later: a shell start-up
+  file, an autostart entry, the settings of the agent's own client. An agent that is misled
+  could use that to run code as you. Give access only to agents you trust on this machine,
+  and keep the MCP client's own permission prompts on for hoprs's tools. The protected paths
+  cover only the local side of transfers: a saved site that points at this computer (SSH to
+  `localhost`) gives an agent with "Allow everything" the remote-side tools on this
+  machine's own files, `~/.ssh` and hoprs's files included.
+- Open an interactive terminal.
+
+**What you see.** "Agent connected" in the status bar while an agent is connected (the
+tooltip counts them). It appears with the agent's first call, when `hoprs mcp` connects to
+hoprs, not when the MCP client starts it. A small "agent" tag on its transfers in the queue
+(you can pause or cancel them there); "Connected (by an agent)" on its sites in the
+sidebar; and one line per action in the log, from `agent`, for example
+``ran `systemctl status nginx` on "Acme" (exit 0)``. The log holds the command line and
+the paths, never file content or command output. Turning the switch off closes the channel
+and the agents' sessions at once, except a session an unfinished transfer still uses (it
+stays until the transfer ends; a paused transfer keeps it), and the agent's next calls say
+so.
+
+**Read this before you choose "Allow everything".** An agent can be misled by what it reads:
+a file, a command's output. hoprs does not review what the agent does, and it does not ask
+before each action. The level is the safeguard: keep production sites on "Allow reading"
+unless the agent really must change them. Anything running as your user on this computer can
+use the channel while the switch is on (see [SECURITY.md](SECURITY.md)); that is why the
+switch starts off.
+
+**Known limits**
+
+- hoprs must be open. The agent's calls fail with a message that says so, and work again as
+  soon as hoprs is open and the switch is on; the agent need not be restarted.
+- `run_command` is for SSH sites. There is no terminal and no input. If a command passes its
+  time limit, hoprs sends it a KILL signal and says so, but it may keep running on the server.
+- `read_file` refuses a file whose last path component is a symbolic link; `download` it.
+- On Windows the agent's local paths must be on the drive hoprs's local pane reaches (the
+  current drive); other drives and network paths are refused with a message that says so.
+- On some FTP servers a link to a folder is listed as a folder, so a recursive `delete` goes
+  into it.
+- A transfer queue written by this version is refused by hoprs 1.5.0 and older.
+
 ### Settings
 
 ![The Settings tab on its Transfers section: workers per site, what to do when a file already exists, and the keepalive interval](docs/images/settings.png)
@@ -383,7 +496,7 @@ nothing. A file of everything restores on every version, as before.
 Settings open as a tab: Ctrl+, (⌘, on macOS), the gear at the bottom of the sidebar, or
 "Settings" in the Ctrl+K palette. There is only ever one; pressing the shortcut again
 focuses it. A list on the left switches between General, Transfers, Folder compare, Remote
-editing, Terminal and Backup (export and restore). Closing the tab returns to the tab you came from.
+editing, Terminal, Agents (MCP) and Backup (export and restore). Closing the tab returns to the tab you came from.
 
 ### Remote editing
 
@@ -443,10 +556,12 @@ tests check that every catalog has the same keys and variables as `en.ftl` (`car
 | Config: `sites.toml` (no secrets), `workspaces.toml`, `settings.toml` | `~/.config/hoprs/` | `~/Library/Application Support/hoprs/` | `%APPDATA%\hoprs\` |
 | Transfer queue `queue.db` (SQLite), `recovered/` (remote edits that could not be uploaded) | `~/.local/share/hoprs/` | `~/Library/Application Support/hoprs/` | `%APPDATA%\hoprs\` |
 | Working copies of files being edited | `$XDG_RUNTIME_DIR/hoprs/edit/` (cleared at logout) | a temporary folder | a temporary folder |
+| `agent.sock`, the channel for agents (only while Settings › Agents (MCP) is on and hoprs runs; the pipe `\\.\pipe\hoprs-agent-<your SID>` on Windows) | beside `instance.lock` (normally `$XDG_RUNTIME_DIR/hoprs/`; if that is unusable, `~/.config/hoprs/`, then the temporary folder) | `~/Library/Application Support/hoprs/` | none: a named pipe |
 | Passwords and key passphrases, service `hoprs/<site-id>` | Secret Service (GNOME Keyring, KWallet) | macOS Keychain | Windows Credential Manager |
 
 The TOML files are plain text and safe to keep in a dotfiles repository: they never hold a
-password or passphrase.
+password or passphrase. Two keys belong to agents: `agents_enabled = true` in `settings.toml` (written only
+when on) and `agent_access = "read"` or `"all"` on a site in `sites.toml` (absent means no access).
 
 ## Configuration
 
@@ -496,6 +611,11 @@ needed.
     [CMake](https://cmake.org) and [NASM](https://www.nasm.us) on `PATH`
 
 - **Docker** (optional) for the integration tests and for building the `.deb`.
+
+The MCP server for agents uses [`rmcp`](https://github.com/modelcontextprotocol/rust-sdk), the
+official Rust SDK, for the protocol on stdio. It adds exactly ten packages to `Cargo.lock` (`rmcp`, `schemars`, `schemars_derive`,
+`serde_derive_internals`, `dyn-clone`, `ref-cast`, `ref-cast-impl`, `pastey`,
+`unicode-general-category`, `unicode-normalization`) and needs nothing to install: no TLS, no HTTP, no OpenSSL.
 
 ### Build and run
 
@@ -670,6 +790,30 @@ On macOS, click "Always Allow" in the Keychain prompt (it comes back after each 
 **A connection keeps dropping.** Open the log (status bar, Log) and look at the INFO lines
 around the drop; they name the cause (timeout, server close, reconnect attempts). For more,
 start hoprs with `RUST_LOG=hoprs_ssh=debug,hoprs_remote=debug`.
+
+**An agent says "hoprs is not reachable".** hoprs is closed, or Settings › Agents (MCP) is off.
+Open hoprs and turn the switch on; then the agent's next call works. On Linux, `hoprs mcp`
+looks for hoprs's channel under `$XDG_RUNTIME_DIR`: an agent started where that variable is
+missing or different (another login session, a service, a container, `sudo`) cannot find
+the running hoprs and says the same. Compare `echo $XDG_RUNTIME_DIR` in the agent's terminal
+with the one hoprs was started from; start the agent from the same desktop session, or pass
+the variable through to it.
+
+**An agent says hoprs and its MCP server are different versions.** The window and the
+`hoprs mcp` program are not the same build, and the message says which is older. hoprs was
+updated while its window stayed open: quit hoprs and open it again. The `hoprs mcp` program
+was started before hoprs was updated (an agent session that stayed open across the update):
+restart or reconnect the hoprs MCP server in the MCP client (for example by restarting the
+agent session); restarting hoprs does not help then.
+
+**The copied MCP command stops working (macOS).** macOS can run an app opened from the
+Downloads folder or from the disk image from a temporary path that changes at each launch,
+so the path in the copied command no longer exists. Move hoprs to Applications, open it from
+there, and copy the command again.
+
+**The agent cannot start `hoprs` (Windows, macOS).** Register it with the full path to the
+executable, as Settings › Agents (MCP) shows it (`C:\Program Files\hoprs\hoprs.exe` on Windows).
+`hoprs` alone is not on `PATH` there.
 
 **The host key changed.** hoprs shows the old and new fingerprints and connects only if you
 accept the new key. Check with the server's administrator first.

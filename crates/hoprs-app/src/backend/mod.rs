@@ -2,6 +2,7 @@
 //! manager (with the sessions' terminal shells), the remote edits and the prompt broker,
 //! behind [`BackendApi`].
 
+pub mod agent;
 pub mod broker;
 pub mod edit;
 #[cfg(test)]
@@ -50,6 +51,9 @@ pub use sessions::{
 pub use shells::ShellId;
 pub use vault::{LazyKeyringStore, ProfileSnapshot, VaultHandle};
 
+use crate::agent::server::AgentServer;
+use crate::agent::service::Service;
+use crate::agent::{AgentEvent, Limits};
 use crate::drive::{ConnectEvent, Drive, DriveAccount, DriveFile, Pages, Sealed};
 use crate::settings::{self, Settings, SettingsLoad};
 use crate::update::Release;
@@ -320,6 +324,15 @@ pub trait BackendApi: Send + Sync {
     fn set_workers(&self, workers: usize);
     /// Keepalive (seconds, `10..=300`) of the SSH and FTP connections made from now on.
     fn set_keepalive(&self, secs: u64);
+    /// The master switch of Settings › Agents (MCP): whether agents may connect. A
+    /// `settings.toml` saved afterwards sets it too (the stored setting wins).
+    async fn set_agents_enabled(&self, on: bool);
+    /// What the agent side reports (relays connected, the channel's state, the sites an
+    /// agent holds, the sessions an agent brought up), for the UI's subscription. Only
+    /// the first call gets it. Bounded while nobody reads (see
+    /// [`crate::agent::latest_events`]): of `Relays`, `Sites` and `Channel` the latest
+    /// value always arrives; of `Connected`, at least the latest of each site.
+    fn agent_events(&self) -> Option<mpsc::Receiver<AgentEvent>>;
 
     /// The latest stable release (the update check). `update-dev-build` in a debug build
     /// without `HOPRS_UPDATE_URL` (see [`http::api_url`]).
@@ -508,6 +521,12 @@ pub struct BackendConfig {
     /// The user's versions saved when a remote edit takes the server's (see
     /// [`edit::default_recovered_dir`]).
     pub recovered_dir: PathBuf,
+    /// The directory of the agent channel, protected from agents' transfers like the
+    /// others; `None` until the run knows it.
+    pub agent_dir: Option<PathBuf>,
+    /// The running executable, protected from agents' transfers too (see
+    /// [`crate::agent::paths::program_roots`]); `None` when it is not known.
+    pub program: Option<PathBuf>,
 }
 
 impl BackendConfig {
@@ -521,7 +540,25 @@ impl BackendConfig {
             backup_params: ExportParams::default(),
             edit_dir: edit::default_edit_dir(),
             recovered_dir: edit::default_recovered_dir(),
+            agent_dir: None,
+            program: std::env::current_exe().ok(),
         })
+    }
+
+    /// hoprs's own directories: the profiles, the queue's directory, the remote edits'
+    /// copies, the recovered versions and the agent channel's directory.
+    fn own_dirs(&self) -> Vec<PathBuf> {
+        let mut dirs = vec![self.profile_dir.clone()];
+        dirs.extend(
+            self.queue_path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf),
+        );
+        dirs.push(self.edit_dir.clone());
+        dirs.push(self.recovered_dir.clone());
+        dirs.extend(self.agent_dir.clone());
+        dirs
     }
 }
 
@@ -532,6 +569,9 @@ pub struct Backend {
     settings_path: PathBuf,
     /// What `settings.toml` held when the backend opened.
     settings: SettingsLoad,
+    /// Held across a write of `settings.toml` and the switch's update from it, so the
+    /// switch always equals the file written last.
+    settings_turn: tokio::sync::Mutex<()>,
     /// Why the queue database could not be opened (the engine runs in memory then).
     queue_error: Option<Error>,
     backup_params: ExportParams,
@@ -544,6 +584,15 @@ pub struct Backend {
     downloading: Downloading,
     /// The Google Drive connection (its keyring entry in the app secret store).
     drive: Arc<Drive>,
+    /// The master switch for agents, started from `settings.toml`; the agent channel
+    /// follows it.
+    agents: tokio::sync::watch::Sender<bool>,
+    /// What the agent service works through (see [`agent`]).
+    agent: Arc<agent::RealHost>,
+    /// The agent channel's server; `None` only while [`Backend::open`] builds it.
+    agent_server: Option<AgentServer>,
+    /// The agent side's events, until the UI takes them.
+    agent_events: Mutex<Option<mpsc::Receiver<AgentEvent>>>,
 }
 
 impl Backend {
@@ -566,13 +615,21 @@ impl Backend {
         if let Some(error) = &loaded.error {
             tracing::warn!(%error, "settings.toml is unusable; this run uses the defaults");
         }
+        // Before the engine starts: its guard of agent items needs them.
+        let fixed = crate::agent::paths::fixed_roots(
+            &config.own_dirs(),
+            &config.sessions.known_hosts_path(),
+            config.program.as_deref(),
+        );
         let (engine, queue_error) = start_engine(
             config.queue_path.as_deref(),
             EngineConfig {
                 default_policy: loaded.settings.default_policy,
+                agent_guard: Some(agent::guard(vault.clone(), fixed.clone())),
                 ..EngineConfig::default()
             },
         );
+        let agents = tokio::sync::watch::Sender::new(loaded.settings.agents_enabled);
         config.sessions.workers = loaded.settings.workers_per_site;
         config.sessions.keepalive = std::time::Duration::from_secs(loaded.settings.keepalive_secs);
         let broker = PromptBroker::new(vault.clone());
@@ -582,11 +639,25 @@ impl Backend {
             broker.clone(),
             config.sessions,
         );
-        Ok(Backend {
+        let agent = Arc::new(agent::RealHost::new(
+            vault.clone(),
+            engine.clone(),
+            sessions.clone(),
+            broker.clone(),
+            agents.subscribe(),
+            fixed,
+        ));
+        let channel = config
+            .agent_dir
+            .as_deref()
+            .map(crate::agent::channel::endpoint_in);
+        let (agent_tx, agent_rx) = mpsc::unbounded_channel();
+        let mut backend = Backend {
             edits: EditManager::new(config.edit_dir, config.recovered_dir),
             profile_dir: config.profile_dir,
             settings_path,
             settings: loaded,
+            settings_turn: tokio::sync::Mutex::new(()),
             queue_error,
             backup_params: config.backup_params,
             vault,
@@ -596,7 +667,26 @@ impl Backend {
             update: UpdateClient::default(),
             downloading: Downloading::default(),
             drive: Arc::new(Drive::new(Arc::new(MemoryStore::new()))),
-        })
+            agents,
+            agent,
+            agent_server: None,
+            agent_events: Mutex::new(Some(crate::agent::latest_events(agent_rx))),
+        };
+        // Its own task: the channel is opened there (never on this thread) when the
+        // switch is on.
+        let service = Service::new(backend.agent_host(), Limits::default(), agent_tx.clone());
+        backend.agent_server = Some(AgentServer::start(
+            service,
+            channel,
+            backend.agents.subscribe(),
+            agent_tx,
+        ));
+        Ok(backend)
+    }
+
+    /// The agent service's host over this backend.
+    pub fn agent_host(&self) -> Arc<agent::RealHost> {
+        self.agent.clone()
     }
 
     /// Where the app's own secrets (the Google Drive connection) are kept; by default in
@@ -721,6 +811,11 @@ impl BackendApi for Backend {
     async fn shutdown(&self) {
         // Local and fast first: whatever is unsent is safe before any slow step.
         self.edits.preserve_unsent().await;
+        // The relays are told hoprs quits and their calls dropped, so nothing of an
+        // agent holds a session or a connection attempt when they close.
+        if let Some(server) = &self.agent_server {
+            server.shutdown().await;
+        }
         self.engine.clone().shutdown().await;
         self.sessions.close_all().await;
         // The close flow settled the edits it knew of; anything unsent since is kept as a
@@ -1034,13 +1129,33 @@ impl BackendApi for Backend {
         self.queue_error.clone()
     }
 
+    /// Once the file is written, its `agents_enabled` is the master switch: the stored
+    /// setting wins over a [`set_agents_enabled`](BackendApi::set_agents_enabled) that
+    /// reached the backend out of order. One save at a time, the write and the switch
+    /// together: two saves racing leave the switch as the file written last.
     async fn save_settings(&self, settings: Settings) -> Result<()> {
+        let _turn = self.settings_turn.lock().await;
         let path = self.settings_path.clone();
-        blocking(move || settings::save(&path, &settings)).await
+        let agents = settings.agents_enabled;
+        blocking(move || settings::save(&path, &settings)).await?;
+        self.agents
+            .send_if_modified(|on| std::mem::replace(on, agents) != agents);
+        Ok(())
     }
 
     async fn set_policy(&self, policy: ConflictPolicy) {
         self.engine.set_policy(policy).await;
+    }
+
+    async fn set_agents_enabled(&self, on: bool) {
+        self.agents.send_replace(on);
+    }
+
+    fn agent_events(&self) -> Option<mpsc::Receiver<AgentEvent>> {
+        self.agent_events
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
     }
 
     fn set_workers(&self, workers: usize) {
@@ -1180,6 +1295,10 @@ mod tests {
     }
 
     fn open(dir: &Path) -> Backend {
+        open_with_agents(dir, None)
+    }
+
+    fn open_with_agents(dir: &Path, agent_dir: Option<PathBuf>) -> Backend {
         let config = BackendConfig {
             profile_dir: dir.join("profiles"),
             queue_path: Some(dir.join("data").join("queue.db")),
@@ -1187,8 +1306,187 @@ mod tests {
             backup_params: CHEAP_BACKUP,
             edit_dir: dir.join("edit"),
             recovered_dir: dir.join("recovered"),
+            agent_dir,
+            program: None,
         };
         Backend::open(config, Arc::new(MemoryStore::new())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn agents_switch_starts_from_the_settings_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = dir.path().join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(
+            profiles.join(settings::FILE_NAME),
+            "agents_enabled = true\n",
+        )
+        .unwrap();
+        let backend = open(dir.path());
+        assert!(*backend.agents.borrow());
+        backend.set_agents_enabled(false).await;
+        assert!(!*backend.agents.borrow());
+
+        // No file: off.
+        let other = tempfile::tempdir().unwrap();
+        assert!(!*open(other.path()).agents.borrow());
+    }
+
+    /// A relay of the real backend, its channel in a temporary directory.
+    struct Relay {
+        reader: tokio::io::BufReader<tokio::io::ReadHalf<crate::agent::channel::Stream>>,
+        writer: tokio::io::WriteHalf<crate::agent::channel::Stream>,
+    }
+
+    impl Relay {
+        /// Connects (waiting for the channel: `Backend::open` returns before it exists)
+        /// and says its hello.
+        async fn connect(endpoint: &crate::agent::channel::Endpoint) -> Relay {
+            let start = std::time::Instant::now();
+            let stream = loop {
+                let connecting = crate::agent::channel::connect(endpoint);
+                match crate::agent::testing::step("backend relay: connecting", connecting).await {
+                    Ok(stream) => break stream,
+                    Err(err) => {
+                        assert!(start.elapsed() < LINE_WAIT, "no channel: {err}");
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                }
+            };
+            let (read, writer) = tokio::io::split(stream);
+            let mut relay = Relay {
+                reader: tokio::io::BufReader::new(read),
+                writer,
+            };
+            let version = env!("CARGO_PKG_VERSION");
+            relay
+                .send(&format!(r#"{{"hoprs_agent":1,"version":"{version}"}}"#))
+                .await;
+            assert_eq!(
+                relay.line().await.as_deref(),
+                Some(format!(r#"{{"hello":"ok","version":"{version}"}}"#).as_str())
+            );
+            relay
+        }
+
+        async fn send(&mut self, line: &str) {
+            use tokio::io::AsyncWriteExt;
+            let bytes = format!("{line}\n");
+            crate::agent::testing::step(
+                format!("backend relay: writing {line}"),
+                self.writer.write_all(bytes.as_bytes()),
+            )
+            .await
+            .unwrap();
+        }
+
+        /// The next line; `None` at the end.
+        async fn line(&mut self) -> Option<String> {
+            let reading = crate::agent::proto::read_line(&mut self.reader);
+            crate::agent::testing::step("backend relay: reading a line", reading)
+                .await
+                .ok()
+                .flatten()
+        }
+    }
+
+    const LINE_WAIT: Duration = Duration::from_secs(10);
+
+    /// The master switch from `settings.toml` opens the channel, a relay's call goes
+    /// through the real host, turning it off says so; a saved settings file is the
+    /// switch too, and quitting says goodbye.
+    #[tokio::test]
+    async fn agent_channel_follows_the_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let profiles = dir.path().join("profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(
+            profiles.join(settings::FILE_NAME),
+            "agents_enabled = true\n",
+        )
+        .unwrap();
+        let agent_dir = dir.path().join("run");
+        let backend = open_with_agents(dir.path(), Some(agent_dir.clone()));
+        let mut events = backend.agent_events().unwrap();
+        let endpoint = crate::agent::channel::endpoint_in(&agent_dir);
+
+        let mut relay = Relay::connect(&endpoint).await;
+        relay
+            .send(r#"{"call":1,"tool":"list_sites","args":{}}"#)
+            .await;
+        assert_eq!(
+            relay.line().await.as_deref(),
+            Some(r#"{"reply":1,"ok":true,"blocks":["{\"sites\":[]}"]}"#)
+        );
+        backend.set_agents_enabled(false).await;
+        assert_eq!(relay.line().await.as_deref(), Some(r#"{"bye":"off"}"#));
+        assert_eq!(relay.line().await, None);
+        let mut seen = Vec::new();
+        while let Ok(Some(event)) =
+            tokio::time::timeout(Duration::from_millis(200), events.recv()).await
+        {
+            seen.push(event);
+        }
+        assert!(seen.contains(&AgentEvent::Channel(None)), "{seen:?}");
+        assert!(seen.contains(&AgentEvent::Relays(1)), "{seen:?}");
+        let relays = seen
+            .iter()
+            .rev()
+            .find(|e| matches!(e, AgentEvent::Relays(_)));
+        assert_eq!(relays, Some(&AgentEvent::Relays(0)), "{seen:?}");
+        // The reaper ran when the channel closed.
+        assert_eq!(
+            seen.last(),
+            Some(&AgentEvent::Sites(Vec::new())),
+            "{seen:?}"
+        );
+
+        // The stored setting is the switch: saved on, the channel opens again.
+        let on = Settings {
+            agents_enabled: true,
+            ..Settings::default()
+        };
+        backend.save_settings(on).await.unwrap();
+        let mut relay = Relay::connect(&endpoint).await;
+        backend.shutdown().await;
+        assert_eq!(relay.line().await.as_deref(), Some(r#"{"bye":"quit"}"#));
+        assert_eq!(relay.line().await, None);
+    }
+
+    /// Saves racing each other: whatever order their writes and their continuations
+    /// take, the switch ends equal to the file written last.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_switch_is_the_file_written_last() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = open(dir.path());
+        let path = backend.settings_path.clone();
+        for round in 0..40 {
+            let saves = (0..8).map(|i| {
+                backend.save_settings(Settings {
+                    agents_enabled: (i + round) % 2 == 0,
+                    ..Settings::default()
+                })
+            });
+            for saved in futures_util::future::join_all(saves).await {
+                saved.unwrap();
+            }
+            let stored = settings::load(&path).settings.agents_enabled;
+            assert_eq!(*backend.agents.borrow(), stored, "round {round}");
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_events_are_handed_out_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = open(dir.path());
+        assert!(backend.agent_events().is_some());
+        assert!(backend.agent_events().is_none());
+
+        let fake = fake::FakeBackend::new();
+        let mut events = fake.agent_events().unwrap();
+        assert!(fake.agent_events().is_none());
+        fake.push_agent_event(AgentEvent::Relays(2));
+        assert_eq!(events.recv().await, Some(AgentEvent::Relays(2)));
     }
 
     /// A debug build without `HOPRS_UPDATE_URL` never reaches the network: both update
@@ -1566,6 +1864,8 @@ mod tests {
             backup_params: CHEAP_BACKUP,
             edit_dir: dir.path().join("edit"),
             recovered_dir: dir.path().join("recovered"),
+            agent_dir: None,
+            program: None,
         };
         let backend = Backend::open(config, Arc::new(MemoryStore::new())).unwrap();
         let key = "AAAAC3NzaC1lZDI1NTE5AAAAIGrhflDkrs18RwIFvHFCsoXLdUL+0cVr81616Tzk8aBj";
@@ -1725,6 +2025,8 @@ mod tests {
             backup_params: CHEAP_BACKUP,
             edit_dir: dir.path().join("edit"),
             recovered_dir: dir.path().join("recovered"),
+            agent_dir: None,
+            program: None,
         };
         let backend = Backend::open(config, Arc::new(MemoryStore::new())).unwrap();
         assert!(backend.engine.snapshot().await.is_empty());
@@ -2233,6 +2535,8 @@ mod tests {
             backup_params: CHEAP_BACKUP,
             edit_dir: dir.path().join("edit"),
             recovered_dir: dir.path().join("recovered"),
+            agent_dir: None,
+            program: None,
         };
         let backend = Arc::new(Backend::open(config, Arc::new(MemoryStore::new())).unwrap());
         let mut prompts = backend.prompt_events().unwrap();

@@ -95,6 +95,80 @@ impl Default for FtpOptions {
     }
 }
 
+/// What a coding agent (over MCP) may do on a site. The user sets it by hand
+/// in the site's form; it is never exported, restored or imported.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentAccess {
+    /// The site does not exist for agents.
+    #[default]
+    None,
+    /// List, stat, read and download.
+    Read,
+    /// Everything, including writes and (SSH) commands.
+    All,
+}
+
+impl AgentAccess {
+    pub fn is_none(&self) -> bool {
+        *self == Self::None
+    }
+
+    /// Whether this level covers `needed`.
+    pub fn allows(self, needed: AgentAccess) -> bool {
+        self >= needed
+    }
+}
+
+/// Lenient on purpose: `"read"` and `"all"` are those levels; anything else
+/// (a level a newer hoprs wrote, another type) is "No access", so the site
+/// stays readable and never gains access it was not given.
+impl<'de> Deserialize<'de> for AgentAccess {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+
+        struct Level;
+        impl<'de> Visitor<'de> for Level {
+            type Value = AgentAccess;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an agent access level")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(match v {
+                    "read" => AgentAccess::Read,
+                    "all" => AgentAccess::All,
+                    _ => AgentAccess::None,
+                })
+            }
+            fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
+                Ok(AgentAccess::None)
+            }
+            fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
+                Ok(AgentAccess::None)
+            }
+            fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
+                Ok(AgentAccess::None)
+            }
+            fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
+                Ok(AgentAccess::None)
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(AgentAccess::None)
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+                while seq.next_element::<IgnoredAny>()?.is_some() {}
+                Ok(AgentAccess::None)
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+                Ok(AgentAccess::None)
+            }
+        }
+        deserializer.deserialize_any(Level)
+    }
+}
+
 /// A saved site. Secrets never live here; `has_*` only flag keyring entries.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Site {
@@ -116,6 +190,9 @@ pub struct Site {
     pub has_password: bool,
     #[serde(default)]
     pub has_key_passphrase: bool,
+    /// What agents may do here; absent from `sites.toml` means no access.
+    #[serde(default, skip_serializing_if = "AgentAccess::is_none")]
+    pub agent_access: AgentAccess,
 }
 
 impl Site {
@@ -138,6 +215,7 @@ impl Site {
             local_dir: None,
             has_password: false,
             has_key_passphrase: false,
+            agent_access: AgentAccess::None,
         }
     }
 }
@@ -227,5 +305,58 @@ protocol = "ssh"
         s.has_password = true;
         let text = toml::to_string(&s).unwrap();
         assert_eq!(toml::from_str::<Site>(&text).unwrap(), s);
+    }
+
+    fn site_toml(extra: &str) -> String {
+        format!(
+            "id = \"s1\"\nname = \"One\"\nhost = \"h\"\nport = 22\nuser = \"u\"\nprotocol = \"ssh\"\n{extra}"
+        )
+    }
+
+    #[test]
+    fn agent_access_serde() {
+        let mut site = Site::new("One", "h", "u", Protocol::Ssh);
+        assert!(!toml::to_string(&site).unwrap().contains("agent_access"));
+        site.agent_access = AgentAccess::Read;
+        let text = toml::to_string(&site).unwrap();
+        assert!(text.contains("agent_access = \"read\""), "{text}");
+        assert_eq!(
+            toml::from_str::<Site>(&text).unwrap().agent_access,
+            AgentAccess::Read
+        );
+        site.agent_access = AgentAccess::All;
+        let text = toml::to_string(&site).unwrap();
+        assert!(text.contains("agent_access = \"all\""), "{text}");
+        assert_eq!(
+            toml::from_str::<Site>(&text).unwrap().agent_access,
+            AgentAccess::All
+        );
+
+        for extra in [
+            "",
+            "agent_access = \"none\"\n",
+            "agent_access = \"write\"\n",
+            "agent_access = \"ALL\"\n",
+            "agent_access = 3\n",
+            "agent_access = true\n",
+            "agent_access = [\"all\"]\n",
+            "agent_access = { level = \"all\" }\n",
+        ] {
+            let site: Site = toml::from_str(&site_toml(extra)).unwrap();
+            assert_eq!(site.agent_access, AgentAccess::None, "{extra}");
+        }
+        let site: Site = toml::from_str(&site_toml("agent_access = \"all\"\n")).unwrap();
+        assert_eq!(site.agent_access, AgentAccess::All);
+    }
+
+    #[test]
+    fn agent_access_order() {
+        use AgentAccess::*;
+        assert!(All.allows(Read));
+        assert!(Read.allows(Read));
+        assert!(!Read.allows(All));
+        assert!(!None.allows(Read));
+        assert!(None.is_none() && !Read.is_none());
+        assert_eq!(Site::new("a", "h", "u", Protocol::Ftp).agent_access, None);
     }
 }

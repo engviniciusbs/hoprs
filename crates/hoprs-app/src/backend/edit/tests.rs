@@ -1445,3 +1445,200 @@ async fn racing_preserve_passes_copy_once() {
     assert_eq!(one[0].recovered, two[0].recovered);
     assert_eq!(h.recovered_copies().len(), 1);
 }
+
+/// `put` (an agent's `write_file`): `TempRename` writes a temporary file and renames it
+/// over the path, keeping the old file's mode and leaving no temporary file; `InPlace`
+/// writes the path itself.
+#[tokio::test]
+async fn put_writes_by_mode() {
+    /// Records the paths `open_write` and `rename` were called with.
+    struct Recording {
+        inner: MemFs,
+        calls: Mutex<Vec<String>>,
+    }
+    #[async_trait]
+    impl RemoteFs for Recording {
+        async fn list(&self, path: &RemotePath) -> Result<Vec<RemoteEntry>> {
+            self.inner.list(path).await
+        }
+        async fn stat(&self, path: &RemotePath) -> Result<RemoteEntry> {
+            self.inner.stat(path).await
+        }
+        async fn open_read(&self, path: &RemotePath, offset: u64) -> Result<BoxAsyncRead> {
+            self.inner.open_read(path, offset).await
+        }
+        async fn open_write(&self, path: &RemotePath, offset: u64) -> Result<BoxAsyncWrite> {
+            self.calls.lock().unwrap().push(format!("write {path}"));
+            self.inner.open_write(path, offset).await
+        }
+        async fn mkdir(&self, path: &RemotePath) -> Result<()> {
+            self.inner.mkdir(path).await
+        }
+        async fn rename(&self, from: &RemotePath, to: &RemotePath) -> Result<()> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("rename {from} {to}"));
+            self.inner.rename(from, to).await
+        }
+        async fn remove_file(&self, path: &RemotePath) -> Result<()> {
+            self.inner.remove_file(path).await
+        }
+        async fn remove_dir(&self, path: &RemotePath) -> Result<()> {
+            self.inner.remove_dir(path).await
+        }
+        async fn chmod(&self, path: &RemotePath, mode: u32) -> Result<()> {
+            self.inner.chmod(path, mode).await
+        }
+    }
+
+    let mem = MemFs::new();
+    mem.add_file("/srv/app.conf", b"old", UNIX_EPOCH);
+    mem.chmod(&rp("/srv/app.conf"), 0o640).await.unwrap();
+    let fs = Recording {
+        inner: mem.clone(),
+        calls: Mutex::new(Vec::new()),
+    };
+
+    put(
+        &fs,
+        &rp("/srv/app.conf"),
+        UploadMode::TempRename,
+        b"new text",
+    )
+    .await
+    .unwrap();
+    assert_eq!(mem.read_file("/srv/app.conf").unwrap(), b"new text");
+    let names: Vec<String> = mem
+        .list(&rp("/srv"))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    assert_eq!(names, ["app.conf"], "no temporary file left");
+    assert_eq!(
+        mem.stat(&rp("/srv/app.conf")).await.unwrap().mode,
+        Some(0o640)
+    );
+    {
+        let calls = fs.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "{calls:?}");
+        assert!(calls[0].starts_with("write /srv/.app.conf."), "{calls:?}");
+        assert!(calls[0].ends_with(".hoprs-upload"), "{calls:?}");
+        assert!(calls[1].ends_with(" /srv/app.conf"), "{calls:?}");
+    }
+
+    // A new file by temporary file and rename too.
+    put(&fs, &rp("/srv/new.txt"), UploadMode::TempRename, b"fresh")
+        .await
+        .unwrap();
+    assert_eq!(mem.read_file("/srv/new.txt").unwrap(), b"fresh");
+
+    fs.calls.lock().unwrap().clear();
+    put(&fs, &rp("/srv/app.conf"), UploadMode::InPlace, b"in place")
+        .await
+        .unwrap();
+    assert_eq!(mem.read_file("/srv/app.conf").unwrap(), b"in place");
+    assert_eq!(*fs.calls.lock().unwrap(), ["write /srv/app.conf"]);
+}
+
+/// `put`'s failures: a rename cut by the network leaves no temporary file behind and the
+/// file untouched; a `stat` error other than not-found is returned before anything is
+/// written; an in-place write that was cut says the file may be incomplete, a cut
+/// temporary file does not.
+#[tokio::test]
+async fn put_failures_clean_up_and_say_what_is_left() {
+    /// `MemFs` whose `rename` is cut by the network.
+    struct CutRename(MemFs);
+    #[async_trait]
+    impl RemoteFs for CutRename {
+        async fn list(&self, path: &RemotePath) -> Result<Vec<RemoteEntry>> {
+            self.0.list(path).await
+        }
+        async fn stat(&self, path: &RemotePath) -> Result<RemoteEntry> {
+            self.0.stat(path).await
+        }
+        async fn open_read(&self, path: &RemotePath, offset: u64) -> Result<BoxAsyncRead> {
+            self.0.open_read(path, offset).await
+        }
+        async fn open_write(&self, path: &RemotePath, offset: u64) -> Result<BoxAsyncWrite> {
+            self.0.open_write(path, offset).await
+        }
+        async fn mkdir(&self, path: &RemotePath) -> Result<()> {
+            self.0.mkdir(path).await
+        }
+        async fn rename(&self, _: &RemotePath, _: &RemotePath) -> Result<()> {
+            Err(Error::new(ErrorKind::Network, "Connection lost"))
+        }
+        async fn remove_file(&self, path: &RemotePath) -> Result<()> {
+            self.0.remove_file(path).await
+        }
+        async fn remove_dir(&self, path: &RemotePath) -> Result<()> {
+            self.0.remove_dir(path).await
+        }
+        async fn chmod(&self, path: &RemotePath, mode: u32) -> Result<()> {
+            self.0.chmod(path, mode).await
+        }
+    }
+
+    let mem = MemFs::new();
+    mem.add_file("/srv/app.conf", b"old", UNIX_EPOCH);
+    let cut = CutRename(mem.clone());
+    let failure = put(&cut, &rp("/srv/app.conf"), UploadMode::TempRename, b"new")
+        .await
+        .unwrap_err();
+    assert_eq!(failure.error.kind, ErrorKind::Network);
+    assert!(!failure.may_be_incomplete);
+    assert_eq!(mem.read_file("/srv/app.conf").unwrap(), b"old");
+    let names: Vec<String> = mem
+        .list(&rp("/srv"))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect();
+    assert_eq!(
+        names,
+        ["app.conf"],
+        "the orphaned temporary file is removed"
+    );
+
+    // A `stat` that fails with something else than not-found: nothing is written.
+    let fs = CountingFs::new(mem.clone());
+    fs.stat_failures.store(1, Ordering::SeqCst);
+    let failure = put(&fs, &rp("/srv/app.conf"), UploadMode::InPlace, b"new")
+        .await
+        .unwrap_err();
+    assert_eq!(failure.error.kind, ErrorKind::Network);
+    assert!(!failure.may_be_incomplete);
+    assert_eq!(fs.writes.load(Ordering::SeqCst), 0);
+    assert_eq!(mem.read_file("/srv/app.conf").unwrap(), b"old");
+
+    // An in-place write cut after the file was truncated.
+    *fs.cut_next_write.lock().unwrap() = Some(ErrorKind::Network);
+    let failure = put(&fs, &rp("/srv/app.conf"), UploadMode::InPlace, b"new")
+        .await
+        .unwrap_err();
+    assert!(failure.may_be_incomplete);
+    assert_eq!(mem.read_file("/srv/app.conf").unwrap(), b"");
+
+    // A temporary file cut by the network: the file itself is untouched.
+    mem.add_file("/srv/app.conf", b"old", UNIX_EPOCH);
+    *fs.cut_next_write.lock().unwrap() = Some(ErrorKind::Network);
+    let failure = put(&fs, &rp("/srv/app.conf"), UploadMode::TempRename, b"new")
+        .await
+        .unwrap_err();
+    assert!(!failure.may_be_incomplete);
+    assert_eq!(mem.read_file("/srv/app.conf").unwrap(), b"old");
+    assert_eq!(names_in(&mem, "/srv").await, ["app.conf"]);
+}
+
+async fn names_in(fs: &MemFs, path: &str) -> Vec<String> {
+    fs.list(&rp(path))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect()
+}

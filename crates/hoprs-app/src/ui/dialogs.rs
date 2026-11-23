@@ -43,6 +43,9 @@ pub struct Content {
     pub action: &'static str,
     /// A trust decision: Cancel is the default (white) button and Enter means Cancel.
     pub decision: bool,
+    /// An agent asked for this connection: one muted line says so. Information only; it
+    /// changes no button and no key.
+    pub by_agent: bool,
 }
 
 /// The content of `dialog`.
@@ -57,6 +60,7 @@ pub fn content(dialog: &Dialog) -> Content {
         save: dialog.can_save(),
         action: strings::connect(),
         decision: dialog.is_decision(),
+        by_agent: request.by_agent,
     };
     match &request.kind {
         PromptKind::HostKey {
@@ -183,6 +187,13 @@ pub fn view(dialog: &Dialog) -> Element<'_, Message> {
             .font(theme::INTER_SEMIBOLD)
     ]
     .spacing(theme::SPACE_SM);
+    if content.by_agent {
+        body = body.push(
+            text(strings::prompt_by_agent())
+                .size(theme::TEXT_SM)
+                .color(p.muted),
+        );
+    }
     if let Some(intro) = content.intro {
         body = body.push(text(intro).size(theme::TEXT_SM).color(p.ink_2));
     }
@@ -419,4 +430,79 @@ fn confirm<'a>(
         .padding(theme::SPACE_SM)
         .style(theme::outline_box)
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use hoprs_core::SiteId;
+    use hoprs_remote::{CertProblem, CertReason};
+
+    use super::*;
+    use crate::backend::broker::{PromptKind, PromptRequest};
+    use crate::backend::{BrokerEvent, PromptId, SessionId};
+
+    /// The content of the dialog the app shows for such a request.
+    fn shown(kind: PromptKind, by_agent: bool) -> Content {
+        let mut app = App::new();
+        app.update(Message::Prompt(BrokerEvent::Request(PromptRequest {
+            id: PromptId(1),
+            session: SessionId(1),
+            site: SiteId::new(),
+            key: "h:22".into(),
+            kind,
+            by_agent,
+        })));
+        content(app.dialogs.current.as_ref().expect("the dialog is shown"))
+    }
+
+    fn kinds() -> Vec<PromptKind> {
+        vec![
+            PromptKind::HostKey {
+                host: "h".into(),
+                port: 22,
+                key_type: "ssh-ed25519".into(),
+                fingerprint: "SHA256:x".into(),
+                other_key_types: Vec::new(),
+            },
+            PromptKind::Certificate {
+                host: "h".into(),
+                port: 21,
+                fingerprint: "SHA256:y".into(),
+                problem: CertProblem::Untrusted {
+                    reason: CertReason::UnknownIssuer,
+                },
+            },
+            PromptKind::Password {
+                user: "u".into(),
+                host: "h".into(),
+            },
+            PromptKind::Passphrase { path: "/k".into() },
+            PromptKind::KeyboardInteractive {
+                name: String::new(),
+                instructions: String::new(),
+                prompts: Vec::new(),
+            },
+        ]
+    }
+
+    #[test]
+    fn agent_dialogs_say_so() {
+        for kind in kinds() {
+            let flagged = shown(kind.clone(), true);
+            assert!(flagged.by_agent, "{kind:?}");
+            let plain = shown(kind.clone(), false);
+            assert!(!plain.by_agent, "{kind:?}");
+            // Information only: the buttons and the default are the same.
+            assert_eq!(
+                (
+                    flagged.action,
+                    flagged.decision,
+                    flagged.save,
+                    flagged.fields.len()
+                ),
+                (plain.action, plain.decision, plain.save, plain.fields.len()),
+                "{kind:?}"
+            );
+        }
+    }
 }

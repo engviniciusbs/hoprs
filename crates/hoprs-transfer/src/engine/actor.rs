@@ -25,12 +25,13 @@
 //! override a run consumed at dispatch, replaced by the policy that
 //! continues its copy once the copy is decided (`Resume`, or `Overwrite`
 //! when it replaces an existing file). Pausing, requeueing or recovering an
-//! item carries it forward; an item with none runs under the global policy
-//! (its destination was never opened for writing). A cancelled item keeps
-//! its continuation too, and a failed one that had one gets `Overwrite`
-//! instead (a failed write can leave stale bytes or holes below the
-//! destination's size), so `retry` never skips or appends to a partial
-//! destination.
+//! item carries it forward; an item with none runs under its tree policy
+//! (the policy its tree was enqueued with, inherited by every item of a
+//! folder), else the global policy (its destination was never opened for
+//! writing). A cancelled item keeps its continuation too, and a failed one
+//! that had one gets `Overwrite` instead (a failed write can leave stale
+//! bytes or holes below the destination's size), so `retry` never skips or
+//! appends to a partial destination.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -43,11 +44,12 @@ use tokio_util::sync::CancellationToken;
 use super::control::Control;
 use super::dirs::DirProgress;
 use super::worker::{self, Prepared, Route, WorkerMsg};
-use super::{EngineConfig, Event, EventKind, SiteEndpoints};
+use super::{EngineConfig, EnqueueOptions, Event, EventKind, LocalGuard, SiteEndpoints};
 use crate::conflict::{Decision, decide};
 use crate::copy::CopyOutcome;
 use crate::model::{
-    ConflictInfo, ConflictPolicy, Direction, TransferId, TransferItem, TransferSpec, TransferState,
+    ConflictInfo, ConflictPolicy, Direction, Origin, TransferId, TransferItem, TransferSpec,
+    TransferState,
 };
 use crate::progress::{ProgressTracker, ProgressUpdate};
 use crate::store::QueueStore;
@@ -82,8 +84,9 @@ pub(super) enum Command {
     },
     Enqueue {
         spec: TransferSpec,
-        /// Conflict policy for this item's own run, stored as its `next_policy`.
-        policy: Option<ConflictPolicy>,
+        /// `policy`: for this item's own run (stored as its `next_policy`)
+        /// and its tree's (stored as `tree_policy`).
+        options: EnqueueOptions,
         reply: oneshot::Sender<Result<TransferId>>,
     },
     SetPolicy {
@@ -132,8 +135,9 @@ pub(super) struct Running {
     pub(super) cancel: CancellationToken,
     pub(super) intent: Option<Intent>,
     /// Policy for the item's next run if this one is interrupted: the
-    /// override this run consumed, until the copy is decided; then the
-    /// policy that continues that copy. Mirrors the stored `next_policy`.
+    /// override this run consumed (unless it is only the item's tree
+    /// policy), until the copy is decided; then the policy that continues
+    /// that copy. Mirrors the stored `next_policy`.
     pub(super) retry: Option<ConflictPolicy>,
     /// The copy phase has started (`prepare` is over).
     pub(super) copying: bool,
@@ -266,6 +270,8 @@ pub(super) struct Actor {
     /// The last item that started writing each destination. An item's stored
     /// continuation is dropped when someone else wrote its destination since.
     pub(super) last_writer: HashMap<DestKey, TransferId>,
+    /// Checked before every run of an item of `Origin::Agent`.
+    pub(super) agent_guard: Option<LocalGuard>,
     pub(super) worker_tx: mpsc::UnboundedSender<WorkerMsg>,
 }
 
@@ -299,6 +305,7 @@ pub(super) async fn run(
         roots: HashMap::new(),
         writing: HashMap::new(),
         last_writer: HashMap::new(),
+        agent_guard: config.agent_guard,
         worker_tx,
     };
     let mut ticker = tokio::time::interval(actor.progress_interval);
@@ -364,10 +371,10 @@ impl Actor {
             }
             Command::Enqueue {
                 spec,
-                policy,
+                options: EnqueueOptions { policy, origin },
                 reply,
             } => {
-                let id = match self.store.insert(None, &spec) {
+                let id = match self.store.insert_with(None, &spec, policy, origin) {
                     Ok(id) => id,
                     Err(e) => {
                         let _ = reply.send(Err(e));
@@ -384,6 +391,8 @@ impl Actor {
                     size: None,
                     bytes_done: 0,
                     state: TransferState::Queued,
+                    origin,
+                    tree_policy: policy,
                 });
                 if let Some(policy) = policy {
                     // Persisted like any continuation, so it survives a restart
@@ -626,6 +635,11 @@ impl Actor {
                 };
                 let route = Route::new(&item.spec, &site.endpoints);
                 let key = dest_key(&item.spec);
+                let tree_policy = item.tree_policy;
+                let guard = match (item.origin, &self.agent_guard) {
+                    (Origin::Agent, Some(guard)) => Some((guard.clone(), item.spec.local.clone())),
+                    _ => None,
+                };
                 if !self.transition(id, TransferState::Active) {
                     continue;
                 }
@@ -634,7 +648,7 @@ impl Actor {
                 // start over) belongs to this item's own earlier copy. If another item
                 // wrote the destination since, continuing would build on (or replace
                 // without asking) that item's file: drop it, so this run gets a fresh
-                // conflict check under the queue's policy.
+                // conflict check under its tree's policy, else the queue's.
                 let superseded = self.last_writer.get(&key).is_some_and(|w| *w != id);
                 let stored = if superseded && policy_override.is_some() {
                     policy_override = None;
@@ -661,15 +675,28 @@ impl Actor {
                     Running {
                         cancel: cancel.clone(),
                         intent: None,
-                        retry: policy_override,
+                        // The item's own tree policy is what it runs under
+                        // anyway: not a continuation, so a failure before the
+                        // copy is decided keeps it (a `Skip` never becomes
+                        // `Overwrite`). `Resume` always is one.
+                        retry: policy_override
+                            .filter(|p| Some(*p) != tree_policy || *p == ConflictPolicy::Resume),
                         copying: false,
                     },
                 );
-                let policy = policy_override.unwrap_or(self.policy);
+                let policy = policy_override.or(tree_policy).unwrap_or(self.policy);
                 let fresh_dst = self.fresh_dst.remove(&id);
                 // A count left from the previous run must not follow this run's own.
                 self.final_progress.retain(|u| u.id != id);
-                worker::spawn_prepare(id, route, policy, fresh_dst, cancel, self.worker_tx.clone());
+                worker::spawn_prepare(
+                    id,
+                    route,
+                    policy,
+                    fresh_dst,
+                    guard,
+                    cancel,
+                    self.worker_tx.clone(),
+                );
             }
         }
     }
@@ -707,8 +734,9 @@ impl Actor {
     /// one. That covers a copy that was decided (its destination was, or
     /// may have been, opened), and also a run that only consumed an
     /// override (a stored continuation, or a user `resolve`) and failed
-    /// before the copy was decided. A run without one keeps no
-    /// continuation, so a retry uses the global policy. (A `Cancelled` item
+    /// before the copy was decided. A run without one (also one whose
+    /// override was only its tree policy) keeps its stored policy, so a
+    /// retry uses its tree policy, else the global policy. (A `Cancelled` item
     /// is not handled here: it keeps its own continuation, `Resume`, or
     /// `Overwrite` when the run was replacing an existing file.) Returns
     /// `error`, with a store error in its detail.
@@ -797,6 +825,8 @@ impl Actor {
                     (Ok(Prepared::Symlink), None) => {
                         self.release(id, TransferState::Skipped(SYMLINK_SKIP.to_string()))
                     }
+                    // Whatever its kind (never a network pause): the item failed.
+                    (Ok(Prepared::Refused(e)), None) => self.release(id, TransferState::Failed(e)),
                     // Only a control command or shutdown cancels the token.
                     (Ok(Prepared::Stopped), None) => self.release_stopped(id, None),
                     (Err(e), None) if e.kind == ErrorKind::Network => self.network_requeue(id, e),

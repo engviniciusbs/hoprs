@@ -542,3 +542,33 @@ fn empty_host_and_port_zero_are_skipped() {
     );
     assert!(vault.sites().is_empty());
 }
+
+#[test]
+fn imported_sites_have_no_agent_access() {
+    let (_dir, _store, mut vault) = open();
+    let report = apply(&mut vault, parsed("sitemanager-3.66.xml"), &FLAT).unwrap();
+    assert!(!report.imported.is_empty());
+    assert!(
+        vault
+            .sites()
+            .iter()
+            .all(|s| s.agent_access == hoprs_core::AgentAccess::None)
+    );
+
+    // A site the user opened up in between keeps its level on a second import.
+    let mut shell = vault
+        .sites()
+        .iter()
+        .find(|s| s.name == "Shell")
+        .unwrap()
+        .clone();
+    shell.agent_access = hoprs_core::AgentAccess::All;
+    vault.upsert_site(shell.clone()).unwrap();
+    apply(&mut vault, parsed("sitemanager-3.66.xml"), &FLAT).unwrap();
+    assert_eq!(
+        vault.site(&shell.id).unwrap().agent_access,
+        hoprs_core::AgentAccess::All
+    );
+    let others = vault.sites().iter().filter(|s| s.id != shell.id);
+    assert!(others.into_iter().all(|s| s.agent_access.is_none()));
+}
