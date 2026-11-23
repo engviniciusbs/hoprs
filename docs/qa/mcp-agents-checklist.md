@@ -72,10 +72,12 @@ a running call; hoprs not running; an unknown host key raised by an agent (the d
 its "An agent asked for this connection." line, the two-minute wait, the answer while a call
 waits). The indicator, the queue tag and the sidebar mark were seen in screenshots.
 
-What it does not replace: a real Claude Code session, macOS and Windows, a normal window
+What it does not replace: an interactive Claude Code session, macOS and Windows, a normal window
 close, FTP sites, a changed host key, password and passphrase prompts, a version mismatch,
 the limits on relays and calls, the idle close. The NEEDS HUMAN rows below keep their
 status; rows 1 and 2 stay required before the 1.6.0 tag.
+
+A real Claude Code session ran on Linux on 2026-11-22 (Claude Code 2.1.330, headless `claude -p` with an MCP configuration in the JSON shape, the relay started inside the test container) connected to `hoprs mcp`, saw the thirteen tools and completed: list_sites (the no-access site absent), list_directory, read_file, make_directory, write_file and reading it back, run_command (`uname -a`, exit 0), write_file on the read-only site refused with the level's sentence, download and transfer_status (done; the file's content verified), and a download into `~/.ssh` refused with the protected-path sentence; the app logged one line per action. Still never run: registering with `claude mcp add` and the command copied from Settings, an interactive session, macOS and Windows. Rows 1 and 2 stay open: they are not marked passed.
 
 ## NEEDS HUMAN
 

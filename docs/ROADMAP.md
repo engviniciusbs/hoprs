@@ -3,7 +3,7 @@
 What is planned, roughly in order, and where help is most welcome. Plans change; the
 [issues](https://github.com/engviniciusbs/hoprs/issues) and
 [discussions](https://github.com/engviniciusbs/hoprs/discussions) are where they get decided.
-Released work is in the [CHANGELOG](../CHANGELOG.md): 1.6.0 (coming) adds the export of one
+Released work is in the [CHANGELOG](../CHANGELOG.md): 1.6.0 (2026-11-23) added the export of one
 site or one workspace, as a partial file that restores with Merge, and an MCP server so coding
 agents can work on the sites you allow (`hoprs mcp`, a level per site); 1.5.0 (2026-11-18) added the app in
 Turkish (a contributed translation); 1.4.0 (2026-11-17) added the update

@@ -1,6 +1,6 @@
 # Changelog
 
-## 1.6.0 — unreleased
+## 1.6.0 — 2026-11-23
 
 You can export one site or one workspace, not only everything.
 
@@ -18,6 +18,7 @@ Coding agents can work on your saved sites.
 - An agent can be misled by what it reads, and hoprs does not review its actions: keep production sites on "Allow reading" unless the agent really must change them.
 - A file sent from the compare panel with Overwrite now replaces a file another transfer wrote after it was queued; before, hoprs asked.
 - A queue file written by this version is refused by hoprs 1.5.0 and older, which then run on an empty in-memory queue.
+- File sizes from 1000 to 1023 now have the thousands separator like the other numbers (`1,023 B`; `1.023 KB` in Portuguese and Turkish), by Emre Öcel ([@emreocell](https://github.com/emreocell), #43).
 
 ## 1.5.0 — 2026-11-18
 

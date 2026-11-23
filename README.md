@@ -26,7 +26,7 @@ click) and puts a terminal, a two-pane file browser, folder compare and a persis
 transfer queue behind it, in one quiet window that opens in under 100 ms and idles at about
 33 MB.
 
-- **Version:** 1.5.0 ([changelog](CHANGELOG.md))
+- **Version:** 1.6.0 ([changelog](CHANGELOG.md))
 - **Platforms:** Linux (Ubuntu 24.04 or newer, amd64), macOS 11 or newer (Apple Silicon and Intel), Windows 10 or newer (x64).
 - **Languages:** English, Brazilian Portuguese and Turkish.
 - **License:** MIT OR Apache-2.0
@@ -118,32 +118,32 @@ Every release has these files on the
 
 | System | File |
 |---|---|
-| Linux (Ubuntu 24.04 or newer, amd64) | `hoprs_1.5.0-1_amd64.deb` |
-| macOS 11 or newer, Apple Silicon and Intel | `hoprs_1.5.0_macos_universal.dmg` |
-| Windows 10 or newer, x64 (installer, per machine) | `hoprs_1.5.0_windows_x64.msi` |
-| Windows 10 or newer, x64 (portable) | `hoprs_1.5.0_windows_x64.zip` |
+| Linux (Ubuntu 24.04 or newer, amd64) | `hoprs_1.6.0-1_amd64.deb` |
+| macOS 11 or newer, Apple Silicon and Intel | `hoprs_1.6.0_macos_universal.dmg` |
+| Windows 10 or newer, x64 (installer, per machine) | `hoprs_1.6.0_windows_x64.msi` |
+| Windows 10 or newer, x64 (portable) | `hoprs_1.6.0_windows_x64.zip` |
 
 The macOS and Windows builds are **not signed** with a paid certificate (see the steps
 below), so each system warns once on first launch.
 
 ### Linux: the `.deb` (recommended)
 
-1. Download `hoprs_1.5.0-1_amd64.deb` and `SHA256SUMS`.
+1. Download `hoprs_1.6.0-1_amd64.deb` and `SHA256SUMS`.
 2. Check the download and install it:
 
    ```sh
    sha256sum -c SHA256SUMS --ignore-missing
-   sudo apt install ./hoprs_1.5.0-1_amd64.deb
+   sudo apt install ./hoprs_1.6.0-1_amd64.deb
    ```
 
-   Expected output of the first command: `hoprs_1.5.0-1_amd64.deb: OK`. `apt` installs the
+   Expected output of the first command: `hoprs_1.6.0-1_amd64.deb: OK`. `apt` installs the
    libraries hoprs needs (Wayland, X11, Vulkan/EGL loaders, D-Bus).
 
 3. Start hoprs from the app menu, or run:
 
    ```sh
    hoprs             # opens the window
-   hoprs --version   # prints "hoprs 1.5.0"
+   hoprs --version   # prints "hoprs 1.6.0"
    hoprs --help
    ```
 
@@ -152,7 +152,7 @@ and exits.
 
 ### macOS: the `.dmg`
 
-1. Download `hoprs_1.5.0_macos_universal.dmg` and `SHA256SUMS`, and check it:
+1. Download `hoprs_1.6.0_macos_universal.dmg` and `SHA256SUMS`, and check it:
 
    ```sh
    shasum -a 256 -c SHA256SUMS --ignore-missing
@@ -177,11 +177,11 @@ The `.dmg` is one universal build for Apple Silicon and Intel Macs.
 
 ### Windows: the `.msi` or the `.zip`
 
-1. Download `hoprs_1.5.0_windows_x64.msi` (or the portable `hoprs_1.5.0_windows_x64.zip`)
+1. Download `hoprs_1.6.0_windows_x64.msi` (or the portable `hoprs_1.6.0_windows_x64.zip`)
    and `SHA256SUMS`. In PowerShell, compare the hash with the line in `SHA256SUMS`:
 
    ```powershell
-   (Get-FileHash .\hoprs_1.5.0_windows_x64.msi -Algorithm SHA256).Hash
+   (Get-FileHash .\hoprs_1.6.0_windows_x64.msi -Algorithm SHA256).Hash
    ```
 
 2. Run the `.msi`. It installs per machine (it asks for administrator rights) and adds a
@@ -631,7 +631,7 @@ The binary ends up in `target/release/hoprs`.
 
 ```sh
 scripts/package-deb.sh                                              # needs Docker
-scripts/check-deb.sh target/deb-ubuntu-24.04/debian/hoprs_1.5.0-1_amd64.deb
+scripts/check-deb.sh target/deb-ubuntu-24.04/debian/hoprs_1.6.0-1_amd64.deb
 ```
 
 `package-deb.sh` builds inside an Ubuntu 24.04 container pinned by digest, with
