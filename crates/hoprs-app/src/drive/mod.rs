@@ -90,6 +90,10 @@ impl fmt::Debug for Sealed {
 /// How long before its end an access token is no longer used.
 const TOKEN_MARGIN: Duration = Duration::from_secs(60);
 
+/// The longest an access token is trusted, whatever `expires_in` says (it also keeps
+/// the deadline from overflowing).
+const TOKEN_LIFE_MAX: Duration = Duration::from_secs(24 * 60 * 60);
+
 fn not_configured() -> Error {
     Error::coded(
         ErrorKind::NotFound,
@@ -106,7 +110,9 @@ struct Access {
 
 impl Access {
     fn new(token: SecretString, expires_in: u64) -> Access {
-        let life = Duration::from_secs(expires_in).saturating_sub(TOKEN_MARGIN);
+        let life = Duration::from_secs(expires_in)
+            .min(TOKEN_LIFE_MAX)
+            .saturating_sub(TOKEN_MARGIN);
         Access {
             token,
             until: Instant::now() + life,
@@ -468,6 +474,14 @@ impl fmt::Debug for Drive {
 mod tests {
     use super::*;
     use crate::test_https::{Answer, Seen, answer, identity, serve};
+
+    #[test]
+    fn a_huge_expires_in_does_not_panic() {
+        for expires_in in [u64::MAX, u64::MAX / 2, 1 << 40, 3600, 0] {
+            let access = Access::new(SecretString::from("t"), expires_in);
+            assert_eq!(access.fresh(), expires_in > 60, "{expires_in}");
+        }
+    }
     use hoprs_core::{ErrorKind, Result as CoreResult};
     use hoprs_vault::{AppSecret, MemoryStore};
     use percent_encoding::percent_decode_str;
