@@ -184,6 +184,7 @@ ${systems.map((os) => `- [${downloads[os].name} ${downloads[os].ext}](${download
 ## Features
 
 - ${t.connection.lead}
+- ${t.agents.lead} ${t.agents.note} ${facts.agentsDocUrl}
 - SSH with a terminal; files over SFTP, FTP and FTPS (explicit and implicit). Plain FTP is allowed and labelled ftp (unencrypted).
 - Passwords are kept in the system keyring: Secret Service on Linux, Keychain on macOS, Credential Manager on Windows. Site files hold no secrets.
 - No accounts and no data collection: it talks only to the servers you add.

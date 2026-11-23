@@ -40,6 +40,19 @@ export const ptBr: Dict = {
     shotAlt:
       "Aba de terminal do hoprs na mesma conexão SSH, mostrando ls -la da pasta do projeto no servidor enquanto o upload continua na fila embaixo.",
   },
+  agents: {
+    title: "Seu agente, nos sites que você permitir.",
+    lead: "O hoprs é um servidor MCP. O Claude Code e outros agentes de código podem listar pastas, ler e escrever arquivos, rodar comandos e transferir arquivos nos seus sites salvos, enquanto o hoprs guarda as senhas.",
+    commandComment: "Configurações › Agentes (MCP) mostra este comando com o seu caminho",
+    levelsLabel: "Níveis de acesso, escolhidos por site",
+    levels: [
+      { name: "Sem acesso", note: "o padrão: o agente não vê o site" },
+      { name: "Permitir leitura", note: "listar pastas, ler arquivos, baixar" },
+      { name: "Permitir tudo", note: "escrever, apagar, enviar, rodar comandos" },
+    ],
+    note: "Vem desligado. O hoprs precisa estar aberto, e o log dele mostra o que o agente faz. O que um agente lê vai para onde esse agente enviar.",
+    how: "Como funciona",
+  },
   filezilla: {
     title: "Seus sites do FileZilla vêm junto.",
     label: "O que muda quando você troca o FileZilla pelo hoprs",

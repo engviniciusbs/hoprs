@@ -38,6 +38,19 @@ export const en = {
     shotAlt:
       "hoprs terminal tab on the same SSH connection, showing ls -la of the project folder on the server while the upload keeps running in the queue below.",
   },
+  agents: {
+    title: "Your agent, on the sites you allow.",
+    lead: "hoprs is an MCP server. Claude Code and other coding agents can list folders, read and write files, run commands and move files on your saved sites, while hoprs keeps the passwords.",
+    commandComment: "Settings › Agents (MCP) shows this command with your path",
+    levelsLabel: "Access levels, chosen per site",
+    levels: [
+      { name: "No access", note: "the default: the agent does not see the site" },
+      { name: "Allow reading", note: "list folders, read files, download" },
+      { name: "Allow everything", note: "write, delete, upload, run commands" },
+    ],
+    note: "Off by default. hoprs must be open, and its log shows what the agent does. What an agent reads goes wherever that agent sends it.",
+    how: "How it works",
+  },
   filezilla: {
     title: "Your FileZilla sites, kept.",
     label: "What changes when you move from FileZilla to hoprs",
