@@ -12,7 +12,7 @@ it.each(langs)("%s: the agents section has the command, the three levels and the
   const section = screen.getByRole("heading", { level: 2, name: t.title }).closest("section")!;
   expect(section.getAttribute("aria-labelledby")).toBe("agents-title");
   expect(section.textContent).toContain(t.lead);
-  expect(section.querySelector("code")!.textContent).toContain("claude mcp add hoprs -- /usr/bin/hoprs mcp");
+  expect(section.querySelector("code")!.textContent).toContain('claude mcp add hoprs -- "/usr/bin/hoprs" mcp');
   expect(section.querySelector("code")!.textContent).toContain(t.commandComment);
   const items = within(within(section).getByRole("list", { name: t.levelsLabel })).getAllByRole("listitem");
   expect(items).toHaveLength(3);

@@ -14,7 +14,7 @@ export default function Agents() {
         </span>
         <code>
           <span className="out-note"># {t.commandComment}</span>
-          {"\n"}claude mcp add hoprs -- /usr/bin/hoprs mcp
+          {"\n"}claude mcp add hoprs -- "/usr/bin/hoprs" mcp
         </code>
       </pre>
       <ul className="well out agents-levels" aria-label={t.levelsLabel}>
