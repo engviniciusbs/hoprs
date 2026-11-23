@@ -249,6 +249,8 @@ pub struct App {
     /// The keyring could not be read (or the entry deleted): the next pick of the Google
     /// Drive destination reads it again.
     drive_unreadable: bool,
+    /// The id of the latest Connect; its events carry it, others are dropped.
+    drive_attempt: u64,
     /// Advances while something runs without a known end (import, backup): drives the
     /// indeterminate progress bar.
     pub busy_phase: u32,
@@ -768,9 +770,13 @@ pub enum Effect {
     DriveStatus,
     /// Signs in to Google Drive through the browser; its events come back as
     /// [`ExportMsg::Connecting`].
-    DriveConnect,
-    /// Ends the wait of a running connect (no message: its `Done` says it).
-    DriveCancel,
+    DriveConnect {
+        attempt: u64,
+    },
+    /// Ends the wait of the connect `attempt` (no message: its `Done` says it).
+    DriveCancel {
+        attempt: u64,
+    },
     /// Disconnects Google Drive; back as [`ExportMsg::Disconnected`].
     DriveDisconnect,
     /// Seals the encrypted backup of `scope` in memory; back as [`ExportMsg::SealDone`].
@@ -944,6 +950,7 @@ impl App {
             agent_exe: std::env::current_exe().ok(),
             drive_link: export::DriveLink::Unknown,
             drive_error: None,
+            drive_attempt: 0,
             drive_unreadable: false,
             busy_phase: 0,
             window_width: INITIAL_WINDOW_WIDTH,
@@ -1059,6 +1066,7 @@ impl App {
         // A menu item chosen becomes the action's own message too.
         let msg = self.menu_command(msg);
         let shown = self.shown_tab();
+        let export_was_shown = self.export_shown();
         let active = self.active_tab;
         let user = reconnect::is_user_action(&msg);
         let mut effects = self.apply(msg);
@@ -1108,7 +1116,7 @@ impl App {
             self.editor_input = None;
         }
         // The same for the export screen's: a flow that does not run goes with it.
-        effects.extend(self.export_left());
+        effects.extend(self.export_left(export_was_shown));
         // The center shows another tab (or Settings, or a form): a menu about what it
         // showed goes.
         if self.shown_tab() != shown {

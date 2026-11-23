@@ -349,10 +349,12 @@ pub trait BackendApi: Send + Sync {
     /// once). `None`: not connected.
     async fn drive_status(&self) -> Result<Option<DriveAccount>>;
     /// Signs in through the browser (see [`Drive::connect`]): `Waiting { url }`, then
-    /// exactly one `Done`, last. `pages` are the texts the browser sees afterwards.
-    fn drive_connect(&self, pages: Pages) -> BoxStream<'static, ConnectEvent>;
-    /// Ends the wait of a running connect (its `Done` is `drive-connect-cancelled`).
-    fn drive_cancel(&self);
+    /// exactly one `Done`, last. `attempt` is the app's id of this Connect (rising);
+    /// `pages` are the texts the browser sees afterwards.
+    fn drive_connect(&self, attempt: u64, pages: Pages) -> BoxStream<'static, ConnectEvent>;
+    /// Ends the wait of the connect `attempt` (its `Done` is `drive-connect-cancelled`),
+    /// also when it has not begun to wait yet.
+    fn drive_cancel(&self, attempt: u64);
     /// Revokes the connection at Google (a failure is only logged) and deletes it here.
     async fn drive_disconnect(&self) -> Result<()>;
     /// Seals the encrypted backup of `scope` in memory (like
@@ -1192,16 +1194,16 @@ impl BackendApi for Backend {
         blocking(move || drive.status()).await
     }
 
-    fn drive_connect(&self, pages: Pages) -> BoxStream<'static, ConnectEvent> {
+    fn drive_connect(&self, attempt: u64, pages: Pages) -> BoxStream<'static, ConnectEvent> {
         let drive = self.drive.clone();
         blocking_stream(
-            move |send| drive.connect(&pages, send),
+            move |send| drive.connect(attempt, &pages, send),
             |err| ConnectEvent::Done(Err(err)),
         )
     }
 
-    fn drive_cancel(&self) {
-        self.drive.cancel();
+    fn drive_cancel(&self, attempt: u64) {
+        self.drive.cancel(attempt);
     }
 
     async fn drive_disconnect(&self) -> Result<()> {
@@ -2227,7 +2229,7 @@ mod tests {
             connected: "c".into(),
             failed: "f".into(),
         };
-        let events: Vec<_> = backend.drive_connect(pages).collect().await;
+        let events: Vec<_> = backend.drive_connect(1, pages).collect().await;
         assert!(
             matches!(events.as_slice(), [crate::drive::ConnectEvent::Done(Err(err))] if err.code == code),
             "{events:?}"
@@ -2237,7 +2239,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code, code);
-        backend.drive_cancel();
+        backend.drive_cancel(1);
     }
 
     /// Every export outcome reaches the log (INFO done, WARN failed, with the scope kind

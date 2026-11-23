@@ -585,7 +585,7 @@ pick-restore = Bir hoprs yedeği seçin
 export-done = { $sites }, { $workspaces } ve { $secrets } dışa aktarıldı.
 drive-name-required = Dosya için bir ad girin
 # The pages the browser shows after connecting to Google Drive.
-drive-page-connected = hoprs bağlandı. Bu sekmeyi kapatabilirsiniz.
+drive-page-connected = Google yanıtı hoprs'a gönderdi. Sonucu görmek için hoprs'a dönün; bu sekmeyi kapatabilirsiniz.
 drive-page-failed = hoprs bağlanamadı. hoprs'a dönüp yeniden deneyin.
 export-destination = Hedef
 export-destination-file = Bu bilgisayarda bir dosya

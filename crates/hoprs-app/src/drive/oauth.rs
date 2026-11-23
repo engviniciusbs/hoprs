@@ -19,7 +19,7 @@ const ENCODE: &AsciiSet = &NON_ALPHANUMERIC
     .remove(b'~');
 
 /// The longest request line the parser looks at (Google's codes are far shorter).
-const MAX_REQUEST_LINE: usize = 4096;
+pub(super) const MAX_REQUEST_LINE: usize = 4096;
 
 /// The error of anything that goes wrong while connecting that has no better key; the
 /// cause goes into the detail (never a code, state or token).
