@@ -75,3 +75,105 @@ sites and saved tabs. Run a debug or release build of this branch: `cargo run -p
    backup version" and the vault is untouched (same sites, workspaces and passwords).
 9. **Full backup on 1.5.0.** Export everything with this build and restore it with hoprs
    1.5.0, once with Merge and once with Replace: both work as they did for a 1.5.0 backup.
+
+## Google Drive destination (2026-11-23)
+
+Behaviour as of pull request #48 (`drive-enable`). Nothing here needs a Google account except
+the rows under "End-to-end run" and "NEEDS HUMAN (Google Drive)".
+
+| Check | Result |
+| --- | --- |
+| The OAuth client needs both values, an empty value counts as unset, run-time values count only in a debug build; the only scope is `drive.file`; the endpoints are Google's or those under `HOPRS_DRIVE_URL` (`https://` only) | Pass: `client_needs_both_values`, `run_time_values_only_in_debug`, `only_the_drive_file_scope`, `endpoints_under_a_base` |
+| PKCE (RFC 7636), a different `state` and verifier each time, the authorisation URL has exactly its parameters, the callback parser, no code in `Debug` | Pass: `pkce_matches_rfc_7636`, `state_and_verifier_differ_each_time`, `auth_url_has_exactly_the_parameters`, `callback_parser`, `callback_debug_hides_the_code` |
+| The loopback listener binds `127.0.0.1` only; a right `state` with a code returns it, with an error is "denied"; a stray request, a wrong `state`, junk, a silent connection or a connection that falls over do not end the wait; a request head far over 8 KiB (large cookies) still connects; a long request line is refused; Cancel and the time-out free the port | Pass: `good_callback_returns_the_code_and_the_page`, `denied_callback_fails_with_the_failed_page`, `stray_requests_do_not_end_the_wait`, `connections_that_fall_over_do_not_end_the_wait`, `a_big_request_head_does_not_matter`, `a_long_request_line_is_refused`, `cancel_and_timeout_free_the_port`, `only_a_broken_listener_ends_the_wait`, `the_returned_code_is_not_in_debug_output`, `pages_escape_their_text` |
+| The client: the PKCE form, refresh and revoke, the `hoprs` folder found or created with an exact query, the multipart upload, an unsafe view link left out, unexpected answers are errors, no redirect is followed, a token goes only to its own endpoint, a file over 5 MB is refused without a request | Pass: `exchange_sends_the_pkce_form`, `refresh_and_revoke`, `folder_is_found_or_created`, `folder_query_is_exact`, `upload_sends_metadata_and_bytes`, `unsafe_view_link_is_left_out`, `unexpected_answers_are_errors_not_panics`, `redirects_are_refused`, `tokens_go_only_to_their_endpoint`, `upload_over_five_megabytes_is_refused_without_a_request` |
+| The connection: one keyring entry holds the refresh token and the email; with the keyring down the connection lasts for the session; an unreadable keyring is an error and is asked again; status reads the keyring only when asked; a missing or garbage entry is "not connected"; an upload refreshes, finds the folder, uploads; a refused refresh drops the connection; Disconnect revokes and deletes | Pass: `connect_stores_token_and_email_in_one_entry`, `keyring_down_keeps_the_connection_for_the_session`, `unreadable_keyring_is_an_error_and_is_asked_again`, `status_reads_the_keyring_only_when_asked`, `missing_or_garbage_entry_is_not_connected`, `upload_refreshes_then_finds_the_folder_and_uploads`, `refused_refresh_drops_the_connection`, `disconnect_revokes_and_deletes` |
+| Cancel ends the wait of its own attempt only, early or late | Pass: `cancel_ends_the_wait`, `ids_decide_which_attempt_is_current`, `cancel_touches_only_its_own_attempt`, `a_cancel_before_the_attempt_registered_ends_it`, `a_late_earlier_attempt_does_not_cancel_the_current_one` |
+| No token, code, verifier or client secret in `Debug` or in an error | Pass: `nothing_secret_in_debug_or_errors` |
+| A build without a client: every call answers `drive-not-configured`; the export screen offers no Destination | Pass: `not_configured_answers_every_call`, `drive_calls_without_a_client`, `drive_is_not_offered_without_a_client` |
+| The keyring entry is service `hoprs/google-drive`, account `refresh-token` | Pass: `app_secret_names` |
+| `settings.toml` holds `google_drive = true` only when set, ignores a value that is not a boolean, keeps unknown keys | Pass: `google_drive_marker_roundtrip_and_invalid` |
+| The flow: connect waits then connects; a second Connect click is ignored; export seals then uploads; a failed upload offers Try again and Save to this computer; a refused authorisation asks to connect again and clears the marker; one export at a time; Disconnect clears the marker; a stale marker is cleared when the entry is gone | Pass: `connect_waits_then_connects`, `second_connect_click_is_ignored`, `export_to_drive_seals_then_uploads`, `upload_failure_offers_try_again_and_save`, `refused_authorisation_asks_to_connect_again`, `one_export_at_a_time_for_drive_too`, `disconnect_clears_the_marker`, `stale_marker_is_cleared_when_the_entry_is_gone` |
+| Opening the form never reads the keyring; an unreadable keyring is asked again on the next pick | Pass: `opening_the_form_never_reads_the_keyring`, `unreadable_keyring_is_asked_again` |
+| A connection that is stored sets the marker; one held for this session only sets none and leaves an existing one | Pass: `a_session_only_connection_sets_no_marker`, `a_session_only_connect_keeps_an_existing_marker` |
+| The name field must not be empty; the form's messages and effects reach the backend | Pass: `drive_messages_from_the_user`, `drive_effects_reach_the_backend`, `submit_does_nothing_after_an_upload_or_a_local_save`, `a_failed_upload_can_be_submitted_again`, `drive_error_goes_when_the_form_is_left` |
+| The form's Drive row and outcome per state; nothing of Drive under the File destination | Pass: `drive_row_per_link`, `drive_outcome_per_state`, `no_drive_row_for_the_file_destination`, `the_file_destination_shows_nothing_of_a_drive_outcome` |
+| Settings → Backup shows the line from the marker or a live connection, only in a build with Drive; a failure shows without the marker | Pass: `drive_line_follows_the_marker_and_the_build`, `drive_line_also_follows_a_live_connection`, `drive_error_shows_without_the_marker_but_only_in_a_drive_build` |
+| Every new text in English, pt-BR and Turkish | Pass: `every_en_key_is_used`, `same_keys_and_variables_in_both_languages`, `error_codes_exist_in_both_catalogs`, `pt_br_values_differ_from_english`, `tr_values_differ_from_english` |
+
+## Google Drive: end-to-end run (2026-11-23, not in CI)
+
+What ran: hoprs's own `drive` module, driven from a test harness with an in-memory secret
+store, on Linux, against the real Google project (app in production, brand verified, a Desktop
+app OAuth client, the single scope `drive.file`).
+
+What it did **not** go through: the app's window, a release build, the system keyring, macOS
+or Windows. Every row below that depends on one of these stays NEEDS HUMAN.
+
+Result:
+
+- The consent screen showed the app name `hoprs` and the permission "See, edit, create, and
+  delete only the specific Google Drive files you use with this app". It showed **no**
+  unverified-app warning. It also showed an informational box about missing Privacy Policy or
+  Terms of Service links; hoprs has no terms page.
+- The token exchange returned a refresh token. The account's email was readable (`about.get`
+  answers under `drive.file`), so the form can show it.
+- Three uploads went into the `hoprs` folder, one of them after a token refresh.
+- Disconnect revoked the access at Google.
+
+## NEEDS HUMAN (Google Drive)
+
+Use a release build or a build with `HOPRS_GOOGLE_CLIENT_ID` and `HOPRS_GOOGLE_CLIENT_SECRET`
+set, and a real Google account. Do each row on Linux, macOS and Windows unless it says
+otherwise. Use a vault with a site that has a saved password.
+
+1. **Connect.** Right-click a site, Export…, Destination "Google Drive", "Connect to Google
+   Drive…". The browser opens on Google's consent screen: app name `hoprs`, only "See, edit,
+   create, and delete only the specific Google Drive files you use with this app". (The run
+   above saw no unverified-app screen, only an informational box about missing Privacy Policy
+   or Terms links: note whether that is still so, and with which account type.) After allowing,
+   the browser tab says "Google sent the answer to hoprs. Go back to hoprs to see the result;
+   you can close this tab." and hoprs shows the account (its email, or "Connected"). Do it
+   with Português and Türkçe too (the tab's page is in the app's language).
+2. **Export and find the file.** Type the password twice and Export. The screen says
+   "Uploaded to Google Drive: …". In Drive there is a folder `hoprs` holding the file. "Open in
+   Drive" opens it in the browser.
+3. **Restore.** Download the file from Drive, and on a machine with other sites restore it with
+   Settings → Backup → Restore backup… and Merge: the site is added and its password works.
+   Replace is refused for a partial file.
+4. **A second export** the same day, with the same name, gives a second file (nothing is
+   overwritten).
+5. **Cancel and no browser.** Click Connect, then Cancel: the wait ends. Click Connect again
+   with no browser (for example `BROWSER=true` or no default browser) and use "Copy the link":
+   pasting it in a browser continues the connection. Leave one connect unanswered for 5
+   minutes: "The browser did not answer in 5 minutes" (Linux is enough).
+6. **Offline.** Disconnect the network, Export: an error shows inline and the screen offers
+   "Try again" and "Save to this computer…". Reconnect, "Try again" uploads; or save to this
+   computer and restore the saved file.
+7. **A file over 5 MB** (a vault with a few large saved key files is enough, or a debug build
+   with a smaller limit): the upload fails with "Could not upload to Google Drive" and "Save to
+   this computer…" works (Linux is enough).
+8. **Disconnect** in the export screen, and again in Settings → Backup (connect first): the
+   keyring entry goes, `settings.toml` loses `google_drive`, and the app disappears from
+   <https://myaccount.google.com/permissions>.
+9. **Revoked at Google.** Connect, remove hoprs at
+   <https://myaccount.google.com/permissions>, Export: the error "Not connected to Google
+   Drive" shows, Connect is shown again, `google_drive` leaves `settings.toml`, and "Save to this computer…" still saves the file.
+10. **The keyring.** After connecting, the keyring has one entry, service `hoprs/google-drive`,
+    account `refresh-token` (Seahorse; Keychain Access; Credential Manager shows
+    `refresh-token.hoprs/google-drive`), and `settings.toml` holds `google_drive = true` and
+    nothing else about Google. Restart hoprs: Settings → Backup shows "Google Drive:
+    connected"; pick Google Drive in an export: it shows the account and uploads without a new
+    sign-in. With the keyring locked or absent (Linux: stop the Secret Service): the screen
+    says "The system keyring is unavailable: this connection lasts until hoprs closes.", no
+    marker is written, and after a restart Connect is shown again.
+11. **A browser with large cookies for `127.0.0.1`** (visit a local dev server that sets big
+    cookies first) still connects (Linux is enough).
+12. **A build without the client** (a source build, or the CI artifact of a pull request)
+    shows no Destination row on the export screen and no Google line in Settings.
+13. **The log panel** shows lines such as `Google Drive: connected` and `Google Drive:
+    uploaded <name>`, and no token, code or secret.
+14. **The window.** The run above never went through the app's window. Look at the Drive
+    rows at 520 px (Account with Disconnect, Name, the "Waiting for the browser…" state with
+    Cancel and "Copy the link"), that Export is disabled until connected, and that nothing
+    shows a Google or Drive logo.

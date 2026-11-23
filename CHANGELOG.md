@@ -8,6 +8,15 @@ You can export one site or one workspace, not only everything.
 - One export screen for all three: a title that names what is exported, a File field that starts as `hoprs-<name>-<date>.hoprs` (`hoprs-backup-<date>.hoprs` for everything), the password typed twice, and a question before overwriting a file you typed the path of.
 - A file of one site or one workspace holds that site or workspace, the sites in it and their passwords. It restores with **Merge** only; Replace is refused with "This file holds only part of a backup. Restore it with Merge." hoprs 1.5.0 and older answer "Unsupported backup version" to it. A file of everything is unchanged and restores on every version.
 
+You can export the encrypted file to your Google Drive.
+
+- On the export screen, Destination **Google Drive** replaces the File field. **Connect to Google Drive…** opens your browser once; after that, Export uploads the file into a folder named `hoprs` in your Drive. Each export is a new file; hoprs never overwrites or deletes one. "Open in Drive" opens it.
+- The only permission asked is `drive.file` ("See, edit, create, and delete only the specific Google Drive files you use with this app"): hoprs sees the files it created, not the rest of your Drive. Only the sealed file leaves your computer, protected by your password.
+- The connection is one keyring entry (service `hoprs/google-drive`) and the marker `google_drive = true` in `settings.toml`. Without a usable keyring it lasts until hoprs closes, and the screen says so.
+- A failed upload keeps the encrypted file: **Try again**, or **Save to this computer…**. The limit is 5 MB; a larger file is refused and can be saved to this computer.
+- **Disconnect** (on the export screen and in Settings → Backup) revokes the access at Google and deletes the keyring entry. Restoring is manual: download the file from Drive and use Restore backup….
+- The destination shows only in builds that carry a Google client (the releases do). A privacy page on hoprs.online describes what is sent.
+
 Coding agents can work on your saved sites.
 
 - `hoprs mcp` is an MCP server that Claude Code and any other MCP client can start. Settings › Agents (MCP) turns it on (off by default) and shows the command to register it, `claude mcp add hoprs -- "<path to hoprs>" mcp`, and a JSON snippet for other clients. hoprs must be open: the program talks to the running window, which keeps the passwords.

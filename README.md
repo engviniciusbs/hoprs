@@ -77,7 +77,8 @@ transfer queue behind it, in one quiet window that opens in under 100 ms and idl
 - **Credentials in the system keyring** (Secret Service, macOS Keychain, Windows Credential Manager). Site files hold no secrets.
   `ssh-agent` is supported and preferred.
 - **Encrypted backup:** export everything, one workspace or one site, and restore it, in one
-  encrypted file with the passwords (Argon2id and XChaCha20-Poly1305).
+  encrypted file with the passwords (Argon2id and XChaCha20-Poly1305). The file can be saved on
+  this computer or uploaded to your Google Drive.
 - **FileZilla import:** reads `sitemanager.xml` and reports what was imported and what was
   skipped.
 - **Security prompts inline:** host key and certificate changes are shown in place, never as
@@ -254,7 +255,10 @@ Uninstalling never touches your data or your saved passwords (see
 listed there, and the keyring entries for service `hoprs/<site-id>` (up to two per site, a
 password and a key passphrase): in Seahorse ("Passwords and Keys") on Linux, Keychain Access
 on macOS. On Windows, Credential Manager shows them as `password.hoprs/<site-id>` and
-`key-passphrase.hoprs/<site-id>`.
+`key-passphrase.hoprs/<site-id>`. If you connected Google Drive, there is one more entry,
+service `hoprs/google-drive` (account `refresh-token`; `refresh-token.hoprs/google-drive` in
+Credential Manager). Use Disconnect in hoprs first if you can: it also ends the access at
+Google (see [Google Drive](#google-drive)).
 
 ## First steps
 
@@ -372,12 +376,75 @@ Where to start:
 The export screen is a form in the middle of the window. Its title says what is exported,
 the File field starts as `hoprs-<name>-<date>.hoprs` in your Documents folder (or home), and
 "Choose…" opens the save dialog. Everything is `hoprs-backup-<date>.hoprs`. If you type the
-path of a file that exists, hoprs asks before overwriting it.
+path of a file that exists, hoprs asks before overwriting it. In a build with Google Drive
+there is also a Destination choice, below.
 
 A file of one site or one workspace is a partial file. Restore it with Merge: Replace is
 refused, because it would remove everything the file does not hold. Partial files need
 hoprs 1.6.0 or newer; hoprs 1.5.0 and older answer "Unsupported backup version" and change
 nothing. A file of everything restores on every version, as before.
+
+To keep the file in Google Drive, see [Google Drive](#google-drive).
+
+### Google Drive
+
+The export screen can send the encrypted file to your Google Drive instead of saving it on
+this computer. The choice "Destination" shows only in builds that carry a Google client (the
+releases do; see [Building from source](#building-from-source)).
+
+**Connect (once).** In the export screen, choose Destination "Google Drive", then "Connect to
+Google Drive…". hoprs opens your browser on Google's consent screen. Sign in and allow. The
+browser then shows a page that says Google sent the answer to hoprs; go back to hoprs, which
+shows the account (its email when Google gives it, else "Connected"). If the browser did not
+open, "Copy the link" and open it yourself. "Cancel" ends the wait, which also ends after 5
+minutes.
+
+**Export.** Type a name for the file (it starts as `hoprs-<name>-<date>.hoprs`), the password
+twice, and press Export. hoprs encrypts the file on this computer, then uploads it to a folder
+named `hoprs` in your Drive (created if it is not there). Every export is a new file: hoprs
+never overwrites or deletes one, so two exports with the same name give two files. "Open in
+Drive" opens the file's page in the browser.
+
+**If the upload fails** (offline, a revoked access, a file larger than 5 MB) the screen says
+so, and the encrypted file is still in memory: "Try again" after fixing the cause, or "Save to
+this computer…". If you revoked hoprs at Google, Connect is shown again.
+
+**Restore.** hoprs does not read from Drive. Download the file from the `hoprs` folder in
+your browser, then use Settings → Backup → "Restore backup…". A file of one site or one
+workspace restores with Merge only (see above).
+
+**Disconnect.** "Disconnect" in the export screen, or in Settings → Backup (which shows a
+"Google Drive: connected" line). hoprs revokes its access at Google (if that call fails it is
+only logged), deletes its keyring entry and forgets the connection. The files already in Drive
+stay; delete them in Drive. You can also remove hoprs at
+<https://myaccount.google.com/permissions>.
+
+What it does and does not do:
+
+- **What leaves your computer:** only the sealed file (the same bytes as a file you save
+  yourself, protected by your password) and its name. No password, key or site file is sent in
+  the clear. Besides that, the sign-in and the token exchange go to Google, with the OAuth
+  client's id and secret. They are compiled into the release builds; a desktop app cannot keep
+  such a secret from someone who reads the program, and Google does not treat it as one.
+- **Who hoprs talks to:** `oauth2.googleapis.com` and `www.googleapis.com`, only after you pick
+  Google Drive and click Connect, Export or Disconnect. The sign-in page itself is
+  `accounts.google.com`, in your browser. While you wait, hoprs listens on `127.0.0.1` (this
+  computer only), on a free port, until the browser answers, you cancel or 5 minutes pass.
+  Proxy variables are honoured like for the update check. No redirect is followed.
+- **What hoprs may do in your Drive:** the only permission asked is `drive.file`: Google
+  words it as "See, edit, create, and delete only the specific Google Drive files you use with
+  this app". hoprs sees the files it created, not the rest of your Drive.
+- **What hoprs keeps:** a refresh token (and the account email) in one keyring entry, service
+  `hoprs/google-drive`, account `refresh-token`. `settings.toml` gets `google_drive = true`
+  as a marker so Settings can show the line without opening the keyring. hoprs reads the
+  keyring when you first pick Google Drive in a session, and on Connect, Export and Disconnect;
+  not when you open the form, and not when it starts.
+- **No usable keyring:** the connection is held in memory and lasts until hoprs closes. The
+  screen says so, no marker is written, and after a restart you press Connect again.
+- **Not in the log:** tokens, codes and the client secret are never written to the log; it
+  has lines such as `Google Drive: connected`.
+
+The [privacy page](https://hoprs.online/privacy/) describes what is sent.
 
 ### Agents (MCP)
 
@@ -558,10 +625,13 @@ tests check that every catalog has the same keys and variables as `en.ftl` (`car
 | Working copies of files being edited | `$XDG_RUNTIME_DIR/hoprs/edit/` (cleared at logout) | a temporary folder | a temporary folder |
 | `agent.sock`, the channel for agents (only while Settings › Agents (MCP) is on and hoprs runs; the pipe `\\.\pipe\hoprs-agent-<your SID>` on Windows) | beside `instance.lock` (normally `$XDG_RUNTIME_DIR/hoprs/`; if that is unusable, `~/.config/hoprs/`, then the temporary folder) | `~/Library/Application Support/hoprs/` | none: a named pipe |
 | Passwords and key passphrases, service `hoprs/<site-id>` | Secret Service (GNOME Keyring, KWallet) | macOS Keychain | Windows Credential Manager |
+| The Google Drive connection, service `hoprs/google-drive`, account `refresh-token` (only if you connected Google Drive) | Secret Service | macOS Keychain | Windows Credential Manager |
 
 The TOML files are plain text and safe to keep in a dotfiles repository: they never hold a
 password or passphrase. Two keys belong to agents: `agents_enabled = true` in `settings.toml` (written only
 when on) and `agent_access = "read"` or `"all"` on a site in `sites.toml` (absent means no access).
+`google_drive = true` in `settings.toml` (written only when a Google Drive connection was stored in
+the keyring) is the only thing about Google that is not in the keyring.
 
 ## Configuration
 
@@ -616,6 +686,16 @@ The MCP server for agents uses [`rmcp`](https://github.com/modelcontextprotocol/
 official Rust SDK, for the protocol on stdio. It adds exactly ten packages to `Cargo.lock` (`rmcp`, `schemars`, `schemars_derive`,
 `serde_derive_internals`, `dyn-clone`, `ref-cast`, `ref-cast-impl`, `pastey`,
 `unicode-general-category`, `unicode-normalization`) and needs nothing to install: no TLS, no HTTP, no OpenSSL.
+
+### Google Drive in your own build
+
+The Google Drive destination is hidden unless the build carries an OAuth client. Release
+builds get the author's. To enable it in your build, create a Google Cloud project with an
+OAuth client of type "Desktop app" and the scope `drive.file`, and build with both
+`HOPRS_GOOGLE_CLIENT_ID` and `HOPRS_GOOGLE_CLIENT_SECRET` set (an empty value counts as unset;
+both are read at build time). A debug build also reads them at run time, where they win, and
+`HOPRS_DRIVE_URL` (one `https://` base that replaces Google's endpoints) for tests. Without
+the pair, the export screen shows no Destination choice.
 
 ### Build and run
 

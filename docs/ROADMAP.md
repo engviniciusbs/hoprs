@@ -25,6 +25,8 @@ or missing on each side and transfers only the difference).
 - **More for agents:** an interactive terminal and folder compare for agents; finer limits than
   the site (folders, commands); a headless mode that works without the window.
 - **Export to one of your own sites** (upload the encrypted file over SFTP or FTP).
+- **Restore from Google Drive** (pick the file in hoprs, instead of downloading it first), and
+  other clouds as export destinations. Uploads above 5 MB (a resumable upload).
 - **Import `~/.ssh/config`:** hosts, users, ports, identity files.
 - **Jump hosts (`ProxyJump`)** for servers behind a bastion.
 - **Tunnels and port forwarding** saved with the site (for example a local port that reaches
@@ -51,6 +53,7 @@ one, so nobody duplicates the work.
 
 ## Not planned
 
-- **Telemetry** of any kind in the app. hoprs collects no data; the update check is a
-  request to GitHub to check for a new version and can be turned off (see
-  [Updates](../README.md#updates)).
+- **Telemetry** of any kind in the app. hoprs collects no data. The only requests it makes on
+  its own behalf are the update check to GitHub, which can be turned off (see
+  [Updates](../README.md#updates)), and Google, only when you connect Google Drive and export
+  there (see [Google Drive](../README.md#google-drive)).
