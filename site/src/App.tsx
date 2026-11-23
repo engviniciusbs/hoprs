@@ -1,5 +1,6 @@
 import { LangProvider } from "./i18n";
 import type { Lang, Page } from "./i18n";
+import Agents from "./sections/Agents";
 import Connection from "./sections/Connection";
 import Faq from "./sections/Faq";
 import Fast from "./sections/Fast";
@@ -22,6 +23,7 @@ export default function App({ lang = "en", page = "home" }: { lang?: Lang; page?
           <Hero />
           <Fast />
           <Connection />
+          <Agents />
           <Filezilla />
           <OpenSource />
           <Install />

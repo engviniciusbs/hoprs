@@ -17,6 +17,7 @@
   <a href="https://hoprs.online">Website</a> ·
   <a href="https://github.com/engviniciusbs/hoprs/releases/latest">Download</a> ·
   <a href="#first-steps">First steps</a> ·
+  <a href="#agents-mcp">Agents (MCP)</a> ·
   <a href="CHANGELOG.md">Changelog</a> ·
   <a href="CONTRIBUTING.md">Contributing</a>
 </p>
@@ -25,6 +26,8 @@ hoprs keeps the idea that made FileZilla useful (a list of saved sites you open 
 click) and puts a terminal, a two-pane file browser, folder compare and a persistent
 transfer queue behind it, in one quiet window that opens in under 100 ms and idles at about
 33 MB.
+
+Since 1.6.0 hoprs is also an MCP server: Claude Code and other coding agents can work on the sites you allow, at a level you choose for each one, while hoprs keeps the passwords. See [Agents (MCP)](#agents-mcp).
 
 - **Version:** 1.6.0 ([changelog](CHANGELOG.md))
 - **Platforms:** Linux (Ubuntu 24.04 or newer, amd64), macOS 11 or newer (Apple Silicon and Intel), Windows 10 or newer (x64).
@@ -59,6 +62,9 @@ transfer queue behind it, in one quiet window that opens in under 100 ms and idl
 - **Workspaces:** a workspace groups sites in the sidebar. Open its sites one by one, or
   all at once (right-click, Open all), which also restores their tabs. A site can belong to
   several workspaces.
+- **Agents (MCP):** Claude Code and other coding agents can work on the sites you allow, one
+  by one, at a level you choose (reading, or everything), through `hoprs mcp`. hoprs keeps the
+  passwords and shows what the agent does. Off by default; see [Agents (MCP)](#agents-mcp).
 - **Terminal:** `xterm-256color` with truecolor, 10 000 lines of scrollback by default,
   find in scrollback, copy and paste, and a reconnect bar when the connection drops.
 - **Two-pane file browser:** local and remote side by side, virtualised lists that stay
@@ -88,9 +94,6 @@ transfer queue behind it, in one quiet window that opens in under 100 ms and idl
 - **Language:** English, Brazilian Portuguese or Turkish. hoprs follows the OS language by default;
   Settings › Language switches it at once.
 - **Command palette:** Ctrl+K (Cmd+K on macOS) jumps to any tab, site, workspace or action.
-- **Agents (MCP):** Claude Code and other coding agents can work on the sites you allow, one
-  by one, at a level you choose (reading, or everything), through `hoprs mcp`. hoprs keeps the
-  passwords and shows what the agent does. Off by default; see [Agents (MCP)](#agents-mcp).
 - **Update notice:** hoprs tells you when a new version is out and, with one click,
   downloads it, checks it against the release's `SHA256SUMS` and opens the system
   installer. It can be turned off; see [Updates](#updates).

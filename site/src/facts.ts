@@ -36,6 +36,7 @@ export const facts = {
   changelogUrl: `${repoUrl}/blob/main/CHANGELOG.md`,
   securityUrl: `${repoUrl}#security`,
   perfDocUrl: `${repoUrl}/blob/main/docs/perf/README.md`,
+  agentsDocUrl: `${repoUrl}#agents-mcp`,
   licenseUrl: `${repoUrl}/blob/main/LICENSE-MIT`,
   apacheLicenseUrl: `${repoUrl}/blob/main/LICENSE-APACHE`,
   issuesUrl: `${repoUrl}/issues`,
