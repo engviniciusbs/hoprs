@@ -141,6 +141,48 @@ impl Link {
     }
 }
 
+/// The connect attempts, by the id the app gave them (rising with each Connect click).
+/// Workers start in any order (they all wait for the first client build), so the ids,
+/// not the order of arrival, say which attempt is the current one.
+#[derive(Default)]
+struct Attempts {
+    /// The attempt that waits for the browser: its id and cancel flag.
+    current: Option<(u64, Arc<AtomicBool>)>,
+    /// The highest id cancelled: an attempt at or below it that registers later (its
+    /// cancel came before it began) ends at once.
+    cancelled_upto: u64,
+}
+
+impl Attempts {
+    /// Registers attempt `id`. `None`: it must not wait, a newer one (or its own cancel)
+    /// came first. A lower attempt that is waiting is cancelled.
+    fn register(&mut self, id: u64) -> Option<Arc<AtomicBool>> {
+        if let Some((current, flag)) = &self.current {
+            if *current > id {
+                return None;
+            }
+            if *current < id {
+                flag.store(true, Ordering::Relaxed);
+                self.current = None;
+            }
+        }
+        if id <= self.cancelled_upto {
+            return None;
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        self.current = Some((id, flag.clone()));
+        Some(flag)
+    }
+}
+
+fn cancelled_error() -> Error {
+    Error::coded(
+        ErrorKind::Io,
+        "drive-connect-cancelled",
+        "Connection to Google Drive cancelled",
+    )
+}
+
 /// What the holder knows of the connection.
 enum Known {
     /// The keyring was not read yet.
@@ -193,8 +235,8 @@ pub struct Drive {
     client: OnceLock<Option<Client>>,
     store: Arc<dyn AppSecretStore>,
     known: Mutex<Known>,
-    /// The cancel flag of the connect that waits for the browser, if one does.
-    attempt: Mutex<Option<Arc<AtomicBool>>>,
+    /// The connect that waits for the browser, if one does, and the cancels seen.
+    attempt: Mutex<Attempts>,
 }
 
 impl Drive {
@@ -204,7 +246,7 @@ impl Drive {
             client: OnceLock::new(),
             store,
             known: Mutex::new(Known::Unread),
-            attempt: Mutex::new(None),
+            attempt: Mutex::new(Attempts::default()),
         }
     }
 
@@ -278,31 +320,35 @@ impl Drive {
     /// to [`loopback::CONNECT_TIMEOUT`], or [`Drive::cancel`], or another `connect`),
     /// trades the code for tokens, reads the email, stores the entry, then sends exactly
     /// one `Done`, last.
-    pub fn connect(&self, pages: &Pages, send: &mut dyn FnMut(ConnectEvent)) {
+    pub fn connect(&self, attempt: u64, pages: &Pages, send: &mut dyn FnMut(ConnectEvent)) {
         let result = self
             .client()
-            .and_then(|client| self.sign_in(client, pages, send));
+            .and_then(|client| self.sign_in(client, attempt, pages, send));
         send(ConnectEvent::Done(result));
     }
 
     fn sign_in(
         &self,
         client: &Client,
+        id: u64,
         pages: &Pages,
         send: &mut dyn FnMut(ConnectEvent),
     ) -> Result<DriveAccount, Error> {
-        let flag = Arc::new(AtomicBool::new(false));
-        {
-            let mut attempt = self.attempt.lock().unwrap_or_else(PoisonError::into_inner);
-            if let Some(previous) = attempt.replace(flag.clone()) {
-                previous.store(true, Ordering::Relaxed);
-            }
-        }
+        let registered = self
+            .attempt
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .register(id);
+        let flag = registered.ok_or_else(cancelled_error)?;
         let code = self.wait_for_code(client, &flag, pages, send);
         {
-            let mut attempt = self.attempt.lock().unwrap_or_else(PoisonError::into_inner);
-            if attempt.as_ref().is_some_and(|a| Arc::ptr_eq(a, &flag)) {
-                *attempt = None;
+            let mut attempts = self.attempt.lock().unwrap_or_else(PoisonError::into_inner);
+            if attempts
+                .current
+                .as_ref()
+                .is_some_and(|(_, a)| Arc::ptr_eq(a, &flag))
+            {
+                attempts.current = None;
             }
         }
         let (code, verifier, redirect_uri) = code?;
@@ -353,14 +399,17 @@ impl Drive {
     }
 
     /// Ends the wait of a running [`Drive::connect`] (its `Done` is
-    /// `drive-connect-cancelled`); nothing when none waits.
-    pub fn cancel(&self) {
-        let attempt = self
-            .attempt
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        if let Some(flag) = attempt {
+    /// `drive-connect-cancelled`) when `id` is the attempt that waits. An `id` that has not
+    /// registered yet ends when it does; one that is not waiting cancels nothing else.
+    pub fn cancel(&self, id: u64) {
+        let mut attempts = self.attempt.lock().unwrap_or_else(PoisonError::into_inner);
+        attempts.cancelled_upto = attempts.cancelled_upto.max(id);
+        if attempts
+            .current
+            .as_ref()
+            .is_some_and(|(current, _)| *current == id)
+            && let Some((_, flag)) = attempts.current.take()
+        {
             flag.store(true, Ordering::Relaxed);
         }
     }
@@ -473,14 +522,6 @@ impl fmt::Debug for Drive {
 mod tests {
     use super::*;
     use crate::test_https::{Answer, Seen, answer, identity, serve};
-
-    #[test]
-    fn a_huge_expires_in_does_not_panic() {
-        for expires_in in [u64::MAX, u64::MAX / 2, 1 << 40, 3600, 0] {
-            let access = Access::new(SecretString::from("t"), expires_in);
-            assert_eq!(access.fresh(), expires_in > 60, "{expires_in}");
-        }
-    }
     use hoprs_core::{ErrorKind, Result as CoreResult};
     use hoprs_vault::{AppSecret, MemoryStore};
     use percent_encoding::percent_decode_str;
@@ -490,6 +531,21 @@ mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_huge_expires_in_does_not_panic() {
+        for expires_in in [u64::MAX, u64::MAX / 2, 1 << 40, 3600, 0] {
+            let access = Access::new(SecretString::from("t"), expires_in);
+            assert_eq!(access.fresh(), expires_in > 60, "{expires_in}");
+        }
+    }
+
+    /// Ids for the connects of the tests, rising like the app's.
+    static IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    fn next_id() -> u64 {
+        IDS.fetch_add(1, Ordering::Relaxed)
+    }
 
     const CLIENT_SECRET: &str = "CLIENT-SECRET-VALUE";
     const CODE: &str = "CODE-SECRET-VALUE";
@@ -727,7 +783,7 @@ mod tests {
     fn connect(drive: &Drive) -> Vec<ConnectEvent> {
         let mut events = Vec::new();
         let mut browser = None;
-        drive.connect(&pages(), &mut |event| {
+        drive.connect(next_id(), &pages(), &mut |event| {
             if let ConnectEvent::Waiting { url } = &event {
                 let url = url.clone();
                 browser = Some(std::thread::spawn(move || browse(&url, CODE)));
@@ -1006,12 +1062,12 @@ mod tests {
     }
 
     /// Starts a connect on another thread; returns once it is waiting.
-    fn waiting(drive: &Arc<Drive>) -> std::thread::JoinHandle<Vec<ConnectEvent>> {
+    fn waiting(drive: &Arc<Drive>, id: u64) -> std::thread::JoinHandle<Vec<ConnectEvent>> {
         let (tx, rx) = std::sync::mpsc::channel();
         let drive = drive.clone();
         let handle = std::thread::spawn(move || {
             let mut events = Vec::new();
-            drive.connect(&pages(), &mut |event| {
+            drive.connect(id, &pages(), &mut |event| {
                 if matches!(event, ConnectEvent::Waiting { .. }) {
                     let _ = tx.send(());
                 }
@@ -1041,21 +1097,100 @@ mod tests {
         ));
         // The bounds only prove "promptly, not the five-minute time-out", and are wide
         // for loaded CI machines.
-        let first = waiting(&drive);
+        let (id1, id2, id3) = (next_id(), next_id(), next_id());
+        let first = waiting(&drive, id1);
         let started = Instant::now();
-        drive.cancel();
+        drive.cancel(id1);
         cancelled(&first.join().unwrap());
         assert!(started.elapsed() < Duration::from_secs(5));
 
         // A second connect ends the first one the same way.
-        let first = waiting(&drive);
+        let first = waiting(&drive, id2);
         let started = Instant::now();
-        let second = waiting(&drive);
+        let second = waiting(&drive, id3);
         cancelled(&first.join().unwrap());
         assert!(started.elapsed() < Duration::from_secs(5));
-        drive.cancel();
+        drive.cancel(id3);
         cancelled(&second.join().unwrap());
         assert_eq!(drive.status().unwrap(), None);
+    }
+
+    /// The workers of two Connects can reach the holder in any order.
+    #[test]
+    fn ids_decide_which_attempt_is_current() {
+        let mut attempts = Attempts::default();
+        // 2 registers first; 1 comes late and ends itself, leaving 2 waiting.
+        let two = attempts.register(2).unwrap();
+        assert!(attempts.register(1).is_none());
+        assert!(!two.load(Ordering::Relaxed));
+        assert_eq!(attempts.current.as_ref().map(|(id, _)| *id), Some(2));
+        // A newer attempt cancels the one that waits.
+        let three = attempts.register(3).unwrap();
+        assert!(two.load(Ordering::Relaxed) && !three.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn cancel_touches_only_its_own_attempt() {
+        let (client, _, _) = google();
+        let drive = Arc::new(Drive::with_client(
+            Some(client),
+            Arc::new(MemoryStore::new()),
+        ));
+        let (id1, id2) = (next_id(), next_id());
+        let second = waiting(&drive, id2);
+        // Not in the slot: nothing is cancelled.
+        drive.cancel(id1);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!second.is_finished());
+        drive.cancel(id2);
+        cancelled(&second.join().unwrap());
+    }
+
+    /// A cancel that came before its attempt registered still ends that attempt, and no
+    /// listener stays bound.
+    #[test]
+    fn a_cancel_before_the_attempt_registered_ends_it() {
+        let (client, _, _) = google();
+        let drive = Drive::with_client(Some(client), Arc::new(MemoryStore::new()));
+        let id = next_id();
+        drive.cancel(id);
+        let mut events = Vec::new();
+        let started = Instant::now();
+        drive.connect(id, &pages(), &mut |event| events.push(event));
+        assert!(started.elapsed() < Duration::from_secs(5));
+        match events.as_slice() {
+            [ConnectEvent::Done(Err(err))] => {
+                assert_eq!(err.code, Some("drive-connect-cancelled"));
+            }
+            other => panic!("{other:?}"),
+        }
+        // A newer attempt is not touched by it.
+        let next = Arc::new(drive);
+        let id = next_id();
+        let again = waiting(&next, id);
+        next.cancel(id);
+        cancelled(&again.join().unwrap());
+    }
+
+    /// The scenario of the review: Connect 1, Cancel, Connect 2, the workers arriving in
+    /// the other order. Attempt 2 must keep waiting, and attempt 1 must end.
+    #[test]
+    fn a_late_earlier_attempt_does_not_cancel_the_current_one() {
+        let (client, _, _) = google();
+        let drive = Arc::new(Drive::with_client(
+            Some(client),
+            Arc::new(MemoryStore::new()),
+        ));
+        let (id1, id2) = (next_id(), next_id());
+        drive.cancel(id1);
+        let second = waiting(&drive, id2);
+        let mut events = Vec::new();
+        drive.connect(id1, &pages(), &mut |event| events.push(event));
+        assert!(matches!(events.as_slice(), [ConnectEvent::Done(Err(_))]));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(!second.is_finished());
+        drive.cancel(id2);
+        cancelled(&second.join().unwrap());
     }
 
     #[test]
@@ -1065,14 +1200,14 @@ mod tests {
         let code = Some("drive-not-configured");
         assert_eq!(drive.status().unwrap_err().code, code);
         let mut events = Vec::new();
-        drive.connect(&pages(), &mut |event| events.push(event));
+        drive.connect(1, &pages(), &mut |event| events.push(event));
         assert!(
             matches!(events.as_slice(), [ConnectEvent::Done(Err(err))] if err.code == code),
             "{events:?}"
         );
         assert_eq!(drive.upload("n", b"x").unwrap_err().code, code);
         assert_eq!(drive.disconnect().unwrap_err().code, code);
-        drive.cancel();
+        drive.cancel(1);
         assert_eq!(store.calls(), 0);
         let err = drive.status().unwrap_err();
         assert_eq!(err.message, "Google Drive is not available in this build");
@@ -1114,14 +1249,15 @@ mod tests {
             Some("drive-not-connected")
         );
         shown.push(format!("{refused:?}"));
-        let first = waiting(&drive);
-        drive.cancel();
+        let id = next_id();
+        let first = waiting(&drive, id);
+        drive.cancel(id);
         let cancelled = first.join().unwrap();
         keep(&cancelled);
         shown.push(format!("{cancelled:?}"));
         let mut events = Vec::new();
         let mut browser = None;
-        drive.connect(&pages(), &mut |event| {
+        drive.connect(next_id(), &pages(), &mut |event| {
             if let ConnectEvent::Waiting { url } = &event {
                 let url = url.clone();
                 browser = Some(std::thread::spawn(move || browse(&url, "WRONG-CODE")));

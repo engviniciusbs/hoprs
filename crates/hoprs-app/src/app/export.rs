@@ -649,7 +649,9 @@ impl App {
         }
         if matches!(self.drive_link, DriveLink::Waiting { .. }) {
             self.drive_link = DriveLink::Disconnected;
-            return vec![Effect::DriveCancel];
+            return vec![Effect::DriveCancel {
+                attempt: self.drive_attempt,
+            }];
         }
         Vec::new()
     }
@@ -661,6 +663,17 @@ impl App {
         }
         self.settings.google_drive = on;
         self.save_settings_effect().into_iter().collect()
+    }
+
+    /// Sets the marker for a connection that is stored; one held for this session only
+    /// leaves it as it is (the keyring, locked today, may hold a valid entry from an
+    /// earlier session).
+    fn persist_drive_marker(&mut self, stored: bool) -> Vec<Effect> {
+        if stored {
+            self.set_drive_marker(true)
+        } else {
+            Vec::new()
+        }
     }
 
     /// File or Google Drive; not while an export runs, Google Drive only with an OAuth
@@ -706,7 +719,7 @@ impl App {
                 // A link held for this session only is no stored connection.
                 let stored = account.stored;
                 self.drive_link = DriveLink::Connected(account);
-                self.set_drive_marker(stored)
+                self.persist_drive_marker(stored)
             }
             Ok(None) => {
                 self.drive_link = DriveLink::Disconnected;
@@ -757,7 +770,9 @@ impl App {
                 }
                 // Cancelled (or the form left) before the backend's wait began, when the
                 // cancel could not reach it: cancelled again now that it can.
-                vec![Effect::DriveCancel]
+                vec![Effect::DriveCancel {
+                    attempt: self.drive_attempt,
+                }]
             }
             // A success that raced a cancel is kept.
             ConnectEvent::Done(Ok(account)) => {
@@ -765,7 +780,7 @@ impl App {
                 self.drive_link = DriveLink::Connected(account);
                 self.drive_unreadable = false;
                 self.drive_error = None;
-                self.set_drive_marker(stored)
+                self.persist_drive_marker(stored)
             }
             ConnectEvent::Done(Err(error)) => {
                 if matches!(self.drive_link, DriveLink::Waiting { .. }) {
@@ -787,7 +802,9 @@ impl App {
             return Vec::new();
         }
         self.drive_link = DriveLink::Disconnected;
-        vec![Effect::DriveCancel]
+        vec![Effect::DriveCancel {
+            attempt: self.drive_attempt,
+        }]
     }
 
     /// "Disconnect" (from the form or Settings): not in a build without Google Drive, nor

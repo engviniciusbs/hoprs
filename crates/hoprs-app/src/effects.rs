@@ -297,8 +297,8 @@ pub fn run(
         } => Task::future(export_backup(backend, scope, path, password)),
         Effect::DriveStatus => Task::future(drive_status(backend)),
         Effect::DriveConnect { attempt } => Task::run(drive_connect(backend, attempt), |m| m),
-        Effect::DriveCancel => {
-            backend.drive_cancel();
+        Effect::DriveCancel { attempt } => {
+            backend.drive_cancel(attempt);
             Task::none()
         }
         Effect::DriveDisconnect => Task::future(drive_disconnect(backend)),
@@ -616,7 +616,7 @@ pub fn drive_connect(
         failed: strings::drive_page_failed().to_owned(),
     };
     backend
-        .drive_connect(pages)
+        .drive_connect(attempt, pages)
         .map(move |event| Message::Export(ExportMsg::Connecting(attempt, event)))
 }
 

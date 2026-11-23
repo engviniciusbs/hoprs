@@ -1450,7 +1450,7 @@ impl BackendApi for FakeBackend {
         }
     }
 
-    fn drive_connect(&self, _pages: Pages) -> BoxStream<'static, ConnectEvent> {
+    fn drive_connect(&self, _attempt: u64, _pages: Pages) -> BoxStream<'static, ConnectEvent> {
         // As the real backend: a connect that ends connected is what `drive_status`
         // answers from then on (from memory: the keyring is not asked again).
         let state = self.state.clone();
@@ -1465,7 +1465,7 @@ impl BackendApi for FakeBackend {
             .boxed()
     }
 
-    fn drive_cancel(&self) {
+    fn drive_cancel(&self, _attempt: u64) {
         self.state().drive_cancels += 1;
     }
 
@@ -1709,7 +1709,7 @@ mod tests {
 
         // Nothing scripted: the stream ends at once.
         assert!(
-            fake.drive_connect(pages())
+            fake.drive_connect(1, pages())
                 .collect::<Vec<_>>()
                 .await
                 .is_empty()
@@ -1720,12 +1720,12 @@ mod tests {
             },
             ConnectEvent::Done(Ok(account.clone())),
         ]);
-        let events: Vec<_> = fake.drive_connect(pages()).collect().await;
+        let events: Vec<_> = fake.drive_connect(1, pages()).collect().await;
         assert!(matches!(
             events.as_slice(),
             [ConnectEvent::Waiting { .. }, ConnectEvent::Done(Ok(_))]
         ));
-        fake.drive_cancel();
+        fake.drive_cancel(1);
         assert_eq!(fake.drive_cancels(), 1);
 
         let scope = ExportScope::All;

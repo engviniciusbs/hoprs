@@ -956,7 +956,10 @@ async fn cancel_and_timeout_states() {
         ),
     );
     let effects = export(&mut f.app, ExportMsg::CancelConnect);
-    assert!(matches!(effects[..], [Effect::DriveCancel]), "{effects:?}");
+    assert!(
+        matches!(effects[..], [Effect::DriveCancel { .. }]),
+        "{effects:?}"
+    );
     assert_eq!(f.app.drive_link, DriveLink::Disconnected);
     let effects = export(
         &mut f.app,
@@ -994,7 +997,10 @@ async fn early_cancel_is_sent_again_once_the_wait_begins() {
     export(&mut f.app, ExportMsg::DriveStatus(Ok(None)));
     export(&mut f.app, ExportMsg::Connect);
     let effects = export(&mut f.app, ExportMsg::CancelConnect);
-    assert!(matches!(effects[..], [Effect::DriveCancel]), "{effects:?}");
+    assert!(
+        matches!(effects[..], [Effect::DriveCancel { .. }]),
+        "{effects:?}"
+    );
     assert_eq!(f.app.drive_link, DriveLink::Disconnected);
     let effects = export(
         &mut f.app,
@@ -1005,7 +1011,10 @@ async fn early_cancel_is_sent_again_once_the_wait_begins() {
             },
         ),
     );
-    assert!(matches!(effects[..], [Effect::DriveCancel]), "{effects:?}");
+    assert!(
+        matches!(effects[..], [Effect::DriveCancel { .. }]),
+        "{effects:?}"
+    );
     assert_eq!(f.app.drive_link, DriveLink::Disconnected);
     export(
         &mut f.app,
@@ -1058,7 +1067,9 @@ async fn leaving_while_waiting_cancels() {
     );
     let effects = f.app.update(Message::ConnectSite(f.a.id.clone()));
     assert!(
-        effects.iter().any(|e| matches!(e, Effect::DriveCancel)),
+        effects
+            .iter()
+            .any(|e| matches!(e, Effect::DriveCancel { .. })),
         "{effects:?}"
     );
     assert_eq!(f.app.drive_link, DriveLink::Disconnected);
@@ -1066,7 +1077,9 @@ async fn leaving_while_waiting_cancels() {
     // Once only.
     let effects = f.app.update(Message::OpenSettings);
     assert!(
-        !effects.iter().any(|e| matches!(e, Effect::DriveCancel)),
+        !effects
+            .iter()
+            .any(|e| matches!(e, Effect::DriveCancel { .. })),
         "{effects:?}"
     );
 }
@@ -1536,7 +1549,7 @@ async fn drive_effects_reach_the_backend() {
         "{message:?}"
     );
     let runs = effects::CompareRuns::default();
-    let _ = effects::run(backend.clone(), &runs, Effect::DriveCancel);
+    let _ = effects::run(backend.clone(), &runs, Effect::DriveCancel { attempt: 1 });
     assert_eq!(fake.drive_cancels(), 1);
 
     let message = effects::seal_export(
@@ -1704,7 +1717,8 @@ async fn events_of_an_earlier_attempt_are_dropped() {
         &mut f.app,
         ExportMsg::Connecting(2, waiting_event(AUTH_URL)),
     );
-    export(&mut f.app, ExportMsg::Connecting(1, waiting_event("late")));
+    let effects = export(&mut f.app, ExportMsg::Connecting(1, waiting_event("late")));
+    assert!(effects.is_empty(), "{effects:?}");
     assert_eq!(
         f.app.drive_link,
         DriveLink::Waiting {
@@ -1775,4 +1789,29 @@ async fn drive_error_goes_when_the_form_is_left() {
     export(&mut f.app, ExportMsg::Disconnected(Err(error.clone())));
     f.app.update(Message::SettingsSaved(Ok(())));
     assert_eq!(f.app.drive_error, Some(error));
+}
+
+/// A connection held for this session only does not take away a marker an earlier
+/// session set (the keyring is locked today, and may hold a valid entry).
+#[tokio::test]
+async fn a_session_only_connect_keeps_an_existing_marker() {
+    let session_only = DriveAccount {
+        email: None,
+        stored: false,
+    };
+    let mut f = drive_fixture().await;
+    f.app.settings.google_drive = true;
+    on_drive(&mut f);
+    export(
+        &mut f.app,
+        ExportMsg::DriveStatus(Err(Error::new(ErrorKind::Io, "locked"))),
+    );
+    export(&mut f.app, ExportMsg::Connect);
+    let effects = export(
+        &mut f.app,
+        ExportMsg::Connecting(1, ConnectEvent::Done(Ok(session_only.clone()))),
+    );
+    assert_eq!(f.app.drive_link, DriveLink::Connected(session_only));
+    assert!(f.app.settings.google_drive);
+    assert!(!saves_settings(&effects), "{effects:?}");
 }

@@ -773,8 +773,10 @@ pub enum Effect {
     DriveConnect {
         attempt: u64,
     },
-    /// Ends the wait of a running connect (no message: its `Done` says it).
-    DriveCancel,
+    /// Ends the wait of the connect `attempt` (no message: its `Done` says it).
+    DriveCancel {
+        attempt: u64,
+    },
     /// Disconnects Google Drive; back as [`ExportMsg::Disconnected`].
     DriveDisconnect,
     /// Seals the encrypted backup of `scope` in memory; back as [`ExportMsg::SealDone`].
