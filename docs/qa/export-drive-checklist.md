@@ -121,6 +121,15 @@ Result:
 - Three uploads went into the `hoprs` folder, one of them after a token refresh.
 - Disconnect revoked the access at Google.
 
+## Google Drive: the author's run in the app (2026-11-23, Linux)
+
+The author installed the `.deb` built by a dry run of the release workflow (byte-identical to
+the released `hoprs_1.6.0-1_amd64.deb`) on Ubuntu and went through the flow in the app's
+window with the system keyring: Export… on a site, the Google Drive destination, Connect in
+the browser, the export, the line in Settings → Backup and Disconnect. The author reported
+that all of it worked. The report was for the flow as a whole, not row by row, so the rows
+below keep their status; macOS and Windows have not been run.
+
 ## NEEDS HUMAN (Google Drive)
 
 Use a release build or a build with `HOPRS_GOOGLE_CLIENT_ID` and `HOPRS_GOOGLE_CLIENT_SECRET`
