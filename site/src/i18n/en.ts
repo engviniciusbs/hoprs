@@ -46,7 +46,7 @@ export const en = {
     levels: [
       { name: "No access", note: "the default: the agent does not see the site" },
       { name: "Allow reading", note: "list folders, read files, download" },
-      { name: "Allow everything", note: "write, delete, upload, run commands" },
+      { name: "Allow everything", note: "write, delete, upload, run commands (SSH sites)" },
     ],
     note: "Off by default. hoprs must be open, and its log shows what the agent does. What an agent reads goes wherever that agent sends it.",
     how: "How it works",

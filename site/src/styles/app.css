@@ -110,6 +110,10 @@ html, body { overflow-x: clip; background: var(--color-paper); }
 .install-pre { display: flex; gap: var(--space-sm); max-width: 100%; overflow-x: auto; }
 .install-pre code { white-space: pre; font: inherit; }
 .install-prompts { display: flex; flex-direction: column; color: var(--color-muted); user-select: none; }
+.agents-cmd { display: flex; gap: var(--space-sm); }
+.agents-cmd code { white-space: pre; font: inherit; }
+.agents-levels .out-value { min-width: 17ch; font-size: var(--text-md); }
+@media (max-width: 30rem) { .agents-levels .out-value { min-width: 0; flex-basis: 100%; } }
 .install-status { min-height: 1.5em; }
 
 .install-systems { margin-top: var(--space-md); }

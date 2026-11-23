@@ -7,7 +7,7 @@ export default function Agents() {
     <section className="section container" aria-labelledby="agents-title">
       <h2 id="agents-title">{t.title}</h2>
       <p className="lead">{t.lead}</p>
-      <pre className="well cmd install-pre">
+      <pre className="well cmd agents-cmd">
         <span className="install-prompts" aria-hidden="true">
           <span>{" "}</span>
           <span>$</span>
@@ -17,7 +17,7 @@ export default function Agents() {
           {"\n"}claude mcp add hoprs -- /usr/bin/hoprs mcp
         </code>
       </pre>
-      <ul className="well out" aria-label={t.levelsLabel}>
+      <ul className="well out agents-levels" aria-label={t.levelsLabel}>
         {t.levels.map((level) => (
           <li key={level.name}>
             <span className="out-value">{level.name}</span>

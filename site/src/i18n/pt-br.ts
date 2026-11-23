@@ -48,7 +48,7 @@ export const ptBr: Dict = {
     levels: [
       { name: "Sem acesso", note: "o padrão: o agente não vê o site" },
       { name: "Permitir leitura", note: "listar pastas, ler arquivos, baixar" },
-      { name: "Permitir tudo", note: "escrever, apagar, enviar, rodar comandos" },
+      { name: "Permitir tudo", note: "escrever, apagar, enviar, rodar comandos (sites SSH)" },
     ],
     note: "Vem desligado. O hoprs precisa estar aberto, e o log dele mostra o que o agente faz. O que um agente lê vai para onde esse agente enviar.",
     how: "Como funciona",
