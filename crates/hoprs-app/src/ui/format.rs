@@ -19,7 +19,7 @@ pub fn size_in(lang: Language, bytes: u64) -> String {
     let unit_name = |unit| strings::size_unit_in(lang, unit);
     const UNITS: usize = 7;
     if bytes < 1024 {
-        return format!("{bytes} {}", unit_name(0));
+        return format!("{} {}", i18n::group_digits(lang, bytes), unit_name(0));
     }
     let mut value = bytes as f64;
     let mut unit = 0;
@@ -46,7 +46,12 @@ pub fn size_in(lang: Language, bytes: u64) -> String {
         };
         format!("{number} {}", unit_name(unit))
     } else {
-        format!("{shown:.0} {}", unit_name(unit))
+        // 1000 to 1023 still read as one number, so they get a thousands separator too.
+        format!(
+            "{} {}",
+            i18n::group_digits(lang, shown as u64),
+            unit_name(unit)
+        )
     }
 }
 
@@ -134,7 +139,9 @@ mod tests {
         // Sizes: bytes as they are, then base 1024 with one decimal below 10.
         assert_eq!(size(0), "0 B");
         assert_eq!(size(68), "68 B");
-        assert_eq!(size(1023), "1023 B");
+        assert_eq!(size(999), "999 B");
+        assert_eq!(size(1000), "1,000 B"); // 1000 to 1023 get a thousands separator
+        assert_eq!(size(1023), "1,023 B");
         assert_eq!(size(1024), "1.0 KB");
         assert_eq!(size(4198), "4.1 KB"); // 4.0996
         assert_eq!(size(4096), "4.0 KB");
@@ -190,6 +197,16 @@ mod tests {
         assert_eq!(size_in(PtBr, 68), "68 B");
         assert_eq!(size_in(PtBr, 5 * 1024u64.pow(3) / 2), "2,5 GB");
         assert_eq!(size_in(En, 4198), "4.1 KB");
+        // 1000 to 1023 are grouped like the counts elsewhere in the app.
+        assert_eq!(size_in(PtBr, 999), "999 B");
+        assert_eq!(size_in(PtBr, 1000), "1.000 B");
+        assert_eq!(size_in(PtBr, 1023), "1.023 B");
+        assert_eq!(size_in(En, 1000), "1,000 B");
+        assert_eq!(size_in(En, 1023), "1,023 B");
+        assert_eq!(size_in(PtBr, 1000 * 1024), "1.000 KB");
+        assert_eq!(size_in(PtBr, 1023 * 1024), "1.023 KB");
+        assert_eq!(size_in(En, 1000 * 1024), "1,000 KB");
+        assert_eq!(size_in(En, 1023 * 1024), "1,023 KB");
         assert_eq!(date_in(PtBr, at(2026, 11, 11, 14, 2), 2026), "11 nov 14:02");
         assert_eq!(date_in(PtBr, at(2024, 10, 2, 9, 11), 2026), "02 out 2024");
         assert_eq!(date_in(En, at(2026, 11, 11, 14, 2), 2026), "11 Nov 14:02");
