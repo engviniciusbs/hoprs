@@ -5,9 +5,9 @@ const responsible = "Vinícius Sarmento";
 const privacyEmail = "privacy@hoprs.online";
 const maintainerUrl = `https://github.com/${maintainer}`;
 const repoUrl = `${maintainerUrl}/hoprs`;
-const version = "1.5.0";
+const version = "1.6.0";
 // The date of the GitHub Release above (CHANGELOG.md), shown as "Updated" in the footer.
-const releaseDate = "2026-11-18";
+const releaseDate = "2026-11-23";
 const debName = `hoprs_${version}-1_amd64.deb`;
 const dmgName = `hoprs_${version}_macos_universal.dmg`;
 const msiName = `hoprs_${version}_windows_x64.msi`;

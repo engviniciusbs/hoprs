@@ -3,7 +3,7 @@
 What is planned, roughly in order, and where help is most welcome. Plans change; the
 [issues](https://github.com/engviniciusbs/hoprs/issues) and
 [discussions](https://github.com/engviniciusbs/hoprs/discussions) are where they get decided.
-Released work is in the [CHANGELOG](../CHANGELOG.md): 1.6.0 (coming) adds the export of one
+Released work is in the [CHANGELOG](../CHANGELOG.md): 1.6.0 (2026-11-23) added the export of one
 site or one workspace, as a partial file that restores with Merge, and an MCP server so coding
 agents can work on the sites you allow (`hoprs mcp`, a level per site); 1.5.0 (2026-11-18) added the app in
 Turkish (a contributed translation); 1.4.0 (2026-11-17) added the update
@@ -25,6 +25,8 @@ or missing on each side and transfers only the difference).
 - **More for agents:** an interactive terminal and folder compare for agents; finer limits than
   the site (folders, commands); a headless mode that works without the window.
 - **Export to one of your own sites** (upload the encrypted file over SFTP or FTP).
+- **Restore from Google Drive** (pick the file in hoprs, instead of downloading it first), and
+  other clouds as export destinations. Uploads above 5 MB (a resumable upload).
 - **Import `~/.ssh/config`:** hosts, users, ports, identity files.
 - **Jump hosts (`ProxyJump`)** for servers behind a bastion.
 - **Tunnels and port forwarding** saved with the site (for example a local port that reaches
@@ -51,6 +53,7 @@ one, so nobody duplicates the work.
 
 ## Not planned
 
-- **Telemetry** of any kind in the app. hoprs collects no data; the update check is a
-  request to GitHub to check for a new version and can be turned off (see
-  [Updates](../README.md#updates)).
+- **Telemetry** of any kind in the app. hoprs collects no data. The only requests it makes on
+  its own behalf are the update check to GitHub, which can be turned off (see
+  [Updates](../README.md#updates)), and Google, only when you connect Google Drive, export
+  there or disconnect it (see [Google Drive](../README.md#google-drive)).
